@@ -59,6 +59,13 @@ struct Pending {
 #[derive(Debug, Default)]
 pub struct Vim {
     pub mode: Mode,
+    /// A note for the status bar, like a failed search. Cleared by the next key.
+    pub message: String,
+    /// The prompt char (`/` or `?`) and text of the command line being typed, if one is open.
+    /// It sits over whichever mode it was opened from.
+    cmdline: Option<(char, String)>,
+    /// The last search pattern, and whether it went forward.
+    search: Option<(String, bool)>,
     /// Where the visual selection started; the buffer cursor is the other end.
     anchor: usize,
     pending: Pending,
@@ -83,6 +90,25 @@ impl Vim {
     }
 
     pub fn handle(&mut self, buf: &mut Buffer, key: Key) {
+        if let Some((_, line)) = &mut self.cmdline {
+            match key {
+                Key::Esc => self.cmdline = None,
+                Key::Enter => {
+                    let (prompt, pattern) = self.cmdline.take().unwrap_or_default();
+                    self.search_command(buf, prompt == '/', pattern);
+                }
+                // Backspace on an empty line closes it.
+                Key::Backspace => {
+                    if line.pop().is_none() {
+                        self.cmdline = None;
+                    }
+                }
+                Key::Char(c) => line.push(c),
+                _ => {}
+            }
+            return;
+        }
+        self.message.clear();
         if self.mode == Mode::Insert {
             if self.recording_insert && !self.replaying {
                 self.last_change.push(key);
@@ -148,6 +174,14 @@ impl Vim {
                         register: Some(c),
                         ..p
                     };
+                }
+            }
+            Key::Char(c @ ('/' | '?')) if p.op.is_none() && p.object.is_none() => {
+                self.cmdline = Some((c, String::new()));
+            }
+            Key::Char(c @ ('n' | 'N')) if p.op.is_none() => {
+                if let Some(to) = self.search_target(buf.text(), buf.cursor(), c == 'N', n) {
+                    buf.set_cursor(to);
                 }
             }
             Key::Char(d @ '0'..='9') if d != '0' || p.count.is_some() => {
@@ -313,6 +347,84 @@ impl Vim {
         }
     }
 
+    /// The prompt char and text of the open command line, for the status bar to draw.
+    pub fn command_line(&self) -> Option<(char, &str)> {
+        self.cmdline
+            .as_ref()
+            .map(|(prompt, line)| (*prompt, line.as_str()))
+    }
+
+    /// Runs `/` or `?` with `pattern`, which if empty is the last pattern.
+    fn search_command(&mut self, buf: &mut Buffer, forward: bool, pattern: String) {
+        let pattern = match (pattern.is_empty(), &self.search) {
+            (false, _) => pattern,
+            (true, Some((last, _))) => last.clone(),
+            (true, None) => return,
+        };
+        self.search = Some((pattern, forward));
+        if let Some(to) = self.search_target(buf.text(), buf.cursor(), false, 1) {
+            buf.set_cursor(to);
+            buf.clamp_to_char();
+        }
+    }
+
+    /// Where the `count`th next match of the last search is from `from`, going the way it went
+    /// (or the other way if `reverse`) and wrapping around the ends. Sets a message and gives
+    /// `None` if there is no match.
+    fn search_target(
+        &mut self,
+        text: &str,
+        from: usize,
+        reverse: bool,
+        count: usize,
+    ) -> Option<usize> {
+        let (pattern, forward) = self.search.as_ref()?;
+        let forward = *forward != reverse;
+        let mut at = from;
+        let mut wrapped = false;
+        for _ in 0..count {
+            let found = if forward {
+                let after = at + text[at..].chars().next().map_or(0, char::len_utf8);
+                text[after..]
+                    .find(pattern.as_str())
+                    .map(|i| after + i)
+                    .or_else(|| {
+                        wrapped = true;
+                        text.find(pattern.as_str())
+                    })
+            } else {
+                // A match that starts before the cursor counts even if it runs past it.
+                let mut end = (at + pattern.len() - 1).min(text.len());
+                loop {
+                    while !text.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    match text[..end].rfind(pattern.as_str()) {
+                        Some(i) if i >= at => end = i + pattern.len() - 1,
+                        found => break found,
+                    }
+                }
+                .or_else(|| {
+                    wrapped = true;
+                    text.rfind(pattern.as_str())
+                })
+            };
+            let Some(found) = found else {
+                self.message = format!("E486: Pattern not found: {pattern}");
+                return None;
+            };
+            at = found;
+        }
+        if wrapped {
+            self.message = format!(
+                "search hit {}, continuing at {}",
+                if forward { "BOTTOM" } else { "TOP" },
+                if forward { "TOP" } else { "BOTTOM" }
+            );
+        }
+        Some(at)
+    }
+
     /// The selected bytes in visual mode: both ends inclusive, or whole lines in visual-line mode.
     pub fn selection(&self, buf: &Buffer) -> Option<Range<usize>> {
         let text = buf.text();
@@ -337,7 +449,7 @@ impl Vim {
 
     /// `d`, `c`, or `y` from the cursor over the motion `key` (`g` set means `gg`).
     fn operator(&mut self, buf: &mut Buffer, op: char, key: Key, g: bool, count: Option<usize>) {
-        if !is_motion(key, g) {
+        if !is_motion(key, g) && !(!g && matches!(key, Key::Char('n' | 'N'))) {
             return;
         }
         let n = count.unwrap_or(1);
@@ -376,6 +488,12 @@ impl Vim {
                     to = next;
                 }
                 to
+            }
+            Key::Char(c @ ('n' | 'N')) if !g => {
+                match self.search_target(text, start, c == 'N', n) {
+                    Some(to) => to,
+                    None => return,
+                }
             }
             // `dw` on the last word of a line stops at the line's end instead of joining the
             // next line.
@@ -1249,5 +1367,81 @@ cd", 0, "9$", 4,
         let (mut vim, mut buf) = run("x", 0, "ihi\x1b.");
         press(&mut vim, &mut buf, "u");
         assert_eq!(buf.text(), "hix");
+    }
+
+    #[test]
+    fn search_moves_to_matches_and_wraps() {
+        let text = "one two three two";
+        for (cursor, keys, want) in [
+            (0, "/two\n", 4),
+            (4, "/two\n", 14),
+            (14, "/two\n", 4),
+            (0, "/two\nn", 14),
+            (0, "/two\nnn", 4),
+            (0, "/two\nN", 14),
+            (0, "/two\n2n", 4),
+            (0, "/two\n3n", 14),
+            (14, "?two\n", 4),
+            (4, "?two\n", 14),
+            (14, "?two\nn", 14),
+            (14, "?two\nN", 14),
+            (0, "/two\n/\n", 14),
+            (0, "/tw\x08\x08two\n", 4),
+            (0, "/x\x08\x08\x08\nx", 0),
+            (0, "/two\x1bx", 0),
+            (0, "/zzz\n", 0),
+            (0, "n", 0),
+            (4, "/e t\n", 12),
+            (0, "/ee\n", 11),
+        ] {
+            let (_, buf) = run(text, cursor, keys);
+            assert_eq!(buf.cursor(), want, "{keys:?} from {cursor}");
+        }
+        // The match after the cursor, not the one under it; matches are literal; chars are whole.
+        let (_, buf) = run("ab ab ab", 0, "/ab\n");
+        assert_eq!(buf.cursor(), 3);
+        let (_, buf) = run("axb a.b", 0, "/a.b\n");
+        assert_eq!(buf.cursor(), 4);
+        let (_, buf) = run("é été é", 0, "/é\n");
+        assert_eq!(buf.cursor(), 3);
+    }
+
+    #[test]
+    fn search_reports_on_the_status_line() {
+        let (mut vim, mut buf) = run("a b a", 0, "/zzz\n");
+        assert_eq!(vim.message, "E486: Pattern not found: zzz");
+        press(&mut vim, &mut buf, "l");
+        assert_eq!(vim.message, "");
+        press(&mut vim, &mut buf, "/a\n");
+        assert_eq!(vim.message, "");
+        press(&mut vim, &mut buf, "n");
+        assert_eq!(vim.message, "search hit BOTTOM, continuing at TOP");
+        press(&mut vim, &mut buf, "N");
+        assert_eq!(vim.message, "search hit TOP, continuing at BOTTOM");
+        // The open command line is readable while it is typed.
+        press(&mut vim, &mut buf, "?ab");
+        assert_eq!(vim.command_line(), Some(('?', "ab")));
+        press(&mut vim, &mut buf, "\x1b");
+        assert_eq!(vim.command_line(), None);
+    }
+
+    #[test]
+    fn search_works_as_a_motion_in_visual_mode_and_after_operators() {
+        let text = "one two three two";
+        let (vim, buf) = run(text, 0, "v/two\n");
+        assert_eq!((vim.mode, vim.selection(&buf)), (Mode::Visual, Some(0..5)));
+        let (vim, buf) = run(text, 0, "v/two\nn");
+        assert_eq!(vim.selection(&buf), Some(0..15));
+        let (_, buf) = run(text, 0, "/two\n0dn");
+        assert_eq!(buf.text(), "two three two");
+        let (_, buf) = run(text, 0, "/two\n$dN");
+        assert_eq!(buf.text(), "one two three o");
+        let (_, buf) = run(text, 0, "/two\n0d2n");
+        assert_eq!(buf.text(), "two");
+        // Nothing found, so nothing is deleted; and `d/` isn't a command.
+        let (_, buf) = run(text, 0, "dn");
+        assert_eq!(buf.text(), text);
+        let (_, buf) = run(text, 0, "d/x");
+        assert_eq!(buf.text(), "ne two three two");
     }
 }
