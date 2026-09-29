@@ -82,7 +82,7 @@ buttons. Smooth scrolling and transitions. Continuous scroll layout with a fixed
 - [x] Toggle underline via a style span
 - [x] Apply font color, size, and name via a style span; merge into an existing span instead of nesting a new one
 - [x] Uppercase the selection
-- [ ] With no selection, formatting applies to the word under the cursor
+- [x] With no selection, formatting applies to the word under the cursor
 - [ ] Each formatting command is one undo step
 
 ### Vim engine

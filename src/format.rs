@@ -28,10 +28,40 @@ impl Mark {
     }
 }
 
+/// The word at `pos`: the one holding the char there, else the one ending just before `pos`, so
+/// a caret at the end of a word still finds it. Apostrophes join a word but not at its ends.
+/// Empty if there is no word.
+fn word_at(text: &str, pos: usize) -> Range<usize> {
+    let is_word = |c: char| c.is_alphanumeric() || c == '\'' || c == '\u{2019}';
+    let anchor = match text[pos..].chars().next() {
+        Some(c) if is_word(c) => pos,
+        _ => match text[..pos].chars().next_back() {
+            Some(c) if is_word(c) => pos - c.len_utf8(),
+            _ => return pos..pos,
+        },
+    };
+    let start = text[..anchor].trim_end_matches(is_word).len();
+    let end = anchor
+        + text[anchor..]
+            .find(|c| !is_word(c))
+            .unwrap_or(text.len() - anchor);
+    let quote = ['\'', '\u{2019}'];
+    let word = text[start..end].trim_start_matches(quote);
+    let start = end - word.len();
+    let word = word.trim_end_matches(quote);
+    start..start + word.len()
+}
+
 /// Cuts `range` into one piece per paragraph, since a span can't cross a blank line. Each piece
 /// is trimmed of whitespace and of a leading block marker (`## `, `> `, `- `), which can't sit
-/// inside a span either. Pieces left empty are dropped.
+/// inside a span either. Pieces left empty are dropped. An empty `range` is a caret, and stands
+/// for the word at it.
 fn pieces(text: &str, spans: &[Span], range: Range<usize>) -> Vec<Range<usize>> {
+    let range = if range.is_empty() {
+        word_at(text, range.start)
+    } else {
+        range
+    };
     let mut pieces: Vec<Range<usize>> = Vec::new();
     let mut piece_start = range.start;
     let mut pos = range.start;
@@ -158,9 +188,15 @@ pub fn set_font_family(buf: &mut Buffer, range: Range<usize>, name: &str) {
 
 /// Uppercases the characters in `range`. It edits the text rather than styling it, so it survives
 /// export. Markup inside the range (URLs, attribute blocks, fences) is left alone, since
-/// uppercasing it would break links and styles. One undo step, or none if nothing changes.
+/// uppercasing it would break links and styles. An empty `range` is a caret, and stands for the
+/// word at it. One undo step, or none if nothing changes.
 pub fn uppercase(buf: &mut Buffer, range: Range<usize>) {
     let text = buf.text();
+    let range = if range.is_empty() {
+        word_at(text, range.start)
+    } else {
+        range
+    };
     let edits: Vec<(Range<usize>, String)> = runs(text, &parse(text))
         .into_iter()
         .filter(|run| !run.markup && run.range.start < range.end && range.start < run.range.end)
@@ -585,5 +621,36 @@ mod tests {
         let mut buf = Buffer::new("ABC 123");
         uppercase(&mut buf, 0..7);
         assert!(!buf.undo());
+    }
+
+    #[test]
+    fn empty_range_formats_the_word_at_the_caret() {
+        let at = |src: &str, pos: usize, f: fn(&mut Buffer, Range<usize>)| {
+            let mut buf = Buffer::new(src);
+            f(&mut buf, pos..pos);
+            buf.text().to_string()
+        };
+        let bold = |buf: &mut Buffer, r| toggle(buf, r, Mark::Bold);
+        // Inside a word, at its end, and at its start.
+        assert_eq!(at("one two three", 5, bold), "one *two* three");
+        assert_eq!(at("one two three", 7, bold), "one *two* three");
+        assert_eq!(at("one two three", 4, bold), "one *two* three");
+        // Apostrophes join a word, except at its ends.
+        assert_eq!(at("don't stop", 2, bold), "*don't* stop");
+        assert_eq!(at("'hi' there", 2, bold), "'*hi*' there");
+        // No word, or a caret beside a word inside markup, still resolves.
+        assert_eq!(at("a  b", 2, bold), "a  b");
+        assert_eq!(at("", 0, bold), "");
+        assert_eq!(at("one *two* three", 6, bold), "one two three");
+        // The other commands use the same rule.
+        assert_eq!(at("hello world", 8, uppercase), "hello WORLD");
+        assert_eq!(
+            at("one two", 5, toggle_underline),
+            r#"one [two]{style="text-decoration:underline"}"#
+        );
+        assert_eq!(
+            at("é ü", 3, |b, r| set_color(b, r, [0, 0, 0])),
+            r##"é [ü]{style="color:#000000"}"##
+        );
     }
 }
