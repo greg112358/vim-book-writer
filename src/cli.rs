@@ -11,6 +11,7 @@ const USAGE: &str =
   --size WxH          the size of the screenshot in pixels (default 1000x700)
   --tree              show the file tree
   --folder DIR        open DIR in the file tree
+  --export FILE       write the document to FILE as Markdown (.md) or PDF (.pdf) and exit
   --autosave          turn auto-save on
   --start             show the start screen
   --recent PATH       a file for the start screen's recent list, once for each (for screenshots)
@@ -38,6 +39,8 @@ pub struct Args {
     pub start: bool,
     /// Turn auto-save on, whatever the settings say.
     pub autosave: bool,
+    /// Write the document to this file, as Markdown or PDF by its extension, and exit.
+    pub export: Option<PathBuf>,
     /// Recent files to show instead of the saved list, for screenshots.
     pub recent: Vec<PathBuf>,
 }
@@ -55,6 +58,7 @@ impl Default for Args {
             popup: None,
             start: false,
             autosave: false,
+            export: None,
             recent: Vec::new(),
         }
     }
@@ -88,6 +92,13 @@ impl Args {
                 "--folder" => parsed.folder = Some(value("--folder")?.into()),
                 "--start" => parsed.start = true,
                 "--autosave" => parsed.autosave = true,
+                "--export" => {
+                    let path = PathBuf::from(value("--export")?);
+                    match path.extension().and_then(|e| e.to_str()) {
+                        Some("md" | "pdf") => parsed.export = Some(path),
+                        _ => return Err(format!("--export needs a .md or .pdf file\n\n{USAGE}")),
+                    }
+                }
                 "--recent" => parsed.recent.push(value("--recent")?.into()),
                 "--popup" => {
                     parsed.popup = Some(match value("--popup")?.as_str() {
@@ -213,6 +224,11 @@ mod tests {
         let args = parse(&["--start", "--recent", "a.dj", "--recent", "b.dj"]).unwrap();
         assert!(args.start && !args.autosave);
         assert!(parse(&["--autosave"]).unwrap().autosave);
+        assert_eq!(
+            parse(&["--export", "out.pdf"]).unwrap().export,
+            Some("out.pdf".into())
+        );
+        assert!(parse(&["--export", "out.txt"]).is_err() && parse(&["--export", "out"]).is_err());
         assert_eq!(args.recent, [PathBuf::from("a.dj"), PathBuf::from("b.dj")]);
         assert_eq!(parse(&["--popup", "font"]).unwrap().popup, Some(Menu::Font));
         assert!(parse(&["--popup", "nope"]).is_err());

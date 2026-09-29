@@ -122,7 +122,7 @@ buttons. Smooth scrolling and transitions. Continuous scroll layout with a fixed
 - [x] File tree UI with Neo-tree keys **[visual]**
 - [x] Command line (`:`) and search (`/`) prompts **[visual]**
 - [x] Auto-save toggle button **[visual]**
-- [ ] Export buttons for Markdown and PDF **[visual]**
+- [x] Export buttons for Markdown and PDF **[visual]**
 - [ ] Clipboard via `arboard`; reload on external change via `notify`
 - [ ] Packaging with `cargo-packager` for macOS and Linux
 

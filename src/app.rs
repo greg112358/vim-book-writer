@@ -48,6 +48,13 @@ pub struct Prompt {
     kind: PromptKind,
 }
 
+/// A file format to export the document as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportKind {
+    Markdown,
+    Pdf,
+}
+
 /// Something only the window can do, which the app asks for and the window then carries out and
 /// reports back with `open_file` or `open_folder`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +62,8 @@ pub enum Effect {
     Quit,
     PickFile,
     PickFolder,
+    /// Ask where to put an export; the window then calls `export_to`.
+    PickExport(ExportKind),
 }
 
 /// Everything about the running app that isn't drawing: the screen, the editor, the recent files,
@@ -250,6 +259,8 @@ impl App {
                 Click::Save => {
                     self.editor.save();
                 }
+                Click::ExportMarkdown => return vec![Effect::PickExport(ExportKind::Markdown)],
+                Click::ExportPdf => return vec![Effect::PickExport(ExportKind::Pdf)],
                 Click::ToggleAutoSave => {
                     self.autosave.enabled = !self.autosave.enabled;
                     self.config.auto_save = self.autosave.enabled;
@@ -530,6 +541,38 @@ impl App {
         } else {
             Vec::new()
         }
+    }
+
+    /// The name to offer for an export: the document's own name with the new extension, in its
+    /// folder, or `untitled` in the current one.
+    pub fn export_suggestion(&self, kind: ExportKind) -> PathBuf {
+        let extension = match kind {
+            ExportKind::Markdown => "md",
+            ExportKind::Pdf => "pdf",
+        };
+        match self.editor.path() {
+            Some(path) => path.with_extension(extension),
+            None => PathBuf::from(format!("untitled.{extension}")),
+        }
+    }
+
+    /// Writes the document to `path` as Markdown or PDF, and says on the status bar how it went.
+    /// Markdown drops color, size, font, and underline; PDF keeps them.
+    pub fn export_to(&mut self, kind: ExportKind, path: &Path) {
+        let text = self.editor.buf.text();
+        let bytes = match kind {
+            ExportKind::Markdown => crate::export::to_markdown(text).into_bytes(),
+            ExportKind::Pdf => {
+                let title = path
+                    .file_stem()
+                    .map_or_else(String::new, |s| s.to_string_lossy().into_owned());
+                crate::pdf::to_pdf(text, &title)
+            }
+        };
+        self.message = match std::fs::write(path, bytes) {
+            Ok(()) => format!("Exported {}", path.display()),
+            Err(error) => format!("Can't write {}: {error}", path.display()),
+        };
     }
 
     /// Opens `path` for editing and puts it first in the recent files. If it can't be read the
@@ -1166,5 +1209,84 @@ mod tests {
         app.tick(at(200_000));
         assert!(app.editor.buf.is_modified());
         assert!(app.editor.vim.message.is_empty());
+    }
+
+    #[test]
+    fn export_buttons_ask_for_a_place_and_export_writes_the_file() {
+        let path = temp_file(
+            "export",
+            "# Title\n\n*bold* and [red]{style=\"color:#c00\"} text\n",
+        );
+        let mut app = App::new(
+            Editor::open(&path).unwrap(),
+            Screen::Editing,
+            Recent::default(),
+            None,
+        );
+        let toolbar = toolbar::toolbar(app.regions(SIZE).toolbar);
+        let button = |label: &str| {
+            let b = toolbar
+                .buttons
+                .iter()
+                .find(|b| b.label == label)
+                .unwrap()
+                .bounds;
+            (b.x + b.w / 2.0, b.y + b.h / 2.0)
+        };
+        assert_eq!(
+            app.click(SIZE, button("MD"), |_, _| None),
+            [Effect::PickExport(ExportKind::Markdown)]
+        );
+        assert_eq!(
+            app.click(SIZE, button("PDF"), |_, _| None),
+            [Effect::PickExport(ExportKind::Pdf)]
+        );
+        // The suggested name is the file's own with the new extension.
+        let markdown = app.export_suggestion(ExportKind::Markdown);
+        assert_eq!(markdown, path.with_extension("md"));
+        assert_eq!(
+            app.export_suggestion(ExportKind::Pdf),
+            path.with_extension("pdf")
+        );
+        assert_eq!(
+            App::new(Editor::default(), Screen::Editing, Recent::default(), None)
+                .export_suggestion(ExportKind::Pdf),
+            PathBuf::from("untitled.pdf")
+        );
+        // Markdown is lossy about style but keeps the text; PDF is a PDF.
+        app.export_to(ExportKind::Markdown, &markdown);
+        assert_eq!(
+            std::fs::read_to_string(&markdown).unwrap(),
+            "# Title\n\n**bold** and red text\n"
+        );
+        assert!(app.message.starts_with("Exported "));
+        let pdf = path.with_extension("pdf");
+        app.export_to(ExportKind::Pdf, &pdf);
+        assert!(std::fs::read(&pdf).unwrap().starts_with(b"%PDF-"));
+        // A place that can't be written to is reported.
+        app.export_to(ExportKind::Markdown, Path::new("/nonexistent/dir/out.md"));
+        assert!(
+            app.message
+                .starts_with("Can't write /nonexistent/dir/out.md"),
+            "{}",
+            app.message
+        );
+        // The note shows on the status bar until the next key.
+        assert!(
+            app.chrome(SIZE)
+                .labels
+                .iter()
+                .any(|l| l.text.starts_with("Can't write"))
+        );
+        press(&mut app, "l");
+        assert!(
+            !app.chrome(SIZE)
+                .labels
+                .iter()
+                .any(|l| l.text.starts_with("Can't write"))
+        );
+        for file in [path, markdown, pdf] {
+            std::fs::remove_file(file).unwrap();
+        }
     }
 }

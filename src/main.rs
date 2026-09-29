@@ -2,7 +2,7 @@ mod gpu;
 mod rects;
 mod typeset;
 
-use book_writing_app::app::{App, Effect, Screen};
+use book_writing_app::app::{App, Effect, ExportKind, Screen};
 use book_writing_app::cli::Args;
 use book_writing_app::config::{self, Config};
 use book_writing_app::editor::Editor;
@@ -117,6 +117,26 @@ impl Shell {
                         self.app.open_file(&file);
                         self.scroll = Scroll::default();
                         self.seen = None;
+                    }
+                }
+                Effect::PickExport(kind) => {
+                    let suggestion = self.app.export_suggestion(kind);
+                    let (title, name, filter) = match kind {
+                        ExportKind::Markdown => ("Export as Markdown", "Markdown", "md"),
+                        ExportKind::Pdf => ("Export as PDF", "PDF", "pdf"),
+                    };
+                    let mut dialog = rfd::FileDialog::new()
+                        .set_title(title)
+                        .add_filter(name, &[filter]);
+                    if let Some(folder) = suggestion.parent().filter(|p| !p.as_os_str().is_empty())
+                    {
+                        dialog = dialog.set_directory(folder);
+                    }
+                    if let Some(file) = suggestion.file_name() {
+                        dialog = dialog.set_file_name(file.to_string_lossy());
+                    }
+                    if let Some(file) = dialog.save_file() {
+                        self.app.export_to(kind, &file);
                     }
                 }
                 Effect::PickFolder => {
@@ -287,6 +307,17 @@ fn main() {
     app.tree_visible = args.tree;
     if let Some(folder) = &args.folder {
         app.open_folder(folder);
+    }
+
+    if let Some(path) = &args.export {
+        let kind = if path.extension().is_some_and(|e| e == "pdf") {
+            ExportKind::Pdf
+        } else {
+            ExportKind::Markdown
+        };
+        app.export_to(kind, path);
+        eprintln!("{}", app.message);
+        std::process::exit(i32::from(!app.message.starts_with("Exported")));
     }
 
     if let Some(path) = &args.screenshot {
