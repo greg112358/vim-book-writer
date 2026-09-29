@@ -21,7 +21,14 @@ Pinned to stable lines: winit 0.30 (0.31 is beta) and notify 8 (9 is rc). Don't 
 - `cargo run` – open the window
 - `muda` is behind the `native-menu` feature (needs `gtk3-devel` on Linux); default builds skip it
 
+## Code style
+- Prefer large functions over splitting simple logic into many small calls.
+- Deduplicate only after the third repetition.
+- Use as few abstractions as get the job done. No traits, wrappers, or generics without a present need.
+- Write tests sparingly. Skip tautological and trivial ones. Test real logic with real edge cases (parsing, editing,
+  vim behavior, export). Keep changes frictionless: a test that breaks on every refactor is a bad test.
+- Keep it fast: no needless allocation or cloning on the typing and render paths.
+
 ## Rules
-- Put logic in the library crate with tests. The window and GPU layers can't be asserted on in a loop.
-- Editing behavior (undo/redo, cursor, selection) needs tests before it needs UI.
+- Put logic in the library crate so it stays testable. The window and GPU layers can't be asserted on in a loop.
 - Never leave `cargo test` or clippy failing when you stop.
