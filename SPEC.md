@@ -63,7 +63,7 @@ buttons. Smooth scrolling and transitions. Continuous scroll layout with a fixed
 - [x] Config load/save with defaults (`src/config.rs`)
 - [x] Directory listing that respects .gitignore (`src/files.rs`)
 - [x] Fuzzy filter (`src/finder.rs`)
-- [ ] Text buffer with insert, delete, and cursor movement; tested without a window
+- [x] Text buffer with insert, delete, and cursor movement; tested without a window
 - [ ] Undo/redo over the buffer; tests cover undo after insert, delete, and multi-step redo
 - [ ] Find in document returning match ranges; tests cover no-match and multiple matches
 
