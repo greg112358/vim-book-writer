@@ -70,7 +70,7 @@ buttons. Smooth scrolling and transitions. Continuous scroll layout with a fixed
 ### Djot model
 - [x] Add `jotdown`. Parse a document into styled spans that keep source byte ranges; tests for headings, lists,
       blockquote, code, links, emphasis, strong, strikethrough, and nested emphasis
-- [ ] Parse `{style="..."}` attributes into structured style (color, font-size, font-family, underline); tests include
+- [x] Parse `{style="..."}` attributes into structured style (color, font-size, font-family, underline); tests include
       malformed values, which must be ignored without panicking
 - [ ] Insert-mode styling map: for a source range, produce which characters are content and which are markup
       delimiters (so the renderer can draw delimiters faint); tests for `**bold**`, `_italic_`, `[text]{style="..."}`

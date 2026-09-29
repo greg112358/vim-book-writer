@@ -1,3 +1,4 @@
+use crate::style::Style;
 use jotdown::{Container, Event, Parser};
 use std::ops::Range;
 
@@ -19,13 +20,15 @@ pub enum SpanKind {
 }
 
 /// A styled piece of the source. Spans nest, so ranges overlap.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Span {
     pub kind: SpanKind,
     /// The whole span in the source, delimiters included.
     pub range: Range<usize>,
     /// The part between the delimiters. What `range` holds around it is markup.
     pub content: Range<usize>,
+    /// From a `style` attribute; empty when the span has none.
+    pub style: Style,
 }
 
 /// Parses djot into styled spans, in document order with parents before their children.
@@ -40,7 +43,7 @@ pub fn parse(src: &str) -> Vec<Span> {
     for (event, range) in Parser::new(src).into_offset_iter() {
         match &event {
             Event::Blankline => continue,
-            Event::Start(container, _) => {
+            Event::Start(container, attributes) => {
                 if let Some(kind) = span_kind(container) {
                     let mut content_start = range.end;
                     // Skip the space after `## `, `> ` and `- `.
@@ -58,6 +61,9 @@ pub fn parse(src: &str) -> Vec<Span> {
                         kind,
                         range: range.clone(),
                         content: content_start..content_start,
+                        style: attributes
+                            .get_value("style")
+                            .map_or_else(Style::default, |css| Style::parse(&css.to_string())),
                     });
                 }
             }
@@ -82,6 +88,7 @@ pub fn parse(src: &str) -> Vec<Span> {
                 kind: SpanKind::ThematicBreak,
                 range: range.clone(),
                 content: range.end..range.end,
+                style: Style::default(),
             }),
             _ => {}
         }
@@ -158,6 +165,24 @@ mod tests {
                 (ThematicBreak, "***", ""),
             ]
         );
+    }
+
+    #[test]
+    fn span_carries_its_parsed_style() {
+        let src = r#"[text]{style="color:#c00;font-size:14pt;text-decoration:underline"} and [x]{style="font-size:;color:"}"#;
+        let spans = parse(src);
+        assert_eq!(spans.len(), 2);
+        assert_eq!(
+            spans[0].style,
+            Style {
+                color: Some([0xcc, 0, 0]),
+                size_pt: Some(14.0),
+                family: None,
+                underline: true,
+            }
+        );
+        assert_eq!(spans[1].style, Style::default());
+        assert_eq!(&src[spans[1].content.clone()], "x");
     }
 
     #[test]
