@@ -79,7 +79,7 @@ buttons. Smooth scrolling and transitions. Continuous scroll layout with a fixed
 
 ### Formatting commands
 - [x] Toggle bold/italic/strikethrough over a selection: wraps with the delimiters, and removes them if already applied
-- [ ] Toggle underline via a style span
+- [x] Toggle underline via a style span
 - [ ] Apply font color, size, and name via a style span; merge into an existing span instead of nesting a new one
 - [ ] Uppercase the selection
 - [ ] With no selection, formatting applies to the word under the cursor
