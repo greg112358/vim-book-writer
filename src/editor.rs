@@ -101,6 +101,22 @@ impl Editor {
     /// Feeds a key to the vim engine and carries out what it asks for. True means the app
     /// should quit.
     pub fn key(&mut self, key: Key) -> bool {
+        // Shortcuts work in every mode, and do what the toolbar buttons do.
+        match key {
+            Key::Ctrl('s') => {
+                self.save();
+                return false;
+            }
+            Key::Ctrl(c @ ('b' | 'i' | 'u')) => {
+                self.apply(&match c {
+                    'b' => Action::Bold,
+                    'i' => Action::Italic,
+                    _ => Action::Underline,
+                });
+                return false;
+            }
+            _ => {}
+        }
         let before = self.buf.cursor();
         let quit = match self.vim.handle(&mut self.buf, key) {
             Some(Command::Save) => {
@@ -514,6 +530,33 @@ mod tests {
         editor.apply(&Action::Link);
         assert_eq!(editor.buf.text(), "see word here");
         assert_eq!(editor.vim.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn shortcuts_format_and_save_in_any_mode() {
+        let path = temp_file("shortcuts", "one two three");
+        let mut editor = Editor::open(&path).unwrap();
+        let ctrl = |editor: &mut Editor, c: char| editor.key(Key::Ctrl(c));
+        // Ctrl+B on the word at the cursor, Ctrl+I over a visual selection.
+        type_keys(&mut editor, "w");
+        ctrl(&mut editor, 'b');
+        assert_eq!(editor.buf.text(), "one *two* three");
+        type_keys(&mut editor, "wve");
+        ctrl(&mut editor, 'i');
+        assert_eq!(editor.buf.text(), "one *two* _three_");
+        assert_eq!(editor.vim.mode, Mode::Normal);
+        ctrl(&mut editor, 'u');
+        assert_eq!(
+            editor.buf.text(),
+            "one *two* _[three]{style=\"text-decoration:underline\"}_"
+        );
+        // While inserting, and Ctrl+S without leaving insert mode.
+        type_keys(&mut editor, "A!");
+        ctrl(&mut editor, 's');
+        assert_eq!(editor.vim.mode, Mode::Insert);
+        assert!(!editor.buf.is_modified());
+        assert!(std::fs::read_to_string(&path).unwrap().ends_with("}_!"));
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
