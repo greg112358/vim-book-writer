@@ -97,7 +97,7 @@ buttons. Smooth scrolling and transitions. Continuous scroll layout with a fixed
 - [x] Visual selection then a formatting shortcut applies the format to the selection
 
 ### Project, files, export
-- [ ] Recent files list: add, dedupe, cap at 20, persist to TOML; tests for ordering and persistence
+- [x] Recent files list: add, dedupe, cap at 20, persist to TOML; tests for ordering and persistence
 - [ ] Auto-save state machine: saves after N ms of no edits, not while nothing changed; tested with a fake clock
 - [ ] File tree model with Neo-tree operations (add, delete, rename, copy, move, yank path, paste, toggle hidden);
       tests use a temp directory

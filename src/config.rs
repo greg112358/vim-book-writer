@@ -1,4 +1,20 @@
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+/// The app's folder in the OS config location, for settings and the recent files list. `None` if
+/// the home directory can't be found.
+pub fn dir() -> Option<PathBuf> {
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+    let base = if cfg!(target_os = "macos") {
+        home.join("Library/Application Support")
+    } else {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .unwrap_or_else(|| home.join(".config"))
+    };
+    Some(base.join("book-writing-app"))
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
