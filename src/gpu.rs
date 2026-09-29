@@ -7,9 +7,11 @@ use std::sync::Arc;
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
-/// What a frame shows.
-pub struct Scene {
-    pub text: String,
+/// What a frame shows. `revision` changes whenever `text` does, so unchanged text isn't laid out
+/// again.
+pub struct Scene<'a> {
+    pub text: &'a str,
+    pub revision: u64,
 }
 
 /// The width of the text column, and the least margin on either side of it.
@@ -31,6 +33,8 @@ pub struct Gpu {
     atlas: TextAtlas,
     text: TextRenderer,
     buffer: Buffer,
+    /// The revision, length, and column width of the text `buffer` holds.
+    shown: Option<(u64, usize, u32)>,
 }
 
 /// A GPU and the window surface it draws to.
@@ -141,6 +145,7 @@ impl Gpu {
             atlas,
             text,
             buffer,
+            shown: None,
         }
     }
 
@@ -151,16 +156,20 @@ impl Gpu {
     }
 
     /// Draws the frame into `view`, which is `width` by `height` pixels.
-    fn paint(&mut self, view: &wgpu::TextureView, width: u32, height: u32, scene: &Scene) {
+    fn paint(&mut self, view: &wgpu::TextureView, width: u32, height: u32, scene: &Scene<'_>) {
         let margin = ((width as f32 - COLUMN_WIDTH) / 2.0).max(MIN_MARGIN);
         let column = (width as f32 - 2.0 * margin).max(1.0);
-        self.buffer.set_size(Some(column), Some(height as f32));
-        self.buffer.set_text(
-            &scene.text,
-            &Attrs::new().family(Family::Serif),
-            Shaping::Advanced,
-            None,
-        );
+        let key = (scene.revision, scene.text.len(), column as u32);
+        if self.shown != Some(key) {
+            self.buffer.set_size(Some(column), Some(height as f32));
+            self.buffer.set_text(
+                scene.text,
+                &Attrs::new().family(Family::Serif),
+                Shaping::Advanced,
+                None,
+            );
+            self.shown = Some(key);
+        }
         self.buffer.shape_until_scroll(&mut self.fonts, false);
         self.viewport
             .update(&self.queue, Resolution { width, height });
@@ -212,7 +221,7 @@ impl Gpu {
     }
 
     /// Draws one frame offscreen and returns it as tightly packed RGBA bytes.
-    pub fn screenshot(&mut self, width: u32, height: u32, scene: &Scene) -> Vec<u8> {
+    pub fn screenshot(&mut self, width: u32, height: u32, scene: &Scene<'_>) -> Vec<u8> {
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("screenshot"),
             size: wgpu::Extent3d {
@@ -305,7 +314,7 @@ impl WindowGpu {
         self.surface.configure(&self.gpu.device, &self.config);
     }
 
-    pub fn draw(&mut self, scene: &Scene) {
+    pub fn draw(&mut self, scene: &Scene<'_>) {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
             | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,

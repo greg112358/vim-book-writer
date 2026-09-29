@@ -108,7 +108,7 @@ buttons. Smooth scrolling and transitions. Continuous scroll layout with a fixed
 - [x] `--screenshot <path>` flag renders one frame offscreen to a PNG, with `--file`, `--mode`, and `--size` options
 - [x] wgpu surface + clear color in the winit window; `cargo build` succeeds
 - [x] Draw buffer text through glyphon **[visual]**
-- [ ] Keyboard input routed into the vim engine
+- [x] Keyboard input routed into the vim engine
 - [ ] Normal-mode rendering: hidden delimiters, styled headings, bold, italic, strikethrough **[visual]**
 - [ ] Insert-mode rendering: styled text with faint delimiters **[visual]**
 - [ ] Caret, selection highlight, and mouse caret placement **[visual]**
