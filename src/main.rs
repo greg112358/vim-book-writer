@@ -1,17 +1,17 @@
 mod gpu;
 
 use book_writing_app::cli::Args;
-use gpu::{Gpu, WindowGpu};
+use gpu::{Gpu, Scene, WindowGpu};
 use std::sync::Arc;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::{Window, WindowId};
 
-#[derive(Default)]
 struct App {
     window: Option<Arc<Window>>,
     gpu: Option<WindowGpu>,
+    scene: Scene,
 }
 
 impl ApplicationHandler for App {
@@ -40,7 +40,7 @@ impl ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => {
                 if let Some(gpu) = &mut self.gpu {
-                    gpu.draw();
+                    gpu.draw(&self.scene);
                 }
             }
             _ => {}
@@ -58,9 +58,18 @@ fn main() {
         }
     };
 
+    let text = match &args.file {
+        Some(path) => std::fs::read_to_string(path).unwrap_or_else(|error| {
+            eprintln!("can't read {}: {error}", path.display());
+            std::process::exit(1);
+        }),
+        None => String::new(),
+    };
+    let scene = Scene { text };
+
     if let Some(path) = &args.screenshot {
         let (width, height) = args.size;
-        let pixels = Gpu::headless().screenshot(width, height);
+        let pixels = Gpu::headless().screenshot(width, height, &scene);
         let file = std::fs::File::create(path).expect("failed to create the screenshot file");
         let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
         encoder.set_color(png::ColorType::Rgba);
@@ -74,6 +83,10 @@ fn main() {
 
     let event_loop = EventLoop::new().expect("failed to create event loop");
     event_loop
-        .run_app(&mut App::default())
+        .run_app(&mut App {
+            window: None,
+            gpu: None,
+            scene,
+        })
         .expect("event loop failed");
 }
