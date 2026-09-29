@@ -72,7 +72,7 @@ buttons. Smooth scrolling and transitions. Continuous scroll layout with a fixed
       blockquote, code, links, emphasis, strong, strikethrough, and nested emphasis
 - [x] Parse `{style="..."}` attributes into structured style (color, font-size, font-family, underline); tests include
       malformed values, which must be ignored without panicking
-- [ ] Insert-mode styling map: for a source range, produce which characters are content and which are markup
+- [x] Insert-mode styling map: for a source range, produce which characters are content and which are markup
       delimiters (so the renderer can draw delimiters faint); tests for `**bold**`, `_italic_`, `[text]{style="..."}`
 - [ ] Normal-mode rendering map: same input, but with delimiters and attribute blocks hidden; tests confirm the visible
       text of `**bold** and _it_` is `bold and it`

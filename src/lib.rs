@@ -6,5 +6,6 @@ pub mod djot;
 pub mod document;
 pub mod files;
 pub mod finder;
+pub mod runs;
 pub mod search;
 pub mod style;
