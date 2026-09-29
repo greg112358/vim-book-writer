@@ -89,7 +89,7 @@ buttons. Smooth scrolling and transitions. Continuous scroll layout with a fixed
 - [x] Modes: normal, insert, visual, visual-line, with correct transitions (`i a o O A I`, `v V`, `Esc`)
 - [x] Motions: `h j k l w b e 0 $ ^ gg G` and counts (`3w`)
 - [x] Operators: `d c y` with motions, doubled forms (`dd cc yy`), `x`, `p P`, `u`, `Ctrl-r`
-- [ ] Text objects: `iw aw ip ap i" a" i( a(`
+- [x] Text objects: `iw aw ip ap i" a" i( a(`
 - [ ] Registers: unnamed, named (`"a`), and yank/paste through them
 - [ ] Dot-repeat (`.`) for the last change
 - [ ] Search: `/`, `?`, `n`, `N`

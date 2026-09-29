@@ -1,7 +1,7 @@
 use crate::buffer::Buffer;
 use crate::motion::{
-    first_non_blank, line_end, line_start, nth_line_start, word_back, word_end, word_forward,
-    word_run_end,
+    first_non_blank, line_end, line_start, nth_line_start, text_object, word_back, word_end,
+    word_forward, word_run_end,
 };
 use std::ops::Range;
 
@@ -45,6 +45,9 @@ struct Pending {
     op: Option<char>,
     /// A `g` was typed and the next key completes it.
     g: bool,
+    /// `i` (`Some(false)`) or `a` (`Some(true)`) was typed after an operator or in visual mode,
+    /// and the next key names a text object.
+    object: Option<bool>,
 }
 
 /// Vim-style modal editing over a `Buffer`. Feed it keys with `handle`.
@@ -114,6 +117,33 @@ impl Vim {
                     ..p
                 };
             }
+            Key::Char(c @ ('i' | 'a')) if (p.op.is_some() || visual) && p.object.is_none() => {
+                self.pending = Pending {
+                    object: Some(c == 'a'),
+                    ..p
+                };
+            }
+            Key::Char(obj) if p.object.is_some() => {
+                let around = p.object == Some(true);
+                let found = text_object(buf.text(), buf.cursor(), obj, around);
+                if let Some((range, linewise)) = found {
+                    match p.op {
+                        Some(op) => {
+                            self.apply_operator(buf, op, range.clone(), linewise, range.start)
+                        }
+                        None => {
+                            // Visual mode: select the object.
+                            let last = buf.text()[..range.end].chars().next_back();
+                            self.anchor = range.start;
+                            buf.set_cursor(range.end - last.map_or(0, char::len_utf8));
+                            if linewise {
+                                self.mode = Mode::VisualLine;
+                            }
+                        }
+                    }
+                }
+            }
+            _ if p.object.is_some() => {}
             Key::Char(op @ ('d' | 'c' | 'y')) if visual => self.visual_operator(buf, op),
             Key::Char('x') if visual => self.visual_operator(buf, 'd'),
             // Capital operators work on whole lines.
@@ -939,5 +969,86 @@ cd", 0, "9$", 4,
         // p and u do nothing in visual mode yet, and don't end it.
         let (vim, buf) = run("abc", 0, "vlpu");
         assert_eq!((buf.text(), vim.mode), ("abc", Mode::Visual));
+    }
+
+    #[test]
+    fn operators_with_text_objects() {
+        for (text, cursor, keys, want, at) in [
+            ("one two three", 5, "diw", "one  three", 4),
+            ("one two three", 5, "daw", "one three", 4),
+            ("one two three", 8, "daw", "one two", 6),
+            ("one two three", 5, "ciwX\x1b", "one X three", 4),
+            ("one two three", 5, "yiwP", "one twotwo three", 6),
+            ("one two three", 5, "yawP", "one two two three", 7),
+            ("one two", 3, "diw", "onetwo", 3),
+            ("a b", 1, "diw", "ab", 1),
+            ("a\n\nb", 2, "diw", "a\n\nb", 2),
+            ("a\nb\n\nc\nd", 0, "dip", "\nc\nd", 0),
+            ("a\nb\n\nc\nd", 0, "dap", "c\nd", 0),
+            ("a\nb\n\nc\nd", 6, "dap", "a\nb", 2),
+            ("a\nb\n\nc\nd", 4, "dip", "a\nb\nc\nd", 4),
+            ("a\nb\n\nc\nd", 4, "dap", "a\nb", 2),
+            ("a\nb\n\nc\nd", 0, "cipX\x1b", "X\n\nc\nd", 0),
+            ("a\nb\n\nc", 0, "yipjjp", "a\nb\n\na\nb\nc", 5),
+            (r#"say "hi there" ok"#, 6, r#"di""#, r#"say "" ok"#, 5),
+            (r#"say "hi there" ok"#, 6, r#"da""#, "say ok", 4),
+            (r#"say "hi there" ok"#, 0, "ci\"X\x1b", r#"say "X" ok"#, 5),
+            ("f(a, (b), c)", 6, "di(", "f(a, (), c)", 6),
+            ("f(a, (b), c)", 3, "da(", "f", 0),
+            ("f(a, (b), c)", 3, "dib", "f()", 2),
+            ("f(a, (b), c)", 3, "ci)X\x1b", "f(X)", 2),
+            ("x [a {b} c]", 7, "di{", "x [a {} c]", 6),
+            ("x [a {b} c]", 7, "di]", "x []", 3),
+            ("(a\n b)", 4, "di(", "()", 1),
+        ] {
+            let (_, buf) = run(text, cursor, keys);
+            assert_eq!(
+                (buf.text(), buf.cursor()),
+                (want, at),
+                "{keys:?} on {text:?} at {cursor}"
+            );
+        }
+    }
+
+    #[test]
+    fn text_object_prefix_cancels_cleanly() {
+        for (keys, want) in [
+            ("dizx", "bc"),
+            ("di\x1bx", "bc"),
+            ("di3x", "abc"),
+            ("da\x08x", "bc"),
+        ] {
+            let (_, buf) = run("abc", 0, keys);
+            assert_eq!(buf.text(), want, "{keys:?}");
+        }
+        // `i` and `a` are still inserts when no operator is pending.
+        let (_, buf) = run("abc", 0, "iX\x1b");
+        assert_eq!(buf.text(), "Xabc");
+    }
+
+    #[test]
+    fn visual_mode_selects_text_objects() {
+        for (text, cursor, keys, want) in [
+            ("one two three", 5, "viwd", "one  three"),
+            ("one two three", 5, "vawd", "one three"),
+            ("a\nb\n\nc", 0, "vipd", "\nc"),
+            ("a\nb\n\nc", 0, "vapd", "c"),
+            (r#"x "a b" y"#, 4, r#"vi"d"#, r#"x "" y"#),
+            (r#"x "a b" y"#, 4, r#"va"d"#, "x y"),
+            ("f(a, b)", 3, "vi(d", "f()"),
+            ("f(a, b)", 3, "va(d", "f"),
+            ("f(a, b)", 3, "vi(y$p", "f(a, b)a, b"),
+        ] {
+            let (vim, buf) = run(text, cursor, keys);
+            assert_eq!(buf.text(), want, "{keys:?} on {text:?}");
+            assert_eq!(vim.mode, Mode::Normal, "{keys:?}");
+        }
+        let (vim, buf) = run("ab cd", 0, "viw");
+        assert_eq!(vim.selection(&buf), Some(0..2));
+        let (vim, buf) = run("a\nb\n\nc", 0, "vip");
+        assert_eq!(
+            (vim.mode, vim.selection(&buf)),
+            (Mode::VisualLine, Some(0..4))
+        );
     }
 }

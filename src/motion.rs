@@ -1,4 +1,6 @@
-//! Cursor motions as pure functions on text and a byte position.
+//! Cursor motions and text objects as pure functions on text and a byte position.
+
+use std::ops::Range;
 
 /// 0 for whitespace, 1 for word chars, 2 for punctuation. `w`, `b`, and `e` stop where it changes.
 fn class(c: char) -> u8 {
@@ -128,6 +130,201 @@ pub fn word_end(text: &str, pos: usize) -> usize {
     end
 }
 
+/// A space or tab. Text objects treat these as the only blanks; a newline always ends the object.
+fn blank(c: char) -> bool {
+    c == ' ' || c == '\t'
+}
+
+/// The range a text object covers around `pos`, and whether it is whole lines. `obj` is the
+/// key after `i` or `a`: `w`, `p`, a quote (`"` `'` `` ` ``), or a bracket (either side, or `b`
+/// `B`). `None` when there is no such object at `pos`.
+pub fn text_object(
+    text: &str,
+    pos: usize,
+    obj: char,
+    around: bool,
+) -> Option<(Range<usize>, bool)> {
+    match obj {
+        'w' => word_object(text, pos, around).map(|r| (r, false)),
+        'p' => paragraph_object(text, pos, around).map(|r| (r, true)),
+        '"' | '\'' | '`' => quote_object(text, pos, obj, around).map(|r| (r, false)),
+        '(' | ')' | 'b' => bracket_object(text, pos, '(', ')', around).map(|r| (r, false)),
+        '[' | ']' => bracket_object(text, pos, '[', ']', around).map(|r| (r, false)),
+        '{' | '}' | 'B' => bracket_object(text, pos, '{', '}', around).map(|r| (r, false)),
+        '<' | '>' => bracket_object(text, pos, '<', '>', around).map(|r| (r, false)),
+        _ => None,
+    }
+}
+
+/// `iw`: the run of blanks or of same-class chars at `pos`. `aw`: a word plus the blanks after
+/// it, or before it if none follow; blanks plus the word after them.
+fn word_object(text: &str, pos: usize, around: bool) -> Option<Range<usize>> {
+    let c = text[pos..].chars().next().filter(|&c| c != '\n')?;
+    let kind = |c: char| if blank(c) { 0 } else { class(c) };
+    let same = |run_class: u8, c: char| c != '\n' && kind(c) == run_class;
+    let run_of = |pos: usize| {
+        let run_class = kind(text[pos..].chars().next().unwrap());
+        let mut start = pos;
+        while let Some(c) = text[..start]
+            .chars()
+            .next_back()
+            .filter(|&c| same(run_class, c))
+        {
+            start -= c.len_utf8();
+        }
+        let mut end = pos;
+        while let Some(c) = text[end..].chars().next().filter(|&c| same(run_class, c)) {
+            end += c.len_utf8();
+        }
+        start..end
+    };
+    let run = run_of(pos);
+    if !around {
+        return Some(run);
+    }
+    if blank(c) {
+        return Some(match text[run.end..].chars().next() {
+            Some(next) if next != '\n' => run.start..run_of(run.end).end,
+            _ => run,
+        });
+    }
+    let trailing = text[run.end..]
+        .bytes()
+        .take_while(|&b| b == b' ' || b == b'\t')
+        .count();
+    if trailing > 0 {
+        return Some(run.start..run.end + trailing);
+    }
+    let leading = text[..run.start]
+        .bytes()
+        .rev()
+        .take_while(|&b| b == b' ' || b == b'\t')
+        .count();
+    Some(run.start - leading..run.end)
+}
+
+/// `ip`: the lines around `pos` that are all blank or all not blank. `ap` adds the blank lines
+/// after a paragraph (before it if none follow), or the paragraph after blank lines. A line of
+/// only whitespace is blank. The range takes whole lines, newline included.
+fn paragraph_object(text: &str, pos: usize, around: bool) -> Option<Range<usize>> {
+    if text.is_empty() {
+        return None;
+    }
+    let is_blank = |start: usize| text[start..line_end(text, start)].trim().is_empty();
+    // Start of the line after the one at `start`, if there is one.
+    let next_line = |start: usize| Some(line_end(text, start) + 1).filter(|&n| n < text.len());
+    let here = line_start(text, pos.min(text.len() - 1));
+    let kind = is_blank(here);
+    let (mut first, mut last) = (here, here);
+    while first > 0 && is_blank(line_start(text, first - 1)) == kind {
+        first = line_start(text, first - 1);
+    }
+    while let Some(next) = next_line(last).filter(|&n| is_blank(n) == kind) {
+        last = next;
+    }
+    if around {
+        // The other kind of lines follows, if anything does.
+        match next_line(last) {
+            Some(mut next) => {
+                last = next;
+                while let Some(n) = next_line(next).filter(|&n| is_blank(n) == !kind) {
+                    (next, last) = (n, n);
+                }
+            }
+            None if !kind => {
+                while first > 0 && is_blank(line_start(text, first - 1)) {
+                    first = line_start(text, first - 1);
+                }
+            }
+            None => {}
+        }
+    }
+    Some(first..(line_end(text, last) + 1).min(text.len()))
+}
+
+/// `i"`: inside the quote pair on the line that holds `pos`, or the first pair after it. `a"`
+/// adds the quotes and the blanks after them, or before them if none follow. Backslash-escaped
+/// quotes don't count.
+fn quote_object(text: &str, pos: usize, quote: char, around: bool) -> Option<Range<usize>> {
+    let (start, end) = (line_start(text, pos), line_end(text, pos));
+    let mut quotes = Vec::new();
+    let mut escaped = false;
+    for (i, c) in text[start..end].char_indices() {
+        if c == quote && !escaped {
+            quotes.push(start + i);
+        }
+        escaped = c == '\\' && !escaped;
+    }
+    let (open, close) = quotes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&[open, close]| (open, close))
+        .find(|&(_, close)| pos <= close)?;
+    if !around {
+        return Some(open + quote.len_utf8()..close);
+    }
+    let after = close + quote.len_utf8();
+    let trailing = text[after..end]
+        .bytes()
+        .take_while(|&b| b == b' ' || b == b'\t')
+        .count();
+    if trailing > 0 {
+        return Some(open..after + trailing);
+    }
+    let leading = text[start..open]
+        .bytes()
+        .rev()
+        .take_while(|&b| b == b' ' || b == b'\t')
+        .count();
+    Some(open - leading..after)
+}
+
+/// `i(`: inside the innermost bracket pair around `pos`, which may span lines. `a(` includes the
+/// brackets. On a bracket, that bracket's pair.
+fn bracket_object(
+    text: &str,
+    pos: usize,
+    open: char,
+    close: char,
+    around: bool,
+) -> Option<Range<usize>> {
+    let start = if text[pos..].starts_with(open) {
+        pos
+    } else {
+        let mut depth = 0;
+        text[..pos].char_indices().rev().find_map(|(i, c)| {
+            if c == close {
+                depth += 1;
+            } else if c == open {
+                if depth == 0 {
+                    return Some(i);
+                }
+                depth -= 1;
+            }
+            None
+        })?
+    };
+    let inner = start + open.len_utf8();
+    let mut depth = 0;
+    let end = text[inner..].char_indices().find_map(|(i, c)| {
+        if c == open {
+            depth += 1;
+        } else if c == close {
+            if depth == 0 {
+                return Some(inner + i);
+            }
+            depth -= 1;
+        }
+        None
+    })?;
+    Some(if around {
+        start..end + close.len_utf8()
+    } else {
+        inner..end
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,5 +387,97 @@ mod tests {
         assert_eq!(nth_line_start(text, 2), 6);
         assert_eq!(nth_line_start(text, 99), 7);
         assert_eq!(nth_line_start("a\nb", 99), 2);
+    }
+
+    /// The text a text object covers at the first occurrence of `at` in `text`, plus whether it
+    /// is linewise.
+    fn object<'a>(text: &'a str, at: &str, obj: char, around: bool) -> Option<(&'a str, bool)> {
+        let pos = text.find(at).unwrap();
+        text_object(text, pos, obj, around).map(|(r, lines)| (&text[r], lines))
+    }
+
+    #[test]
+    fn word_objects() {
+        let text = "foo bar.baz  qux";
+        assert_eq!(object(text, "oo", 'w', false), Some(("foo", false)));
+        assert_eq!(object(text, " bar", 'w', false), Some((" ", false)));
+        assert_eq!(object(text, ".", 'w', false), Some((".", false)));
+        assert_eq!(object(text, "  qux", 'w', false), Some(("  ", false)));
+        assert_eq!(object(text, "foo", 'w', true), Some(("foo ", false)));
+        assert_eq!(object(text, "bar", 'w', true), Some((" bar", false)));
+        // No blanks after the last word, so the ones before it join.
+        assert_eq!(object(text, "qux", 'w', true), Some(("  qux", false)));
+        assert_eq!(object(text, " bar", 'w', true), Some((" bar", false)));
+        assert_eq!(object(text, "  qux", 'w', true), Some(("  qux", false)));
+        // A newline ends it, and there is nothing on an empty line.
+        assert_eq!(object("a b\nc", "b", 'w', true), Some((" b", false)));
+        assert_eq!(text_object("a\n\nb", 2, 'w', false), None);
+        assert_eq!(text_object("é ü", 3, 'w', false), Some((3..5, false)));
+    }
+
+    #[test]
+    fn paragraph_objects() {
+        let text = "a\nb\n\n\nc\nd";
+        assert_eq!(object(text, "a", 'p', false), Some(("a\nb\n", true)));
+        assert_eq!(object(text, "b", 'p', true), Some(("a\nb\n\n\n", true)));
+        // On blank lines: the run of them, or them plus the next paragraph.
+        assert_eq!(text_object(text, 4, 'p', false), Some((4..6, true)));
+        assert_eq!(text_object(text, 4, 'p', true), Some((4..text.len(), true)));
+        // The last paragraph has none after it, so the blank lines before it join.
+        assert_eq!(object(text, "d", 'p', false), Some(("c\nd", true)));
+        assert_eq!(object(text, "d", 'p', true), Some(("\n\nc\nd", true)));
+        // Whitespace-only lines are blank.
+        assert_eq!(
+            object("a\n  \nb\n", "a", 'p', true),
+            Some(("a\n  \n", true))
+        );
+        assert_eq!(text_object("", 0, 'p', false), None);
+    }
+
+    #[test]
+    fn quote_objects() {
+        let text = r#"say "hi there" ok "again" \"x\" z"#;
+        assert_eq!(object(text, "hi", '"', false), Some(("hi there", false)));
+        assert_eq!(
+            object(text, "hi", '"', true),
+            Some((r#""hi there" "#, false))
+        );
+        // On a quote, in a pair; before any pair, the next one; between pairs, the next.
+        assert_eq!(
+            object(text, r#""hi"#, '"', false),
+            Some(("hi there", false))
+        );
+        assert_eq!(object(text, "say", '"', false), Some(("hi there", false)));
+        assert_eq!(object(text, "ok", '"', false), Some(("again", false)));
+        // No closing quote at the end, so blanks before the quotes join.
+        assert_eq!(object(r#"a "b""#, "b", '"', true), Some((r#" "b""#, false)));
+        // Escaped quotes don't pair; after the last pair there is nothing.
+        assert_eq!(object(text, r#"\"x"#, '"', false), None);
+        assert_eq!(object("a 'b' c", "b", '\'', false), Some(("b", false)));
+        assert_eq!(object("no quotes", "quotes", '"', false), None);
+    }
+
+    #[test]
+    fn bracket_objects() {
+        let text = "f(a, (b), c) g";
+        assert_eq!(object(text, "a,", '(', false), Some(("a, (b), c", false)));
+        assert_eq!(object(text, "a,", ')', true), Some(("(a, (b), c)", false)));
+        assert_eq!(object(text, "b", 'b', false), Some(("b", false)));
+        assert_eq!(object(text, ", c", 'b', false), Some(("a, (b), c", false)));
+        // On either bracket, that bracket's pair.
+        assert_eq!(object(text, "(b", '(', true), Some(("(b)", false)));
+        assert_eq!(object(text, "), c", '(', true), Some(("(b)", false)));
+        assert_eq!(object("x [a {b} c]", "b", '{', false), Some(("b", false)));
+        assert_eq!(
+            object("x [a {b} c]", "b", '[', false),
+            Some(("a {b} c", false))
+        );
+        assert_eq!(object("x <a>", "a", '>', true), Some(("<a>", false)));
+        // Across lines, and unbalanced or missing.
+        assert_eq!(object("(a\nb)", "b", '(', false), Some(("a\nb", false)));
+        assert_eq!(object("(a", "a", '(', false), None);
+        assert_eq!(object("a) b", "b", '(', false), None);
+        assert_eq!(object("abc", "b", '(', false), None);
+        assert_eq!(object("abc", "b", 'x', false), None);
     }
 }
