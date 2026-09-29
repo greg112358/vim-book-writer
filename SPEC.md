@@ -105,7 +105,7 @@ buttons. Smooth scrolling and transitions. Continuous scroll layout with a fixed
 - [x] Export djot to PDF with `printpdf`; tests confirm a valid PDF is produced and text appears in it
 
 ## Milestone 2: Window and rendering
-- [ ] `--screenshot <path>` flag renders one frame offscreen to a PNG, with `--file`, `--mode`, and `--size` options
+- [x] `--screenshot <path>` flag renders one frame offscreen to a PNG, with `--file`, `--mode`, and `--size` options
 - [x] wgpu surface + clear color in the winit window; `cargo build` succeeds
 - [ ] Draw buffer text through glyphon **[visual]**
 - [ ] Keyboard input routed into the vim engine

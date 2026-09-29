@@ -610,6 +610,7 @@ dependencies = [
  "muda",
  "notify",
  "nucleo",
+ "png",
  "pollster",
  "printpdf",
  "rfd",
