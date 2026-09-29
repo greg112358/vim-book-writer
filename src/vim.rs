@@ -1,4 +1,5 @@
 use crate::buffer::Buffer;
+use crate::format::{Mark, toggle, toggle_underline};
 use crate::motion::{
     first_non_blank, line_end, line_start, nth_line_start, text_object, word_back, word_end,
     word_forward, word_run_end,
@@ -154,6 +155,7 @@ impl Vim {
                 Key::Right => buf.move_right(),
                 Key::Up => buf.move_up(),
                 Key::Down => buf.move_down(),
+                Key::Ctrl(c @ ('b' | 'i' | 'u')) => self.shortcut(buf, c),
                 Key::Ctrl(_) => {}
             }
             return;
@@ -164,6 +166,11 @@ impl Vim {
                 self.command_revision = buf.revision();
             }
             self.command_keys.push(key);
+        }
+        if let Key::Ctrl(c @ ('b' | 'i' | 'u')) = key {
+            self.pending = Pending::default();
+            self.shortcut(buf, c);
+            return;
         }
         let p = std::mem::take(&mut self.pending);
         self.register = p.register;
@@ -373,6 +380,50 @@ impl Vim {
             }
             self.command_keys.clear();
         }
+    }
+
+    /// Applies a formatting command to the visual selection, or, with none, to the word at the
+    /// cursor, then leaves visual mode. The toolbar buttons and the keyboard shortcuts both come
+    /// through here. It is its own undo step, even in the middle of an insert session, and the
+    /// cursor stays in place around the change (at the start of the selection, in visual mode).
+    pub fn apply_format(
+        &mut self,
+        buf: &mut Buffer,
+        format: impl FnOnce(&mut Buffer, Range<usize>),
+    ) {
+        let range = self.selection(buf).unwrap_or(buf.cursor()..buf.cursor());
+        let caret = if self.mode == Mode::Insert || self.mode == Mode::Normal {
+            buf.cursor()
+        } else {
+            range.start
+        };
+        if self.mode == Mode::Insert {
+            buf.end_group();
+        }
+        let revision = buf.revision();
+        format(buf, range);
+        buf.set_cursor(if buf.revision() == revision {
+            caret
+        } else {
+            buf.shift_through_last_step(caret)
+        });
+        match self.mode {
+            Mode::Insert => buf.begin_group(),
+            Mode::Normal => buf.clamp_to_char(),
+            _ => {
+                self.mode = Mode::Normal;
+                buf.clamp_to_char();
+            }
+        }
+    }
+
+    /// Ctrl+B, Ctrl+I, Ctrl+U.
+    fn shortcut(&mut self, buf: &mut Buffer, key: char) {
+        self.apply_format(buf, |buf, range| match key {
+            'b' => toggle(buf, range, Mark::Bold),
+            'i' => toggle(buf, range, Mark::Italic),
+            _ => toggle_underline(buf, range),
+        });
     }
 
     /// The prompt char and text of the open command line, for the status bar to draw.
@@ -834,7 +885,10 @@ mod tests {
                     '\x1b' => Key::Esc,
                     '\n' => Key::Enter,
                     '\x08' => Key::Backspace,
+                    '\x02' => Key::Ctrl('b'),
+                    '\x09' => Key::Ctrl('i'),
                     '\x12' => Key::Ctrl('r'),
+                    '\x15' => Key::Ctrl('u'),
                     c => Key::Char(c),
                 },
             );
@@ -1561,5 +1615,57 @@ cd", 0, "9$", 4,
         // Not while an operator waits, where it isn't a motion.
         let (_, buf) = run("abc", 0, "d:x");
         assert_eq!(buf.text(), "bc");
+    }
+
+    #[test]
+    fn formatting_shortcuts_apply_to_the_selection() {
+        // (text, cursor, keys, text after, mode after, cursor after)
+        for (text, cursor, keys, want, at) in [
+            ("one two three", 4, "viw\x02", "one *two* three", 5),
+            ("one two three", 4, "viw\x09", "one _two_ three", 5),
+            (
+                "one two",
+                4,
+                "viw\x15",
+                "one [two]{style=\"text-decoration:underline\"}",
+                5,
+            ),
+            ("one *two* three", 5, "viw\x02", "one two three", 4),
+            ("one two three", 4, "viw\x02viw\x02", "one two three", 4),
+            ("hello world", 3, "V\x02", "*hello world*", 1),
+            ("a\nb\n\nc", 0, "Vjjj\x02", "*a\nb*\n\n*c*", 1),
+            ("one two three", 0, "vee\x02", "*one two* three", 1),
+            // With no selection it is the word at the cursor, in normal mode and in insert mode.
+            ("one two", 5, "\x02", "one *two*", 6),
+            ("one two", 0, "\x02", "*one* two", 1),
+            ("a  b", 2, "\x02", "a  b", 2),
+            ("one two", 3, "A\x02x\x1b", "one *two*x", 9),
+            ("one two", 0, "i\x02x\x1b", "*xone* two", 1),
+        ] {
+            let (vim, buf) = run(text, cursor, keys);
+            assert_eq!(
+                (buf.text(), buf.cursor()),
+                (want, at),
+                "{keys:?} on {text:?}"
+            );
+            assert_eq!(vim.mode, Mode::Normal, "{keys:?}");
+        }
+    }
+
+    #[test]
+    fn formatting_in_an_insert_session_is_its_own_undo_step() {
+        let (mut vim, mut buf) = run("one two", 0, "A x\x02y\x1b");
+        assert_eq!(buf.text(), "one two *x*y");
+        press(&mut vim, &mut buf, "u");
+        assert_eq!(buf.text(), "one two *x*");
+        press(&mut vim, &mut buf, "u");
+        assert_eq!(buf.text(), "one two x");
+        press(&mut vim, &mut buf, "u");
+        assert_eq!(buf.text(), "one two");
+        // In visual mode it is one step too, and it ends the selection.
+        let (mut vim, mut buf) = run("a\n\nb", 0, "vjjl\x02");
+        assert_eq!(buf.text(), "*a*\n\n*b*");
+        press(&mut vim, &mut buf, "u");
+        assert_eq!(buf.text(), "a\n\nb");
     }
 }

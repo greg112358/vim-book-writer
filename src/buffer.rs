@@ -56,6 +56,19 @@ impl Buffer {
         self.revision != self.saved_revision
     }
 
+    /// Where `pos` ends up after the edits of the last undo step, so a caller can keep a cursor
+    /// in place around a change it made: text inserted at or before `pos` pushes it along.
+    pub fn shift_through_last_step(&self, mut pos: usize) -> usize {
+        for edit in self.undo.last().into_iter().flatten() {
+            if pos >= edit.at + edit.old.len() {
+                pos = pos - edit.old.len() + edit.new_len;
+            } else if pos > edit.at {
+                pos = edit.at + edit.new_len;
+            }
+        }
+        pos
+    }
+
     /// Records that the text as it is now was saved.
     pub fn mark_saved(&mut self) {
         self.saved_revision = self.revision;

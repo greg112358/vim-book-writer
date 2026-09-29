@@ -94,7 +94,7 @@ buttons. Smooth scrolling and transitions. Continuous scroll layout with a fixed
 - [x] Dot-repeat (`.`) for the last change
 - [x] Search: `/`, `?`, `n`, `N`
 - [x] Ex commands: `:w`, `:q`, `:wq`, `:q!`; `:w` triggers the same code path as the Save button
-- [ ] Visual selection then a formatting shortcut applies the format to the selection
+- [x] Visual selection then a formatting shortcut applies the format to the selection
 
 ### Project, files, export
 - [ ] Recent files list: add, dedupe, cap at 20, persist to TOML; tests for ordering and persistence
