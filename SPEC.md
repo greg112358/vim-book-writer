@@ -110,7 +110,7 @@ buttons. Smooth scrolling and transitions. Continuous scroll layout with a fixed
 - [x] Draw buffer text through glyphon **[visual]**
 - [x] Keyboard input routed into the vim engine
 - [x] Normal-mode rendering: hidden delimiters, styled headings, bold, italic, strikethrough **[visual]**
-- [ ] Insert-mode rendering: styled text with faint delimiters **[visual]**
+- [x] Insert-mode rendering: styled text with faint delimiters **[visual]**
 - [ ] Caret, selection highlight, and mouse caret placement **[visual]**
 - [ ] Smooth scrolling with a fixed-width text column **[visual]**
 

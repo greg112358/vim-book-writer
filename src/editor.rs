@@ -1,7 +1,7 @@
 use crate::buffer::Buffer;
 use crate::display::Display;
 use crate::document::Document;
-use crate::vim::{Command, Key, Vim};
+use crate::vim::{Command, Key, Mode, Vim};
 use std::io;
 use std::path::Path;
 
@@ -11,9 +11,9 @@ pub struct Editor {
     pub buf: Buffer,
     pub vim: Vim,
     doc: Document,
-    /// What the screen shows, and the buffer revision it was made from.
+    /// What the screen shows, and the buffer revision and mode it was made for.
     display: Display,
-    display_revision: Option<u64>,
+    display_key: Option<(u64, bool)>,
     /// Counts the times `display` was rebuilt, so a renderer can tell when it changed.
     display_version: u64,
 }
@@ -26,17 +26,23 @@ impl Editor {
             vim: Vim::new(),
             doc,
             display: Display::default(),
-            display_revision: None,
+            display_key: None,
             display_version: 0,
         })
     }
 
-    /// What to draw. It is rebuilt only when the text has changed since the last call, and the
-    /// number that goes with it changes whenever it is.
+    /// What to draw: the source with faint syntax while inserting, and the finished-looking text
+    /// otherwise. It is rebuilt only when the text or that choice has changed since the last call,
+    /// and the number that goes with it changes whenever it is.
     pub fn display(&mut self) -> (&Display, u64) {
-        if self.display_revision != Some(self.buf.revision()) {
-            self.display = Display::normal(self.buf.text());
-            self.display_revision = Some(self.buf.revision());
+        let key = (self.buf.revision(), self.vim.mode == Mode::Insert);
+        if self.display_key != Some(key) {
+            self.display = if key.1 {
+                Display::insert(self.buf.text())
+            } else {
+                Display::normal(self.buf.text())
+            };
+            self.display_key = Some(key);
             self.display_version += 1;
         }
         (&self.display, self.display_version)
@@ -162,10 +168,15 @@ mod tests {
         assert_eq!(editor.display().1, first);
         type_keys(&mut editor, "l");
         assert_eq!(editor.display().1, first);
-        type_keys(&mut editor, "i*hi*\x1b");
+        type_keys(&mut editor, "i*hi*");
+        // While inserting, the display is the source; after Esc it hides the syntax.
         let (display, version) = editor.display();
-        assert_eq!(display.text, "hi");
+        assert_eq!(display.text, "*hi*");
         assert!(version > first);
+        type_keys(&mut editor, "\x1b");
+        let (display, version_after) = editor.display();
+        assert_eq!(display.text, "hi");
+        assert!(version_after > version);
     }
 
     #[test]

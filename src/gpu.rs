@@ -172,7 +172,7 @@ impl Gpu {
                 display.spans.iter().map(|span| {
                     (
                         &display.text[span.range.clone()],
-                        typeset::attrs(&span.format),
+                        typeset::attrs(&span.format, span.faint),
                     )
                 }),
                 &Attrs::new().family(Family::Serif),

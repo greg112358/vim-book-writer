@@ -10,6 +10,8 @@ pub struct Span {
     /// Where it came from in the source.
     pub source: Range<usize>,
     pub format: Format,
+    /// Syntax the writer typed, drawn dimmed so the text stays readable.
+    pub faint: bool,
 }
 
 /// What the screen shows for a document: the text, and how each stretch of it looks.
@@ -34,10 +36,30 @@ impl Display {
                 range: range.clone(),
                 source: run.range.clone(),
                 format: run.format.clone(),
+                faint: false,
             })
             .collect();
         Self {
             text: shown.text,
+            spans,
+        }
+    }
+
+    /// Insert mode: the source as typed, with each delimiter, block marker, and attribute block
+    /// marked faint and the words in the style they will have. `**Bold Text**` is faint `**`,
+    /// bold `Bold Text`, faint `**`.
+    pub fn insert(src: &str) -> Self {
+        let spans = runs(src, &parse(src))
+            .into_iter()
+            .map(|run| Span {
+                range: run.range.clone(),
+                source: run.range,
+                format: run.format,
+                faint: run.markup,
+            })
+            .collect();
+        Self {
+            text: src.to_string(),
             spans,
         }
     }
@@ -76,5 +98,40 @@ mod tests {
         }
         assert_eq!(end, display.text.len());
         assert_eq!(Display::normal(""), Display::default());
+        assert!(display.spans.iter().all(|s| !s.faint));
+    }
+
+    #[test]
+    fn insert_mode_shows_the_source_with_the_syntax_faint() {
+        let src = "## Head\n\n**Bold Text** and [red]{style=\"color:#c00\"}\n";
+        let display = Display::insert(src);
+        assert_eq!(display.text, src);
+        // (text, faint) for each span; neighbours that look alike were merged by `runs`.
+        let shown: Vec<(&str, bool)> = display
+            .spans
+            .iter()
+            .map(|s| (&display.text[s.range.clone()], s.faint))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("## ", true),
+                ("Head", false),
+                ("\n\n", false),
+                ("**", true),
+                ("Bold Text", false),
+                ("**", true),
+                (" and ", false),
+                ("[", true),
+                ("red", false),
+                ("]{style=\"color:#c00\"}", true),
+                ("\n", false),
+            ]
+        );
+        // The words and their delimiters are bold, and the source ranges are the text's own.
+        let bold: Vec<bool> = display.spans[3..6].iter().map(|s| s.format.bold).collect();
+        assert_eq!(bold, [true, true, true]);
+        assert!(display.spans.iter().all(|s| s.range == s.source));
+        assert_eq!(Display::insert(""), Display::default());
     }
 }
