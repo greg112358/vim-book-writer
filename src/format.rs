@@ -214,6 +214,37 @@ pub fn uppercase(buf: &mut Buffer, range: Range<usize>) {
     buf.end_group();
 }
 
+/// Makes the text in `range` a link with no target yet, `[text]()`, and returns where the cursor
+/// goes to type it: inside the parens. If the text is already inside a link, the link comes off
+/// and the result is `None`. Without any text it is `[]()` with the cursor in the brackets. One
+/// undo step.
+pub fn toggle_link(buf: &mut Buffer, range: Range<usize>) -> Option<usize> {
+    let text = buf.text();
+    let spans = parse(text);
+    let Some(piece) = pieces(text, &spans, range.clone()).into_iter().next() else {
+        buf.replace(range.start..range.start, "[]()");
+        return Some(range.start + 1);
+    };
+    let link = spans.iter().rev().find(|s| {
+        s.kind == SpanKind::Link && s.range.start <= piece.start && piece.end <= s.range.end
+    });
+    let unwrapped = link.map(|span| (span.range.clone(), text[span.content.clone()].to_string()));
+    buf.begin_group();
+    let cursor = match unwrapped {
+        Some((whole, inner)) => {
+            buf.replace(whole, &inner);
+            None
+        }
+        None => {
+            buf.replace(piece.end..piece.end, "]()");
+            buf.replace(piece.start..piece.start, "[");
+            Some(piece.end + 3)
+        }
+    };
+    buf.end_group();
+    cursor
+}
+
 /// Where a span's `{...}` attribute block sits and what its style attribute holds.
 struct StyleTarget {
     span: Span,
@@ -675,5 +706,28 @@ mod tests {
             assert_eq!(buf.text(), src);
             assert!(!buf.undo());
         }
+    }
+
+    #[test]
+    fn link_wraps_the_word_and_puts_the_cursor_in_the_parens() {
+        let mut buf = Buffer::new("see word here");
+        assert_eq!(toggle_link(&mut buf, 6..6), Some(11));
+        assert_eq!(buf.text(), "see [word]() here");
+        assert_eq!(&buf.text()[..11], "see [word](");
+        assert!(buf.undo());
+        assert_eq!(buf.text(), "see word here");
+        assert!(!buf.undo());
+        // A selection, and only its first paragraph.
+        let mut buf = Buffer::new("a b\n\nc");
+        assert_eq!(toggle_link(&mut buf, 0..6), Some(6));
+        assert_eq!(buf.text(), "[a b]()\n\nc");
+        // Inside a link, it comes off and leaves the text.
+        let mut buf = Buffer::new("x [text](http://a.b) y");
+        assert_eq!(toggle_link(&mut buf, 4..8), None);
+        assert_eq!(buf.text(), "x text y");
+        // With no word, an empty link with the cursor in the brackets.
+        let mut buf = Buffer::new("a  b");
+        assert_eq!(toggle_link(&mut buf, 2..2), Some(3));
+        assert_eq!(buf.text(), "a []() b");
     }
 }

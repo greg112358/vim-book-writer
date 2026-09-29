@@ -1,6 +1,8 @@
 //! Headless core of the editor. Everything here is testable without a window or GPU.
 
+pub mod action;
 pub mod autosave;
+pub mod blocks;
 pub mod buffer;
 pub mod cli;
 pub mod config;
@@ -20,6 +22,7 @@ pub mod runs;
 pub mod scroll;
 pub mod search;
 pub mod style;
+pub mod toolbar;
 pub mod tree;
 pub mod ui;
 pub mod vim;

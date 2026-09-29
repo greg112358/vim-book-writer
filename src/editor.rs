@@ -1,6 +1,12 @@
+use crate::action::Action;
+use crate::blocks::{set_heading, toggle_list, toggle_quote};
 use crate::buffer::Buffer;
 use crate::display::Display;
 use crate::document::Document;
+use crate::format::{
+    Mark, set_color, set_font_family, set_font_size, toggle, toggle_link, toggle_underline,
+    uppercase,
+};
 use crate::motion::{word_back, word_end};
 use crate::vim::{Command, Key, Mode, Vim};
 use std::io;
@@ -173,6 +179,46 @@ impl Editor {
         }
     }
 
+    /// Carries out a toolbar or shortcut action on the visual selection, or the word or line at the
+    /// cursor. Each is one undo step. A new link leaves you typing its address.
+    pub fn apply(&mut self, action: &Action) {
+        let buf = &mut self.buf;
+        match action {
+            Action::Bold => self.vim.apply_format(buf, |b, r| toggle(b, r, Mark::Bold)),
+            Action::Italic => self
+                .vim
+                .apply_format(buf, |b, r| toggle(b, r, Mark::Italic)),
+            Action::Strikethrough => {
+                self.vim
+                    .apply_format(buf, |b, r| toggle(b, r, Mark::Strikethrough));
+            }
+            Action::Underline => self.vim.apply_format(buf, toggle_underline),
+            Action::Uppercase => self.vim.apply_format(buf, uppercase),
+            Action::Color(color) => self.vim.apply_format(buf, |b, r| set_color(b, r, *color)),
+            Action::FontSize(pt) => self.vim.apply_format(buf, |b, r| set_font_size(b, r, *pt)),
+            Action::FontFamily(name) => {
+                self.vim
+                    .apply_format(buf, |b, r| set_font_family(b, r, name));
+            }
+            Action::Heading(level) => self.vim.apply_format(buf, |b, r| set_heading(b, r, *level)),
+            Action::BulletList => self.vim.apply_format(buf, |b, r| toggle_list(b, r, false)),
+            Action::NumberedList => self.vim.apply_format(buf, |b, r| toggle_list(b, r, true)),
+            Action::Quote => self.vim.apply_format(buf, toggle_quote),
+            Action::Link => {
+                let mut cursor = None;
+                self.vim
+                    .apply_format(buf, |b, r| cursor = toggle_link(b, r));
+                if let Some(cursor) = cursor {
+                    self.buf.set_cursor(cursor);
+                    if self.vim.mode != Mode::Insert {
+                        self.vim.insert_here(&mut self.buf);
+                    }
+                }
+            }
+        }
+        self.snap_cursor(self.buf.cursor(), Key::Esc);
+    }
+
     /// Writes the text to its file. This is what the Save button and `:w` both do. On failure it
     /// tells the status line why and returns false.
     pub fn save(&mut self) -> bool {
@@ -205,6 +251,7 @@ mod tests {
             quit |= editor.key(match c {
                 '\n' => Key::Enter,
                 '\x1b' => Key::Esc,
+                '\x12' => Key::Ctrl('r'),
                 c => Key::Char(c),
             });
         }
@@ -398,6 +445,75 @@ mod tests {
             (2, "bwa_editor_name.dj")
         );
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn actions_format_the_selection_or_the_word_at_the_cursor() {
+        let mut editor = Editor::default();
+        type_keys(&mut editor, "ione two three\x1b0w");
+        // No selection: the word at the cursor.
+        editor.apply(&Action::Bold);
+        assert_eq!(editor.buf.text(), "one *two* three");
+        editor.apply(&Action::Bold);
+        assert_eq!(editor.buf.text(), "one two three");
+        // A selection, and the visual mode ends.
+        type_keys(&mut editor, "ve");
+        editor.apply(&Action::Color([0xcc, 0, 0]));
+        assert_eq!(
+            editor.buf.text(),
+            "one [two]{style=\"color:#cc0000\"} three"
+        );
+        assert_eq!(editor.vim.mode, Mode::Normal);
+        // Undo takes back one action at a time.
+        editor.apply(&Action::Uppercase);
+        assert_eq!(
+            editor.buf.text(),
+            "one [TWO]{style=\"color:#cc0000\"} three"
+        );
+        type_keys(&mut editor, "u");
+        assert_eq!(
+            editor.buf.text(),
+            "one [two]{style=\"color:#cc0000\"} three"
+        );
+    }
+
+    #[test]
+    fn block_actions_work_on_the_cursors_line() {
+        let mut editor = Editor::default();
+        type_keys(&mut editor, "iTitle\nline one\nline two\x1b");
+        editor.apply(&Action::BulletList);
+        assert_eq!(editor.buf.text(), "Title\nline one\n\n- line two");
+        editor.apply(&Action::Heading(2));
+        assert_eq!(editor.buf.text(), "Title\nline one\n\n## - line two");
+        type_keys(&mut editor, "gg");
+        editor.apply(&Action::Heading(1));
+        editor.apply(&Action::Quote);
+        assert!(
+            editor.buf.text().starts_with("> # Title"),
+            "{}",
+            editor.buf.text()
+        );
+    }
+
+    #[test]
+    fn a_new_link_leaves_you_typing_its_address() {
+        let mut editor = Editor::default();
+        type_keys(&mut editor, "isee word here\x1b0w");
+        editor.apply(&Action::Link);
+        assert_eq!(editor.buf.text(), "see [word]() here");
+        assert_eq!(editor.vim.mode, Mode::Insert);
+        type_keys(&mut editor, "http://x.y\x1b");
+        assert_eq!(editor.buf.text(), "see [word](http://x.y) here");
+        // The address and the wrapping are separate undo steps.
+        type_keys(&mut editor, "u");
+        assert_eq!(editor.buf.text(), "see [word]() here");
+        type_keys(&mut editor, "u");
+        assert_eq!(editor.buf.text(), "see word here");
+        // Applied again inside a link, it comes off, and no insert starts.
+        type_keys(&mut editor, "\x12\x120w");
+        editor.apply(&Action::Link);
+        assert_eq!(editor.buf.text(), "see word here");
+        assert_eq!(editor.vim.mode, Mode::Normal);
     }
 
     #[test]

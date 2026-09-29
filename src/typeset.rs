@@ -27,7 +27,7 @@ pub fn attrs(format: &Format, faint: bool) -> Attrs<'_> {
         size *= 0.9;
     }
     let family = match &format.style.family {
-        Some(name) if !faint => Family::Name(name),
+        Some(name) if !faint => family(name),
         _ if mono => Family::Monospace,
         _ => Family::Serif,
     };
@@ -59,6 +59,17 @@ pub fn attrs(format: &Format, faint: bool) -> Attrs<'_> {
 
 const UNDERLINE: usize = 1;
 const STRIKE: usize = 2;
+
+/// The font family for a name from a style attribute. The three generic names mean whichever font
+/// of that kind is installed.
+fn family(name: &str) -> Family<'_> {
+    match name.to_ascii_lowercase().as_str() {
+        "serif" => Family::Serif,
+        "sans" | "sans-serif" => Family::SansSerif,
+        "mono" | "monospace" => Family::Monospace,
+        _ => Family::Name(name),
+    }
+}
 
 /// The lines for underlines and strikethroughs, for text laid out in `buffer` and drawn at
 /// (`left`, `top`). A line runs along consecutive glyphs marked for it.

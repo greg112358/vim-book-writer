@@ -6,7 +6,8 @@ use book_writing_app::cli::Args;
 use book_writing_app::editor::Editor;
 use book_writing_app::input;
 use book_writing_app::scroll::Scroll;
-use book_writing_app::ui::{self, Regions, Status};
+use book_writing_app::toolbar::{self, Click, Popup};
+use book_writing_app::ui::{self, Interface, Regions, Status};
 use book_writing_app::vim::{Key, Mode};
 use gpu::{Frame, Gpu, Layout, WindowGpu};
 use std::sync::Arc;
@@ -22,7 +23,7 @@ const PADDING: f32 = 54.0;
 const WHEEL_NOTCH: f32 = 81.0;
 
 /// What the window around the editor shows for the editor's current state.
-fn chrome(editor: &mut Editor, regions: &Regions) -> ui::Chrome {
+fn chrome(editor: &mut Editor, regions: &Regions, interface: &Interface<'_>) -> ui::Chrome {
     let status = Status {
         mode: editor.vim.mode,
         file: editor.file_name(),
@@ -30,7 +31,7 @@ fn chrome(editor: &mut Editor, regions: &Regions) -> ui::Chrome {
         words: editor.word_count(),
         message: editor.vim.message.clone(),
     };
-    ui::chrome(regions, &status)
+    ui::chrome(regions, &status, interface)
 }
 
 struct App {
@@ -42,6 +43,10 @@ struct App {
     mouse: (f32, f32),
     /// Whether the file tree is showing.
     tree: bool,
+    /// The toolbar menu that is open, the button the mouse is over, and the last color chosen.
+    popup: Option<Popup>,
+    hover: Option<usize>,
+    color: [u8; 3],
     scroll: Scroll,
     /// The layout of the last frame, for scrolling by the wheel.
     layout: Layout,
@@ -59,7 +64,14 @@ impl App {
         };
         let (width, height) = gpu.size();
         let regions = ui::regions(width as f32, height as f32, self.tree);
-        let chrome = chrome(&mut self.editor, &regions);
+        let toolbar = toolbar::toolbar(regions.toolbar);
+        let interface = Interface {
+            toolbar: &toolbar,
+            hover: self.hover,
+            popup: self.popup.as_ref(),
+            color: self.color,
+        };
+        let chrome = chrome(&mut self.editor, &regions, &interface);
         let view = self.editor.view();
         self.layout = gpu.gpu.layout(&view, regions.editor);
         let seen = (view.version, view.cursor);
@@ -88,9 +100,46 @@ impl App {
         }
     }
 
+    /// A left click at `mouse`: on an open menu's choices, the toolbar's buttons, or the text.
+    fn click(&mut self, (x, y): (f32, f32)) {
+        let Some(gpu) = &self.gpu else { return };
+        let (width, height) = gpu.size();
+        let regions = ui::regions(width as f32, height as f32, self.tree);
+        // An open menu takes the click: a choice applies, and anywhere else just closes it.
+        if let Some(popup) = self.popup.take() {
+            if let Some(item) = popup.hit(x, y) {
+                if let Some(color) = item.swatch {
+                    self.color = color;
+                }
+                self.editor.apply(&item.action);
+            }
+            return;
+        }
+        let toolbar = toolbar::toolbar(regions.toolbar);
+        if let Some(i) = toolbar.hit(x, y) {
+            match toolbar.buttons[i].click.clone() {
+                Click::Do(action) => self.editor.apply(&action),
+                Click::Open(menu) => {
+                    let anchor = toolbar.buttons[i].bounds;
+                    self.popup = Some(toolbar::popup(menu, anchor, (width as f32, height as f32)));
+                }
+            }
+        } else if regions.editor.contains(x, y) {
+            let block = self.editor.vim.mode != Mode::Insert;
+            let (display, _) = self.editor.display();
+            if let Some(offset) = gpu.gpu.hit(display, x, y, block) {
+                self.editor.click(offset);
+            }
+        }
+    }
+
     /// Feeds keys to the editor and redraws. Quits when the editor says to.
     fn keys(&mut self, event_loop: &ActiveEventLoop, keys: impl IntoIterator<Item = Key>) {
         for key in keys {
+            // Esc closes an open menu instead of reaching the editor.
+            if key == Key::Esc && self.popup.take().is_some() {
+                continue;
+            }
             if self.editor.key(key) {
                 event_loop.exit();
             }
@@ -129,24 +178,24 @@ impl ApplicationHandler for App {
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::CursorMoved { position, .. } => {
                 self.mouse = (position.x as f32, position.y as f32);
+                if let Some(gpu) = &self.gpu {
+                    let (width, height) = gpu.size();
+                    let regions = ui::regions(width as f32, height as f32, self.tree);
+                    let hover = toolbar::toolbar(regions.toolbar).hit(self.mouse.0, self.mouse.1);
+                    if hover != self.hover {
+                        self.hover = hover;
+                        if let Some(window) = &self.window {
+                            window.request_redraw();
+                        }
+                    }
+                }
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
                 button: MouseButton::Left,
                 ..
             } => {
-                if let Some(gpu) = &self.gpu {
-                    let (width, height) = gpu.size();
-                    let regions = ui::regions(width as f32, height as f32, self.tree);
-                    let block = self.editor.vim.mode != Mode::Insert;
-                    let (display, _) = self.editor.display();
-                    if regions.editor.contains(self.mouse.0, self.mouse.1)
-                        && let Some(offset) =
-                            gpu.gpu.hit(display, self.mouse.0, self.mouse.1, block)
-                    {
-                        self.editor.click(offset);
-                    }
-                }
+                self.click(self.mouse);
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }
@@ -215,7 +264,22 @@ fn main() {
     if let Some(path) = &args.screenshot {
         let (width, height) = args.size;
         let regions = ui::regions(width as f32, height as f32, args.tree);
-        let chrome = chrome(&mut editor, &regions);
+        let toolbar = toolbar::toolbar(regions.toolbar);
+        let popup = args.popup.map(|menu| {
+            let anchor = toolbar
+                .buttons
+                .iter()
+                .find(|b| b.click == Click::Open(menu))
+                .map_or_else(Default::default, |b| b.bounds);
+            toolbar::popup(menu, anchor, (width as f32, height as f32))
+        });
+        let interface = Interface {
+            toolbar: &toolbar,
+            hover: None,
+            popup: popup.as_ref(),
+            color: [0xcc, 0, 0],
+        };
+        let chrome = chrome(&mut editor, &regions, &interface);
         let view = editor.view();
         let mut gpu = Gpu::headless();
         // Scroll to the caret as the window would, but arrive at once.
@@ -256,6 +320,9 @@ fn main() {
             modifiers: ModifiersState::empty(),
             mouse: (0.0, 0.0),
             tree: args.tree,
+            popup: None,
+            hover: None,
+            color: [0xcc, 0, 0],
             scroll: Scroll::default(),
             layout: Layout::default(),
             seen: None,

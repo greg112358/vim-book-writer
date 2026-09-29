@@ -426,6 +426,12 @@ impl Vim {
         });
     }
 
+    /// Enters insert mode at the cursor, as `i` does.
+    pub fn insert_here(&mut self, buf: &mut Buffer) {
+        buf.begin_group();
+        self.mode = Mode::Insert;
+    }
+
     /// The prompt char and text of the open command line, for the status bar to draw.
     pub fn command_line(&self) -> Option<(char, &str)> {
         self.cmdline

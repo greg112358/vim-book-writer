@@ -1,3 +1,4 @@
+use crate::toolbar::{Click, Menu, Popup, Toolbar};
 use crate::vim::Mode;
 use taffy::prelude::*;
 
@@ -158,6 +159,7 @@ pub struct Label {
     pub size: f32,
     pub color: [u8; 4],
     pub bold: bool,
+    pub italic: bool,
     pub align: Align,
 }
 
@@ -166,6 +168,19 @@ pub struct Label {
 pub struct Chrome {
     pub rects: Vec<Rect>,
     pub labels: Vec<Label>,
+    /// Drawn on top of the editor's text and its caret, like an open menu.
+    pub over_rects: Vec<Rect>,
+    pub over_labels: Vec<Label>,
+}
+
+/// The toolbar as it is now, for `chrome` to draw.
+pub struct Interface<'a> {
+    pub toolbar: &'a Toolbar,
+    /// The button the mouse is over.
+    pub hover: Option<usize>,
+    pub popup: Option<&'a Popup>,
+    /// The color last chosen, shown under the color button.
+    pub color: [u8; 3],
 }
 
 pub const BAR: [u8; 4] = [0xee, 0xe8, 0xda, 0xff];
@@ -174,6 +189,9 @@ pub const BORDER: [u8; 4] = [0xd8, 0xd0, 0xbd, 0xff];
 pub const INK: [u8; 4] = [0x33, 0x33, 0x33, 0xff];
 pub const MUTED: [u8; 4] = [0x7a, 0x74, 0x66, 0xff];
 const LABEL_SIZE: f32 = 12.0;
+const BUTTON_SIZE: f32 = 13.0;
+const HOVER: [u8; 4] = [0xe0, 0xd8, 0xc4, 0xff];
+const MENU: [u8; 4] = [0xfc, 0xf9, 0xf2, 0xff];
 
 /// What the status bar says.
 #[derive(Debug, Clone, PartialEq)]
@@ -195,8 +213,8 @@ fn mode_name(mode: Mode) -> &'static str {
     }
 }
 
-/// The toolbar and status bar backgrounds, the tree panel, and the status text.
-pub fn chrome(regions: &Regions, status: &Status) -> Chrome {
+/// The toolbar and its buttons, the status bar and its text, the tree panel, and an open menu.
+pub fn chrome(regions: &Regions, status: &Status, ui: &Interface<'_>) -> Chrome {
     let mut chrome = Chrome::default();
     let line = |bounds: Bounds| Rect {
         h: 1.0,
@@ -209,6 +227,82 @@ pub fn chrome(regions: &Regions, status: &Status) -> Chrome {
         y: toolbar.y + toolbar.h - 1.0,
         ..line(toolbar)
     });
+    for (i, button) in ui.toolbar.buttons.iter().enumerate() {
+        let b = button.bounds;
+        let open =
+            matches!((&button.click, ui.popup), (Click::Open(menu), Some(p)) if p.menu == *menu);
+        if ui.hover == Some(i) || open {
+            chrome.rects.push(Rect::new(b, HOVER));
+        }
+        let is_color = button.click == Click::Open(Menu::Color);
+        chrome.labels.push(Label {
+            text: button.label.clone(),
+            x: b.x + b.w / 2.0,
+            // The color button's letter sits higher, to leave room for the swatch under it.
+            y: b.y + (b.h - BUTTON_SIZE * 1.3) / 2.0 - if is_color { 2.0 } else { 0.0 },
+            size: BUTTON_SIZE,
+            color: INK,
+            bold: matches!(button.label.as_str(), "B" | "H1" | "H2" | "H3"),
+            italic: button.label == "I",
+            align: Align::Center,
+        });
+        if is_color {
+            let [r, g, blue] = ui.color;
+            chrome.rects.push(Rect {
+                x: b.x + 6.0,
+                y: b.y + b.h - 8.0,
+                w: b.w - 12.0,
+                h: 3.0,
+                color: [r, g, blue, 0xff],
+            });
+        }
+    }
+    if let Some(popup) = ui.popup {
+        let p = popup.bounds;
+        chrome.over_rects.push(Rect {
+            x: p.x + 2.0,
+            y: p.y + 2.0,
+            ..Rect::new(p, [0, 0, 0, 0x28])
+        });
+        chrome.over_rects.push(Rect::new(p, BORDER));
+        chrome.over_rects.push(Rect::new(
+            Bounds {
+                x: p.x + 1.0,
+                y: p.y + 1.0,
+                w: p.w - 2.0,
+                h: p.h - 2.0,
+            },
+            MENU,
+        ));
+        for item in &popup.items {
+            let b = item.bounds;
+            if let Some([r, g, blue]) = item.swatch {
+                chrome
+                    .over_rects
+                    .push(Rect::new(b, [0x99, 0x92, 0x84, 0xff]));
+                chrome.over_rects.push(Rect::new(
+                    Bounds {
+                        x: b.x + 1.0,
+                        y: b.y + 1.0,
+                        w: b.w - 2.0,
+                        h: b.h - 2.0,
+                    },
+                    [r, g, blue, 0xff],
+                ));
+            } else {
+                chrome.over_labels.push(Label {
+                    text: item.label.clone(),
+                    x: b.x + 6.0,
+                    y: b.y + (b.h - BUTTON_SIZE * 1.3) / 2.0,
+                    size: BUTTON_SIZE,
+                    color: INK,
+                    bold: false,
+                    italic: false,
+                    align: Align::Left,
+                });
+            }
+        }
+    }
 
     if let Some(tree) = regions.tree {
         chrome.rects.push(Rect::new(tree, PANEL));
@@ -229,6 +323,7 @@ pub fn chrome(regions: &Regions, status: &Status) -> Chrome {
         size: LABEL_SIZE,
         color,
         bold,
+        italic: false,
         align,
     };
     chrome.labels.push(label(
@@ -352,8 +447,17 @@ mod tests {
             words,
             message: message.into(),
         };
+        let toolbar = crate::toolbar::Toolbar {
+            buttons: Vec::new(),
+        };
+        let interface = Interface {
+            toolbar: &toolbar,
+            hover: None,
+            popup: None,
+            color: [0, 0, 0],
+        };
         let texts = |s: Status| -> Vec<String> {
-            chrome(&regions, &s)
+            chrome(&regions, &s, &interface)
                 .labels
                 .into_iter()
                 .map(|l| l.text)
@@ -374,7 +478,16 @@ mod tests {
         );
         // The labels sit inside the status bar.
         let bar = regions.status;
-        for label in chrome(&regions, &status(Mode::Normal, false, 3, "")).labels {
+        let toolbar = crate::toolbar::Toolbar {
+            buttons: Vec::new(),
+        };
+        let interface = Interface {
+            toolbar: &toolbar,
+            hover: None,
+            popup: None,
+            color: [0, 0, 0],
+        };
+        for label in chrome(&regions, &status(Mode::Normal, false, 3, ""), &interface).labels {
             assert!(
                 label.y >= bar.y && label.y + label.size <= bar.y + bar.h,
                 "{label:?}"

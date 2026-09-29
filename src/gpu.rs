@@ -2,11 +2,11 @@ use crate::rects::Rects;
 use crate::typeset::{self, FONT_SIZE, LINE_HEIGHT};
 use book_writing_app::display::Display;
 use book_writing_app::editor::View;
-use book_writing_app::ui::{Align, Bounds, Chrome};
+use book_writing_app::ui::{Align, Bounds, Chrome, Label};
 use cosmic_text::fontdb;
 use glyphon::{
-    Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache,
-    TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Weight,
+    Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, Style,
+    SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Weight,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -51,10 +51,12 @@ pub struct Gpu {
     viewport: Viewport,
     atlas: TextAtlas,
     text: TextRenderer,
+    /// Draws the text that goes over the rest, like an open menu.
+    text_over: TextRenderer,
     rects: Rects,
     buffer: Buffer,
     /// Shaped interface text, by text, size, and weight.
-    labels: HashMap<(String, u32, bool), Buffer>,
+    labels: HashMap<LabelKey, Buffer>,
     /// The display version and column width of the text `buffer` holds.
     shown: Option<(u64, u32)>,
     /// Where the text's top left corner was drawn, for turning clicks into text positions.
@@ -66,6 +68,64 @@ pub struct WindowGpu {
     pub gpu: Gpu,
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
+}
+
+type LabelKey = (String, u32, u8);
+
+fn label_key(label: &Label) -> LabelKey {
+    (
+        label.text.clone(),
+        label.size.to_bits(),
+        u8::from(label.bold) | u8::from(label.italic) << 1,
+    )
+}
+
+/// Shapes each label that isn't cached yet.
+fn shape_labels(cache: &mut HashMap<LabelKey, Buffer>, fonts: &mut FontSystem, labels: &[Label]) {
+    for label in labels {
+        cache.entry(label_key(label)).or_insert_with(|| {
+            let mut buffer = Buffer::new(fonts, Metrics::new(label.size, label.size * 1.3));
+            let mut attrs = Attrs::new().family(Family::SansSerif);
+            if label.bold {
+                attrs = attrs.weight(Weight::BOLD);
+            }
+            if label.italic {
+                attrs = attrs.style(Style::Italic);
+            }
+            buffer.set_text(&label.text, &attrs, Shaping::Advanced, None);
+            buffer.shape_until_scroll(fonts, false);
+            buffer
+        });
+    }
+}
+
+/// Where each shaped label goes on screen, from its anchor and alignment.
+fn label_areas<'a>(cache: &'a HashMap<LabelKey, Buffer>, labels: &[Label]) -> Vec<TextArea<'a>> {
+    labels
+        .iter()
+        .map(|label| {
+            let buffer = &cache[&label_key(label)];
+            let width = buffer
+                .layout_runs()
+                .map(|run| run.line_w)
+                .fold(0.0, f32::max);
+            let left = match label.align {
+                Align::Left => label.x,
+                Align::Right => label.x - width,
+                Align::Center => label.x - width / 2.0,
+            };
+            let [r, g, b, a] = label.color;
+            TextArea {
+                buffer,
+                left,
+                top: label.y,
+                scale: 1.0,
+                bounds: TextBounds::default(),
+                default_color: Color::rgba(r, g, b, a),
+                custom_glyphs: &[],
+            }
+        })
+        .collect()
 }
 
 impl Gpu {
@@ -160,6 +220,8 @@ impl Gpu {
         let mut atlas = TextAtlas::new(&device, &queue, &cache, format);
         let text = TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
         let buffer = Buffer::new(&mut fonts, Metrics::new(FONT_SIZE, FONT_SIZE * LINE_HEIGHT));
+        let text_over =
+            TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
         let rects = Rects::new(&device, format);
         Self {
             device,
@@ -169,6 +231,7 @@ impl Gpu {
             viewport,
             atlas,
             text,
+            text_over,
             rects,
             buffer,
             labels: HashMap::new(),
@@ -251,67 +314,24 @@ impl Gpu {
         if self.labels.len() > 512 {
             self.labels.clear();
         }
-        for label in &frame.chrome.labels {
-            let key = (label.text.clone(), label.size.to_bits(), label.bold);
-            self.labels.entry(key).or_insert_with(|| {
-                let mut buffer =
-                    Buffer::new(&mut self.fonts, Metrics::new(label.size, label.size * 1.3));
-                let weight = if label.bold {
-                    Weight::BOLD
-                } else {
-                    Weight::NORMAL
-                };
-                buffer.set_text(
-                    &label.text,
-                    &Attrs::new().family(Family::SansSerif).weight(weight),
-                    Shaping::Advanced,
-                    None,
-                );
-                buffer.shape_until_scroll(&mut self.fonts, false);
-                buffer
-            });
-        }
-        let clip = |b: Bounds| TextBounds {
-            left: b.x as i32,
-            top: b.y as i32,
-            right: (b.x + b.w) as i32,
-            bottom: (b.y + b.h) as i32,
-        };
+        shape_labels(&mut self.labels, &mut self.fonts, &frame.chrome.labels);
+        shape_labels(&mut self.labels, &mut self.fonts, &frame.chrome.over_labels);
         let mut areas = vec![TextArea {
             buffer: &self.buffer,
             left,
             top,
             scale: 1.0,
-            bounds: clip(editor),
+            bounds: TextBounds {
+                left: editor.x as i32,
+                top: editor.y as i32,
+                right: (editor.x + editor.w) as i32,
+                bottom: (editor.y + editor.h) as i32,
+            },
             default_color: typeset::TEXT,
             custom_glyphs: &[],
         }];
-        for label in &frame.chrome.labels {
-            let buffer = &self.labels[&(label.text.clone(), label.size.to_bits(), label.bold)];
-            let text_width = buffer
-                .layout_runs()
-                .map(|run| run.line_w)
-                .fold(0.0, f32::max);
-            let x = match label.align {
-                Align::Left => label.x,
-                Align::Right => label.x - text_width,
-                Align::Center => label.x - text_width / 2.0,
-            };
-            areas.push(TextArea {
-                buffer,
-                left: x,
-                top: label.y,
-                scale: 1.0,
-                bounds: TextBounds::default(),
-                default_color: Color::rgba(
-                    label.color[0],
-                    label.color[1],
-                    label.color[2],
-                    label.color[3],
-                ),
-                custom_glyphs: &[],
-            });
-        }
+        areas.extend(label_areas(&self.labels, &frame.chrome.labels));
+        let over_areas = label_areas(&self.labels, &frame.chrome.over_labels);
         self.viewport
             .update(&self.queue, Resolution { width, height });
         self.text
@@ -322,6 +342,17 @@ impl Gpu {
                 &mut self.atlas,
                 &self.viewport,
                 areas,
+                &mut self.swash,
+            )
+            .expect("failed to prepare text");
+        self.text_over
+            .prepare(
+                &self.device,
+                &self.queue,
+                &mut self.fonts,
+                &mut self.atlas,
+                &self.viewport,
+                over_areas,
                 &mut self.swash,
             )
             .expect("failed to prepare text");
@@ -377,6 +408,17 @@ impl Gpu {
             );
             self.rects
                 .draw(&self.device, &self.queue, &mut pass, size, &over);
+            pass.set_scissor_rect(0, 0, width, height);
+            self.rects.draw(
+                &self.device,
+                &self.queue,
+                &mut pass,
+                size,
+                &frame.chrome.over_rects,
+            );
+            self.text_over
+                .render(&self.atlas, &self.viewport, &mut pass)
+                .expect("failed to draw text");
         }
         self.queue.submit([encoder.finish()]);
         self.atlas.trim();
