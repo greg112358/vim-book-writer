@@ -20,6 +20,18 @@ pub enum Key {
     Down,
 }
 
+/// Something the engine can't do itself and asks the app to do. `Save` is what `:w` and the Save
+/// button both produce, so they share one code path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Command {
+    Save,
+    Quit,
+    /// Quit even with unsaved changes.
+    ForceQuit,
+    /// Save, and quit if that worked.
+    SaveQuit,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Mode {
     #[default]
@@ -61,7 +73,9 @@ pub struct Vim {
     pub mode: Mode,
     /// A note for the status bar, like a failed search. Cleared by the next key.
     pub message: String,
-    /// The prompt char (`/` or `?`) and text of the command line being typed, if one is open.
+    /// What the last key asked the app to do.
+    command: Option<Command>,
+    /// The prompt char (`/`, `?`, or `:`) and text of the command line being typed, if one is open.
     /// It sits over whichever mode it was opened from.
     cmdline: Option<(char, String)>,
     /// The last search pattern, and whether it went forward.
@@ -89,13 +103,23 @@ impl Vim {
         Self::default()
     }
 
-    pub fn handle(&mut self, buf: &mut Buffer, key: Key) {
+    /// Handles one key. The result is a request for the app, if the key made one.
+    pub fn handle(&mut self, buf: &mut Buffer, key: Key) -> Option<Command> {
+        self.command = None;
+        self.handle_key(buf, key);
+        self.command.take()
+    }
+
+    fn handle_key(&mut self, buf: &mut Buffer, key: Key) {
         if let Some((_, line)) = &mut self.cmdline {
             match key {
                 Key::Esc => self.cmdline = None,
                 Key::Enter => {
-                    let (prompt, pattern) = self.cmdline.take().unwrap_or_default();
-                    self.search_command(buf, prompt == '/', pattern);
+                    let (prompt, text) = self.cmdline.take().unwrap_or_default();
+                    match prompt {
+                        ':' => self.ex_command(buf, &text),
+                        _ => self.search_command(buf, prompt == '/', text),
+                    }
                 }
                 // Backspace on an empty line closes it.
                 Key::Backspace => {
@@ -176,8 +200,12 @@ impl Vim {
                     };
                 }
             }
-            Key::Char(c @ ('/' | '?')) if p.op.is_none() && p.object.is_none() => {
+            Key::Char(c @ ('/' | '?' | ':')) if p.op.is_none() && p.object.is_none() => {
                 self.cmdline = Some((c, String::new()));
+                // There are no ranges, so a selection has nothing to do with an ex command.
+                if c == ':' {
+                    self.mode = Mode::Normal;
+                }
             }
             Key::Char(c @ ('n' | 'N')) if p.op.is_none() => {
                 if let Some(to) = self.search_target(buf.text(), buf.cursor(), c == 'N', n) {
@@ -282,7 +310,7 @@ impl Vim {
                 }
                 self.replaying = true;
                 for &k in &keys {
-                    self.handle(buf, k);
+                    self.handle_key(buf, k);
                 }
                 self.replaying = false;
                 self.last_change = keys;
@@ -352,6 +380,25 @@ impl Vim {
         self.cmdline
             .as_ref()
             .map(|(prompt, line)| (*prompt, line.as_str()))
+    }
+
+    /// Runs the ex command `text`: `w`, `q`, `wq` (or `x`), and `q!`.
+    fn ex_command(&mut self, buf: &Buffer, text: &str) {
+        self.command = match text.trim() {
+            "" => None,
+            "w" | "w!" | "write" => Some(Command::Save),
+            "wq" | "x" | "wq!" | "xit" | "exit" => Some(Command::SaveQuit),
+            "q" | "quit" if buf.is_modified() => {
+                self.message = "E37: No write since last change (add ! to override)".into();
+                None
+            }
+            "q" | "quit" => Some(Command::Quit),
+            "q!" | "quit!" => Some(Command::ForceQuit),
+            other => {
+                self.message = format!("E492: Not an editor command: {other}");
+                None
+            }
+        };
     }
 
     /// Runs `/` or `?` with `pattern`, which if empty is the last pattern.
@@ -1443,5 +1490,76 @@ cd", 0, "9$", 4,
         assert_eq!(buf.text(), text);
         let (_, buf) = run(text, 0, "d/x");
         assert_eq!(buf.text(), "ne two three two");
+    }
+
+    #[test]
+    fn ex_commands_ask_the_app() {
+        let (mut vim, mut buf) = (Vim::new(), Buffer::new("abc"));
+        let send = |vim: &mut Vim, buf: &mut Buffer, keys: &str| {
+            keys.chars()
+                .map(|c| {
+                    let key = match c {
+                        '\n' => Key::Enter,
+                        '\x08' => Key::Backspace,
+                        c => Key::Char(c),
+                    };
+                    vim.handle(buf, key)
+                })
+                .last()
+                .flatten()
+        };
+        for (keys, want) in [
+            (":w\n", Some(Command::Save)),
+            (":write\n", Some(Command::Save)),
+            (": w! \n", Some(Command::Save)),
+            (":wq\n", Some(Command::SaveQuit)),
+            (":x\n", Some(Command::SaveQuit)),
+            (":q\n", Some(Command::Quit)),
+            (":quit\n", Some(Command::Quit)),
+            (":q!\n", Some(Command::ForceQuit)),
+            (":\n", None),
+            (":w\x08y\n", None),
+        ] {
+            assert_eq!(send(&mut vim, &mut buf, keys), want, "{keys:?}");
+        }
+        assert_eq!(vim.message, "E492: Not an editor command: y");
+        // Only the key that finishes the command returns it.
+        assert_eq!(send(&mut vim, &mut buf, ":w"), None);
+        assert_eq!(vim.command_line(), Some((':', "w")));
+        assert_eq!(vim.handle(&mut buf, Key::Enter), Some(Command::Save));
+        assert_eq!(vim.command_line(), None);
+    }
+
+    #[test]
+    fn quit_refuses_while_there_are_unsaved_changes() {
+        let (mut vim, mut buf) = (Vim::new(), Buffer::new("abc"));
+        press(&mut vim, &mut buf, "x");
+        let ex = |vim: &mut Vim, buf: &mut Buffer, line: &str| {
+            let mut result = None;
+            for c in line.chars() {
+                result = vim.handle(buf, Key::Char(c));
+            }
+            result.or(vim.handle(buf, Key::Enter))
+        };
+        assert_eq!(ex(&mut vim, &mut buf, ":q"), None);
+        assert!(vim.message.starts_with("E37"));
+        assert_eq!(ex(&mut vim, &mut buf, ":q!"), Some(Command::ForceQuit));
+        // After the app saves, it quits normally; a further edit blocks it again.
+        buf.mark_saved();
+        assert_eq!(ex(&mut vim, &mut buf, ":q"), Some(Command::Quit));
+        press(&mut vim, &mut buf, "x");
+        assert_eq!(ex(&mut vim, &mut buf, ":q"), None);
+    }
+
+    #[test]
+    fn colon_leaves_visual_mode_and_esc_cancels_it() {
+        let (mut vim, mut buf) = run("abc", 0, "v:");
+        assert_eq!(vim.mode, Mode::Normal);
+        assert_eq!(vim.command_line(), Some((':', "")));
+        press(&mut vim, &mut buf, "q\x1bx");
+        assert_eq!(buf.text(), "bc");
+        // Not while an operator waits, where it isn't a motion.
+        let (_, buf) = run("abc", 0, "d:x");
+        assert_eq!(buf.text(), "bc");
     }
 }

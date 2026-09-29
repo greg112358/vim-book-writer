@@ -93,7 +93,7 @@ buttons. Smooth scrolling and transitions. Continuous scroll layout with a fixed
 - [x] Registers: unnamed, named (`"a`), and yank/paste through them
 - [x] Dot-repeat (`.`) for the last change
 - [x] Search: `/`, `?`, `n`, `N`
-- [ ] Ex commands: `:w`, `:q`, `:wq`, `:q!`; `:w` triggers the same code path as the Save button
+- [x] Ex commands: `:w`, `:q`, `:wq`, `:q!`; `:w` triggers the same code path as the Save button
 - [ ] Visual selection then a formatting shortcut applies the format to the selection
 
 ### Project, files, export

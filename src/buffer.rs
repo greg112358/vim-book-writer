@@ -16,6 +16,8 @@ pub struct Buffer {
     group_fresh: bool,
     /// Counts every change to the text, undo and redo included.
     revision: u64,
+    /// The revision when the text was last saved.
+    saved_revision: u64,
 }
 
 /// One splice, stored so it can be reversed: `at..at + new_len` now holds what `old` replaced.
@@ -46,6 +48,17 @@ impl Buffer {
     /// A number that differs whenever the text was changed since it was last read.
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+
+    /// True if the text was changed since `mark_saved`. Undoing back to the saved text still
+    /// counts as a change.
+    pub fn is_modified(&self) -> bool {
+        self.revision != self.saved_revision
+    }
+
+    /// Records that the text as it is now was saved.
+    pub fn mark_saved(&mut self) {
+        self.saved_revision = self.revision;
     }
 
     /// Moves the cursor to `pos`, clamped to the text and rounded down to a char boundary.
@@ -323,6 +336,22 @@ mod tests {
         assert_eq!((buf.text(), buf.cursor()), ("ab", 1));
         assert!(buf.redo());
         assert_eq!((buf.text(), buf.cursor()), ("AA12b", 2));
+    }
+
+    #[test]
+    fn tracks_whether_the_text_changed_since_it_was_saved() {
+        let mut buf = Buffer::new("a");
+        assert!(!buf.is_modified());
+        buf.insert("b");
+        assert!(buf.is_modified());
+        buf.mark_saved();
+        assert!(!buf.is_modified());
+        buf.undo();
+        assert!(buf.is_modified());
+        buf.mark_saved();
+        buf.set_cursor(0);
+        buf.move_right();
+        assert!(!buf.is_modified());
     }
 
     #[test]
