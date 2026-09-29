@@ -10,6 +10,7 @@ pub mod files;
 pub mod finder;
 pub mod format;
 pub mod motion;
+pub mod pdf;
 pub mod recent;
 pub mod runs;
 pub mod search;

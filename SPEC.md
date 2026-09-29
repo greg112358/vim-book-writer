@@ -102,7 +102,7 @@ buttons. Smooth scrolling and transitions. Continuous scroll layout with a fixed
 - [x] File tree model with Neo-tree operations (add, delete, rename, copy, move, yank path, paste, toggle hidden);
       tests use a temp directory
 - [x] Export djot to Markdown; tests confirm color/size/font/underline are dropped and text is kept
-- [ ] Export djot to PDF with `printpdf`; tests confirm a valid PDF is produced and text appears in it
+- [x] Export djot to PDF with `printpdf`; tests confirm a valid PDF is produced and text appears in it
 
 ## Milestone 2: Window and rendering
 - [ ] `--screenshot <path>` flag renders one frame offscreen to a PNG, with `--file`, `--mode`, and `--size` options
