@@ -135,10 +135,12 @@ impl App {
             Screen::Editing => {
                 let regions = self.regions(size);
                 let toolbar = toolbar::toolbar(regions.toolbar);
-                let message = match &self.prompt {
-                    Some(prompt) => format!("{}{}\u{258f}", prompt.label, prompt.text),
-                    None if !self.message.is_empty() => self.message.clone(),
-                    None => self.editor.vim.message.clone(),
+                // What is being typed comes first: a tree prompt, or the `:` and `/` line.
+                let message = match (&self.prompt, self.editor.vim.command_line()) {
+                    (Some(prompt), _) => format!("{}{}\u{258f}", prompt.label, prompt.text),
+                    (None, Some((prompt, line))) => format!("{prompt}{line}\u{258f}"),
+                    (None, None) if !self.message.is_empty() => self.message.clone(),
+                    (None, None) => self.editor.vim.message.clone(),
                 };
                 let status = Status {
                     mode: self.editor.vim.mode,
@@ -977,5 +979,38 @@ mod tests {
         // The 31st row has scrolled into the last line showing.
         assert_eq!(rows_now.last().unwrap(), "f28.dj");
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn the_command_and_search_lines_show_on_the_status_bar_as_they_are_typed() {
+        let mut app = App::new(Editor::default(), Screen::Editing, Recent::default(), None);
+        press(&mut app, "ithe dark night\x1b0");
+        let status = |app: &mut App| -> String {
+            let bar = app.regions(SIZE).status;
+            let chrome = app.chrome(SIZE);
+            let label = chrome
+                .labels
+                .iter()
+                .find(|l| l.y >= bar.y && l.x > bar.x + 80.0 && l.x < bar.x + 100.0);
+            label.map(|l| l.text.clone()).unwrap_or_default()
+        };
+        assert_eq!(status(&mut app), "[No Name] [+]");
+        press(&mut app, ":");
+        assert_eq!(status(&mut app), ":\u{258f}");
+        press(&mut app, "wq");
+        assert_eq!(status(&mut app), ":wq\u{258f}");
+        press(&mut app, "\x08\x08\x1b");
+        assert_eq!(status(&mut app), "[No Name] [+]");
+        // A search shows its pattern, then what it found or didn't.
+        press(&mut app, "/dark");
+        assert_eq!(status(&mut app), "/dark\u{258f}");
+        press(&mut app, "\n");
+        assert_eq!(app.editor.buf.cursor(), 4);
+        assert_eq!(status(&mut app), "[No Name] [+]");
+        press(&mut app, "/zzz\n");
+        assert_eq!(status(&mut app), "E486: Pattern not found: zzz");
+        // The next key clears the note.
+        press(&mut app, "l");
+        assert_eq!(status(&mut app), "[No Name] [+]");
     }
 }
