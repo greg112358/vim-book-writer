@@ -5,3 +5,4 @@ pub mod config;
 pub mod document;
 pub mod files;
 pub mod finder;
+pub mod search;

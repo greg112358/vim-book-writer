@@ -65,7 +65,7 @@ buttons. Smooth scrolling and transitions. Continuous scroll layout with a fixed
 - [x] Fuzzy filter (`src/finder.rs`)
 - [x] Text buffer with insert, delete, and cursor movement; tested without a window
 - [x] Undo/redo over the buffer; tests cover undo after insert, delete, and multi-step redo
-- [ ] Find in document returning match ranges; tests cover no-match and multiple matches
+- [x] Find in document returning match ranges; tests cover no-match and multiple matches
 
 ### Djot model
 - [ ] Add `jotdown`. Parse a document into styled spans that keep source byte ranges; tests for headings, lists,
