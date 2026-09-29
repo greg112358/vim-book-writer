@@ -13,4 +13,5 @@ pub mod recent;
 pub mod runs;
 pub mod search;
 pub mod style;
+pub mod tree;
 pub mod vim;
