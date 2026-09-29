@@ -6,7 +6,9 @@ Rust, custom-drawn (winit + wgpu + glyphon), macOS and Linux.
 ## How to use this file
 Work top to bottom. Do the first unchecked item, then run `cargo test`, `cargo clippy --all-targets -- -D warnings`
 and `cargo fmt --check`. Check the box only when the item's stated check passes.
-Items marked **[human]** can't be verified by tests; a person must look at the window.
+Items marked **[visual]** can't be asserted by unit tests. Verify them by rendering offscreen to a PNG (a `--screenshot <path>`
+flag that draws one frame of a given document and mode, then exits) and reading the image. Describe what you see in the
+commit message. If the image looks wrong, fix it and re-render before checking the box.
 
 ## Product
 
@@ -102,26 +104,25 @@ buttons. Smooth scrolling and transitions. Continuous scroll layout with a fixed
 - [ ] Export djot to Markdown; tests confirm color/size/font/underline are dropped and text is kept
 - [ ] Export djot to PDF with `printpdf`; tests confirm a valid PDF is produced and text appears in it
 
-**The loop should stop after Milestone 1.**
-
 ## Milestone 2: Window and rendering
+- [ ] `--screenshot <path>` flag renders one frame offscreen to a PNG, with `--file`, `--mode`, and `--size` options
 - [x] wgpu surface + clear color in the winit window; `cargo build` succeeds
-- [ ] Draw buffer text through glyphon **[human]**
+- [ ] Draw buffer text through glyphon **[visual]**
 - [ ] Keyboard input routed into the vim engine
-- [ ] Normal-mode rendering: hidden delimiters, styled headings, bold, italic, strikethrough **[human]**
-- [ ] Insert-mode rendering: styled text with faint delimiters **[human]**
-- [ ] Caret, selection highlight, and mouse caret placement **[human]**
-- [ ] Smooth scrolling with a fixed-width text column **[human]**
+- [ ] Normal-mode rendering: hidden delimiters, styled headings, bold, italic, strikethrough **[visual]**
+- [ ] Insert-mode rendering: styled text with faint delimiters **[visual]**
+- [ ] Caret, selection highlight, and mouse caret placement **[visual]**
+- [ ] Smooth scrolling with a fixed-width text column **[visual]**
 
 ## Milestone 3: App shell
-- [ ] taffy layout: thin toolbar, editor, right-hand file tree, status bar (mode, word count, file) **[human]**
-- [ ] Toolbar buttons wired to the formatting commands **[human]**
-- [ ] Traditional shortcuts (Ctrl/Cmd+B/I/U, Ctrl/Cmd+S) **[human]**
-- [ ] Start screen: open recent, open folder, open file via `rfd` **[human]**
-- [ ] File tree UI with Neo-tree keys **[human]**
-- [ ] Command line (`:`) and search (`/`) prompts **[human]**
-- [ ] Auto-save toggle button **[human]**
-- [ ] Export buttons for Markdown and PDF **[human]**
+- [ ] taffy layout: thin toolbar, editor, right-hand file tree, status bar (mode, word count, file) **[visual]**
+- [ ] Toolbar buttons wired to the formatting commands **[visual]**
+- [ ] Traditional shortcuts (Ctrl/Cmd+B/I/U, Ctrl/Cmd+S) **[visual]**
+- [ ] Start screen: open recent, open folder, open file via `rfd` **[visual]**
+- [ ] File tree UI with Neo-tree keys **[visual]**
+- [ ] Command line (`:`) and search (`/`) prompts **[visual]**
+- [ ] Auto-save toggle button **[visual]**
+- [ ] Export buttons for Markdown and PDF **[visual]**
 - [ ] Clipboard via `arboard`; reload on external change via `notify`
 - [ ] Packaging with `cargo-packager` for macOS and Linux
 
