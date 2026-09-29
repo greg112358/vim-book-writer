@@ -69,7 +69,7 @@ pub fn runs(src: &str, spans: &[Span]) -> Vec<Run> {
                     SpanKind::Strikethrough => format.strike = true,
                     SpanKind::Code => format.code = true,
                     SpanKind::Link => format.link = true,
-                    SpanKind::ListItem | SpanKind::Span => {}
+                    SpanKind::ListItem | SpanKind::BlockquoteMarker | SpanKind::Span => {}
                 }
                 format.style.color = span.style.color.or(format.style.color);
                 format.style.size_pt = span.style.size_pt.or(format.style.size_pt);
@@ -108,6 +108,27 @@ pub fn runs(src: &str, spans: &[Span]) -> Vec<Run> {
         }
     }
     out
+}
+
+/// What normal mode shows: the runs that aren't markup, laid end to end.
+#[derive(Debug)]
+pub struct Visible<'a> {
+    pub text: String,
+    /// Each shown run as its range in `text` and the run it came from, which holds the
+    /// source range and the format.
+    pub runs: Vec<(Range<usize>, &'a Run)>,
+}
+
+/// Hides every markup run. `runs` must come from `runs()` on the same `src`.
+pub fn visible<'a>(src: &str, runs: &'a [Run]) -> Visible<'a> {
+    let mut text = String::new();
+    let mut shown = Vec::new();
+    for run in runs.iter().filter(|run| !run.markup) {
+        let start = text.len();
+        text.push_str(&src[run.range.clone()]);
+        shown.push((start..text.len(), run));
+    }
+    Visible { text, runs: shown }
 }
 
 #[cfg(test)]
@@ -201,5 +222,31 @@ mod tests {
         }
         assert!(all.iter().all(|r| !r.range.is_empty()));
         assert!(runs("", &[]).is_empty());
+    }
+
+    #[test]
+    fn normal_mode_hides_delimiters_markers_and_attribute_blocks() {
+        let check = |src: &str| {
+            let runs = runs(src, &parse(src));
+            visible(src, &runs).text
+        };
+        assert_eq!(check("**bold** and _it_"), "bold and it");
+        assert_eq!(
+            check(
+                "## Head\n\n> a\n> b\n\n[t]{style=\"color:#c00\"} ok\n\n***\n\n```rust\nlet x;\n```\n\n- [l](http://x.y)\n"
+            ),
+            "Head\n\na\nb\n\nt ok\n\n\n\nlet x;\n\n- l\n"
+        );
+    }
+
+    #[test]
+    fn visible_runs_tile_the_text_and_keep_source_ranges() {
+        let src = "é **b** ü";
+        let runs = runs(src, &parse(src));
+        let shown = visible(src, &runs);
+        assert_eq!(shown.text, "é b ü");
+        assert_eq!(shown.runs[1].0, 3..4);
+        assert_eq!(shown.runs[1].1.range, 5..6);
+        assert!(shown.runs[1].1.format.bold);
     }
 }

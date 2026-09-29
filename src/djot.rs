@@ -9,6 +9,8 @@ pub enum SpanKind {
     ListItem,
     CodeBlock,
     ThematicBreak,
+    /// The `> ` starting a later line of a blockquote. Pure markup, no content.
+    BlockquoteMarker,
     Strong,
     Emphasis,
     Strikethrough,
@@ -78,6 +80,25 @@ pub fn parse(src: &str) -> Vec<Span> {
                     } else if container.is_block() {
                         span.content.end = last_end.max(span.content.start);
                         span.range.end = span.content.end;
+                        if kind == SpanKind::Blockquote {
+                            // jotdown reports only the first `>`; the rest sit in gaps between events.
+                            let (mut line, end) = (span.range.start, span.range.end);
+                            while let Some(newline) = src[line..end].find('\n') {
+                                line += newline + 1;
+                                let marker = src[line..end]
+                                    .bytes()
+                                    .take_while(|b| matches!(b, b'>' | b' '))
+                                    .count();
+                                if src[line..].starts_with('>') {
+                                    spans.push(Span {
+                                        kind: SpanKind::BlockquoteMarker,
+                                        range: line..line + marker,
+                                        content: line + marker..line + marker,
+                                        style: Style::default(),
+                                    });
+                                }
+                            }
+                        }
                     } else {
                         span.content.end = range.start;
                         span.range.end = range.end;
@@ -96,6 +117,8 @@ pub fn parse(src: &str) -> Vec<Span> {
             last_end = last_end.max(range.end);
         }
     }
+    // Blockquote markers were added after their siblings; put everything back in document order.
+    spans.sort_by_key(|s| (s.range.start, std::cmp::Reverse(s.range.end)));
     spans
 }
 
@@ -163,6 +186,20 @@ mod tests {
                 (Strikethrough, "{-d-}", "d"),
                 (CodeBlock, "```rust\nlet x;\n```\n", "let x;\n"),
                 (ThematicBreak, "***", ""),
+            ]
+        );
+    }
+
+    #[test]
+    fn blockquote_marks_the_prefix_of_every_line() {
+        assert_eq!(
+            view("> a\n> b\n>\n> _c_\n"),
+            [
+                (Blockquote, "> a\n> b\n>\n> _c_", "a\n> b\n>\n> _c_"),
+                (BlockquoteMarker, "> ", ""),
+                (BlockquoteMarker, ">", ""),
+                (BlockquoteMarker, "> ", ""),
+                (Emphasis, "_c_", "c"),
             ]
         );
     }
