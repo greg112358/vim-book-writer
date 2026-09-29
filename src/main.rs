@@ -4,7 +4,7 @@ mod typeset;
 
 use book_writing_app::app::{App, Effect, Screen};
 use book_writing_app::cli::Args;
-use book_writing_app::config;
+use book_writing_app::config::{self, Config};
 use book_writing_app::editor::Editor;
 use book_writing_app::input;
 use book_writing_app::recent::Recent;
@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::ModifiersState;
 use winit::window::{Window, WindowId};
 
@@ -207,6 +207,20 @@ impl ApplicationHandler for Shell {
             _ => {}
         }
     }
+
+    /// After a batch of events, and when auto-save's wait is over: save if it is time, and sleep
+    /// until the next time it could be.
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let modified = self.app.editor.buf.is_modified();
+        self.app.tick(Instant::now());
+        if modified != self.app.editor.buf.is_modified() {
+            self.request_redraw();
+        }
+        event_loop.set_control_flow(match self.app.next_wake() {
+            Some(at) => ControlFlow::WaitUntil(at),
+            None => ControlFlow::Wait,
+        });
+    }
 }
 
 /// Writes RGBA pixels to a PNG file.
@@ -262,6 +276,14 @@ fn main() {
         Screen::Editing
     };
     let mut app = App::new(editor, screen, recent, recent_path);
+    // Screenshots use the default settings, and the window the user's own.
+    let config_path: Option<PathBuf> = config::dir().map(|dir| dir.join("config.toml"));
+    let mut config = match (&config_path, screenshot) {
+        (Some(path), false) => Config::load(path),
+        _ => Config::default(),
+    };
+    config.auto_save |= args.autosave;
+    app.set_config(config, config_path.filter(|_| !screenshot));
     app.tree_visible = args.tree;
     if let Some(folder) = &args.folder {
         app.open_folder(folder);

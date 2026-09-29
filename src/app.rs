@@ -1,3 +1,5 @@
+use crate::autosave::AutoSave;
+use crate::config::Config;
 use crate::display::Display;
 use crate::editor::Editor;
 use crate::recent::Recent;
@@ -7,6 +9,7 @@ use crate::tree::Tree;
 use crate::ui::{self, Chrome, Interface, Regions, Status, TreeRow, TreeView};
 use crate::vim::Key;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// Which page of the app is showing.
 #[derive(Debug, Clone, PartialEq)]
@@ -17,6 +20,9 @@ pub enum Screen {
     },
     Editing,
 }
+
+/// How long the text must sit unchanged before auto-save writes it.
+const AUTOSAVE_DELAY: Duration = Duration::from_millis(2000);
 
 /// What has the keyboard: the text, or the file tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +82,9 @@ pub struct App {
     tree_first: usize,
     /// The row and text of the last thing yanked in the tree, for the clipboard.
     pub yanked: Option<PathBuf>,
+    pub autosave: AutoSave,
+    config: Config,
+    config_path: Option<PathBuf>,
 }
 
 impl App {
@@ -101,7 +110,31 @@ impl App {
             message: String::new(),
             tree_first: 0,
             yanked: None,
+            autosave: AutoSave::new(AUTOSAVE_DELAY, Instant::now()),
+            config: Config::default(),
+            config_path: None,
         }
+    }
+
+    /// Applies the saved settings, and keeps the file to save them to when one changes.
+    pub fn set_config(&mut self, config: Config, path: Option<PathBuf>) {
+        self.autosave.enabled = config.auto_save;
+        self.config = config;
+        self.config_path = path;
+    }
+
+    /// Call after input and when `next_wake` comes: saves the file if auto-save is on and the text
+    /// has been still for long enough.
+    pub fn tick(&mut self, now: Instant) {
+        let due = self.autosave.poll(now, &self.editor.buf);
+        if due && self.screen == Screen::Editing && self.editor.path().is_some() {
+            self.editor.save();
+        }
+    }
+
+    /// When `tick` next has something to do, for the window to wake at.
+    pub fn next_wake(&self) -> Option<Instant> {
+        self.autosave.next_deadline()
     }
 
     pub fn regions(&self, size: (f32, f32)) -> Regions {
@@ -156,6 +189,7 @@ impl App {
                     popup: self.popup.as_ref(),
                     color: self.color,
                     tree: tree.as_ref(),
+                    autosave: self.autosave.enabled,
                 };
                 ui::chrome(&regions, &status, &interface)
             }
@@ -212,6 +246,17 @@ impl App {
                 Click::Open(menu) => {
                     let anchor = toolbar.buttons[i].bounds;
                     self.popup = Some(toolbar::popup(menu, anchor, size));
+                }
+                Click::Save => {
+                    self.editor.save();
+                }
+                Click::ToggleAutoSave => {
+                    self.autosave.enabled = !self.autosave.enabled;
+                    self.config.auto_save = self.autosave.enabled;
+                    if let Some(path) = &self.config_path {
+                        // A setting that won't save still works until the app closes.
+                        let _ = self.config.save(path);
+                    }
                 }
             }
         } else if regions.editor.contains(x, y) {
@@ -1012,5 +1057,114 @@ mod tests {
         // The next key clears the note.
         press(&mut app, "l");
         assert_eq!(status(&mut app), "[No Name] [+]");
+    }
+
+    #[test]
+    fn the_save_and_auto_save_buttons() {
+        let dir = std::env::temp_dir().join("bwa_app_autosave");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (file, settings) = (dir.join("book.dj"), dir.join("config.toml"));
+        std::fs::write(&file, "one two").unwrap();
+        let mut app = App::new(
+            Editor::open(&file).unwrap(),
+            Screen::Editing,
+            Recent::default(),
+            None,
+        );
+        app.set_config(Config::default(), Some(settings.clone()));
+        let toolbar = toolbar::toolbar(app.regions(SIZE).toolbar);
+        let button = |label: &str| {
+            let b = toolbar
+                .buttons
+                .iter()
+                .find(|b| b.label == label)
+                .unwrap()
+                .bounds;
+            (b.x + b.w / 2.0, b.y + b.h / 2.0)
+        };
+        // Save does what :w does.
+        press(&mut app, "x");
+        assert!(app.editor.buf.is_modified());
+        app.click(SIZE, button("Save"), |_, _| None);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "ne two");
+        assert!(!app.editor.buf.is_modified());
+        // Auto toggles, is lit while on, and is remembered in the settings file.
+        assert!(!app.autosave.enabled);
+        app.click(SIZE, button("Auto"), |_, _| None);
+        assert!(app.autosave.enabled);
+        assert!(Config::load(&settings).auto_save);
+        let lit = |app: &mut App| {
+            let (x, y) = button("Auto");
+            app.chrome(SIZE).rects.iter().any(|r| {
+                r.color == [0xd2, 0xc8, 0xac, 0xff]
+                    && r.x <= x
+                    && x < r.x + r.w
+                    && r.y <= y
+                    && y < r.y + r.h
+            })
+        };
+        assert!(lit(&mut app));
+        app.click(SIZE, button("Auto"), |_, _| None);
+        assert!(!app.autosave.enabled && !lit(&mut app));
+        assert!(!Config::load(&settings).auto_save);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn auto_save_writes_the_file_once_the_text_has_been_still() {
+        let path = temp_file("autosave", "hello");
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut app = App::new(
+            Editor::open(&path).unwrap(),
+            Screen::Editing,
+            Recent::default(),
+            None,
+        );
+        app.set_config(
+            Config {
+                auto_save: true,
+                ..Config::default()
+            },
+            None,
+        );
+        // Nothing changed: nothing to wake for.
+        app.tick(at(10_000));
+        assert_eq!(app.next_wake(), None);
+        press(&mut app, "x");
+        app.tick(at(10_100));
+        assert_eq!(app.next_wake(), Some(at(12_100)));
+        app.tick(at(11_000));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
+        // More typing pushes the save back.
+        press(&mut app, "x");
+        app.tick(at(11_500));
+        app.tick(at(13_000));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
+        app.tick(at(13_500));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "llo");
+        assert!(!app.editor.buf.is_modified());
+        // Off, it leaves changes for the user to save.
+        app.autosave.enabled = false;
+        press(&mut app, "x");
+        app.tick(at(20_000));
+        app.tick(at(30_000));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "llo");
+        std::fs::remove_file(path).unwrap();
+        // A document with no file has nowhere to save, and doesn't complain.
+        let mut app = App::new(Editor::default(), Screen::Editing, Recent::default(), None);
+        app.set_config(
+            Config {
+                auto_save: true,
+                ..Config::default()
+            },
+            None,
+        );
+        press(&mut app, "ix");
+        app.tick(at(100_000));
+        app.tick(at(200_000));
+        assert!(app.editor.buf.is_modified());
+        assert!(app.editor.vim.message.is_empty());
     }
 }

@@ -11,6 +11,7 @@ const USAGE: &str =
   --size WxH          the size of the screenshot in pixels (default 1000x700)
   --tree              show the file tree
   --folder DIR        open DIR in the file tree
+  --autosave          turn auto-save on
   --start             show the start screen
   --recent PATH       a file for the start screen's recent list, once for each (for screenshots)
   --popup MENU        show a toolbar menu open: color, font, or size
@@ -35,6 +36,8 @@ pub struct Args {
     pub popup: Option<Menu>,
     /// Show the start screen even with a file, for screenshots.
     pub start: bool,
+    /// Turn auto-save on, whatever the settings say.
+    pub autosave: bool,
     /// Recent files to show instead of the saved list, for screenshots.
     pub recent: Vec<PathBuf>,
 }
@@ -51,6 +54,7 @@ impl Default for Args {
             folder: None,
             popup: None,
             start: false,
+            autosave: false,
             recent: Vec::new(),
         }
     }
@@ -83,6 +87,7 @@ impl Args {
                 "--tree" => parsed.tree = true,
                 "--folder" => parsed.folder = Some(value("--folder")?.into()),
                 "--start" => parsed.start = true,
+                "--autosave" => parsed.autosave = true,
                 "--recent" => parsed.recent.push(value("--recent")?.into()),
                 "--popup" => {
                     parsed.popup = Some(match value("--popup")?.as_str() {
@@ -206,7 +211,8 @@ mod tests {
             Some("book".into())
         );
         let args = parse(&["--start", "--recent", "a.dj", "--recent", "b.dj"]).unwrap();
-        assert!(args.start);
+        assert!(args.start && !args.autosave);
+        assert!(parse(&["--autosave"]).unwrap().autosave);
         assert_eq!(args.recent, [PathBuf::from("a.dj"), PathBuf::from("b.dj")]);
         assert_eq!(parse(&["--popup", "font"]).unwrap().popup, Some(Menu::Font));
         assert!(parse(&["--popup", "nope"]).is_err());

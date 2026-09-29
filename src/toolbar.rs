@@ -14,6 +14,9 @@ pub enum Menu {
 pub enum Click {
     Do(Action),
     Open(Menu),
+    /// The same save `:w` does.
+    Save,
+    ToggleAutoSave,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -60,6 +63,11 @@ pub fn toolbar(bounds: Bounds) -> Toolbar {
     add("\"", 26.0, Click::Do(Action::Quote));
     add("Link", 40.0, Click::Do(Action::Link));
 
+    // The buttons for the file rather than the text sit at the right end.
+    let right: [(&str, f32, Click); 2] = [
+        ("Save", 44.0, Click::Save),
+        ("Auto", 46.0, Click::ToggleAutoSave),
+    ];
     let height = (bounds.h - 8.0).max(0.0);
     let y = bounds.y + (bounds.h - height) / 2.0;
     let mut x = bounds.x + PADDING;
@@ -81,6 +89,21 @@ pub fn toolbar(bounds: Bounds) -> Toolbar {
             }
             None => x += GROUP_GAP - GAP,
         }
+    }
+    let right_width: f32 = right.iter().map(|(_, w, _)| w + GAP).sum::<f32>() - GAP;
+    let mut x = (bounds.x + bounds.w - PADDING - right_width).max(x + GROUP_GAP - GAP);
+    for (label, width, click) in right {
+        buttons.push(Button {
+            bounds: Bounds {
+                x,
+                y,
+                w: width,
+                h: height,
+            },
+            label: label.to_string(),
+            click,
+        });
+        x += width + GAP;
     }
     Toolbar { buttons }
 }
@@ -250,7 +273,7 @@ mod tests {
             labels,
             [
                 "B", "I", "U", "S", "Font", "Size", "A", "AA", "H1", "H2", "H3", "\u{2022}", "1.",
-                "\"", "Link"
+                "\"", "Link", "Save", "Auto"
             ]
         );
         let strip = strip();
@@ -261,6 +284,11 @@ mod tests {
             assert!(b.bounds.x >= strip.x && b.bounds.x + b.bounds.w <= strip.w);
             assert!(b.bounds.y >= strip.y && b.bounds.y + b.bounds.h <= strip.y + strip.h);
         }
+        // The file buttons are at the right end, clear of the text buttons.
+        let last = toolbar.buttons.last().unwrap().bounds;
+        assert_eq!(last.x + last.w, strip.w - PADDING);
+        assert_eq!(toolbar.buttons[15].click, Click::Save);
+        assert_eq!(toolbar.buttons[16].click, Click::ToggleAutoSave);
         // Groups have a wider gap between them than buttons do.
         let gap = |i: usize| {
             toolbar.buttons[i + 1].bounds.x
@@ -288,7 +316,7 @@ mod tests {
         // Between groups and outside the strip hit nothing.
         let b = toolbar.buttons[3].bounds;
         assert_eq!(toolbar.hit(b.x + b.w + GROUP_GAP / 2.0, 17.0), None);
-        assert_eq!(toolbar.hit(900.0, 17.0), None);
+        assert_eq!(toolbar.hit(700.0, 17.0), None);
         // Every formatting action has a button.
         for want in [
             Action::Bold,

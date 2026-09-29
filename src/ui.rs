@@ -215,6 +215,8 @@ pub struct Interface<'a> {
     /// The color last chosen, shown under the color button.
     pub color: [u8; 3],
     pub tree: Option<&'a TreeView>,
+    /// Whether auto-save is on, which the Auto button shows by staying pressed.
+    pub autosave: bool,
 }
 
 pub const BAR: [u8; 4] = [0xee, 0xe8, 0xda, 0xff];
@@ -265,7 +267,9 @@ pub fn chrome(regions: &Regions, status: &Status, ui: &Interface<'_>) -> Chrome 
         let b = button.bounds;
         let open =
             matches!((&button.click, ui.popup), (Click::Open(menu), Some(p)) if p.menu == *menu);
-        if ui.hover == Some(i) || open {
+        if button.click == Click::ToggleAutoSave && ui.autosave {
+            chrome.rects.push(Rect::new(b, [0xd2, 0xc8, 0xac, 0xff]));
+        } else if ui.hover == Some(i) || open {
             chrome.rects.push(Rect::new(b, HOVER));
         }
         let is_color = button.click == Click::Open(Menu::Color);
@@ -276,7 +280,8 @@ pub fn chrome(regions: &Regions, status: &Status, ui: &Interface<'_>) -> Chrome 
             y: b.y + (b.h - BUTTON_SIZE * 1.3) / 2.0 - if is_color { 2.0 } else { 0.0 },
             size: BUTTON_SIZE,
             color: INK,
-            bold: matches!(button.label.as_str(), "B" | "H1" | "H2" | "H3"),
+            bold: matches!(button.label.as_str(), "B" | "H1" | "H2" | "H3")
+                || (button.click == Click::ToggleAutoSave && ui.autosave),
             italic: button.label == "I",
             align: Align::Center,
         });
@@ -572,6 +577,7 @@ mod tests {
             popup: None,
             color: [0; 3],
             tree: Some(&view),
+            autosave: false,
         };
         let chrome = chrome(&regions, &status, &interface);
         let labels: Vec<&str> = chrome.labels.iter().map(|l| l.text.as_str()).collect();
@@ -625,6 +631,7 @@ mod tests {
             popup: None,
             color: [0, 0, 0],
             tree: None,
+            autosave: false,
         };
         let texts = |s: Status| -> Vec<String> {
             chrome(&regions, &s, &interface)
@@ -657,6 +664,7 @@ mod tests {
             popup: None,
             color: [0, 0, 0],
             tree: None,
+            autosave: false,
         };
         for label in chrome(&regions, &status(Mode::Normal, false, 3, ""), &interface).labels {
             assert!(

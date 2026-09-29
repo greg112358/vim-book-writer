@@ -22,6 +22,8 @@ pub struct Config {
     pub font_family: String,
     pub font_size: f32,
     pub vim_mode: bool,
+    /// Save the file by itself once edits stop.
+    pub auto_save: bool,
 }
 
 impl Default for Config {
@@ -30,6 +32,7 @@ impl Default for Config {
             font_family: "serif".into(),
             font_size: 16.0,
             vim_mode: false,
+            auto_save: false,
         }
     }
 }
@@ -41,6 +44,24 @@ impl Config {
 
     pub fn to_toml(&self) -> Result<String, toml::ser::Error> {
         toml::to_string(self)
+    }
+
+    /// Reads the settings file. A missing or unreadable one gives the defaults, so a bad file
+    /// never stops the app from starting.
+    pub fn load(path: &std::path::Path) -> Self {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| Self::from_toml(&text).ok())
+            .unwrap_or_default()
+    }
+
+    /// Writes the settings file, making its folder if needed.
+    pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let text = self.to_toml().map_err(std::io::Error::other)?;
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(path, text)
     }
 }
 
@@ -66,6 +87,24 @@ mod tests {
             Config::from_toml(&config.to_toml().unwrap()).unwrap(),
             config
         );
+    }
+
+    #[test]
+    fn loads_and_saves_the_file_and_forgives_a_bad_one() {
+        let dir = std::env::temp_dir().join("bwa_config_file");
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("nested/config.toml");
+        assert_eq!(Config::load(&path), Config::default());
+        let config = Config {
+            auto_save: true,
+            font_size: 20.0,
+            ..Config::default()
+        };
+        config.save(&path).unwrap();
+        assert_eq!(Config::load(&path), config);
+        std::fs::write(&path, "auto_save = [").unwrap();
+        assert_eq!(Config::load(&path), Config::default());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
