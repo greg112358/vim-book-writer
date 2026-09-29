@@ -98,7 +98,7 @@ buttons. Smooth scrolling and transitions. Continuous scroll layout with a fixed
 
 ### Project, files, export
 - [x] Recent files list: add, dedupe, cap at 20, persist to TOML; tests for ordering and persistence
-- [ ] Auto-save state machine: saves after N ms of no edits, not while nothing changed; tested with a fake clock
+- [x] Auto-save state machine: saves after N ms of no edits, not while nothing changed; tested with a fake clock
 - [ ] File tree model with Neo-tree operations (add, delete, rename, copy, move, yank path, paste, toggle hidden);
       tests use a temp directory
 - [ ] Export djot to Markdown; tests confirm color/size/font/underline are dropped and text is kept

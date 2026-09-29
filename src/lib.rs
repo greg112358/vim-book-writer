@@ -1,5 +1,6 @@
 //! Headless core of the editor. Everything here is testable without a window or GPU.
 
+pub mod autosave;
 pub mod buffer;
 pub mod config;
 pub mod djot;
