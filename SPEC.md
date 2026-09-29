@@ -64,7 +64,7 @@ buttons. Smooth scrolling and transitions. Continuous scroll layout with a fixed
 - [x] Directory listing that respects .gitignore (`src/files.rs`)
 - [x] Fuzzy filter (`src/finder.rs`)
 - [x] Text buffer with insert, delete, and cursor movement; tested without a window
-- [ ] Undo/redo over the buffer; tests cover undo after insert, delete, and multi-step redo
+- [x] Undo/redo over the buffer; tests cover undo after insert, delete, and multi-step redo
 - [ ] Find in document returning match ranges; tests cover no-match and multiple matches
 
 ### Djot model

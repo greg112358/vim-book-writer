@@ -1,13 +1,28 @@
 use std::ops::Range;
 
 /// Text with a cursor. The cursor is a byte offset that always sits on a char boundary.
-/// Every edit goes through `replace`, so undo can later hook in at one place.
+/// Every edit goes through `replace`, which records it for undo.
 #[derive(Debug, Default)]
 pub struct Buffer {
     text: String,
     cursor: usize,
     /// Column (in chars) that up/down aim for, so a short line doesn't lose the column.
     goal_col: Option<usize>,
+    undo: Vec<Vec<Edit>>,
+    redo: Vec<Vec<Edit>>,
+    /// Open `begin_group` calls. While above zero, edits join one undo step.
+    group_depth: u32,
+    /// True right after `begin_group` opens a step, before its first edit.
+    group_fresh: bool,
+}
+
+/// One splice, stored so it can be reversed: `at..at + new_len` now holds what `old` replaced.
+#[derive(Debug)]
+struct Edit {
+    at: usize,
+    old: String,
+    new_len: usize,
+    cursor_before: usize,
 }
 
 impl Buffer {
@@ -39,9 +54,75 @@ impl Buffer {
     /// Replaces `range` with `with` and puts the cursor after the new text.
     /// Panics if `range` is out of bounds or not on char boundaries.
     pub fn replace(&mut self, range: Range<usize>, with: &str) {
+        let edit = Edit {
+            at: range.start,
+            old: self.text[range.clone()].to_string(),
+            new_len: with.len(),
+            cursor_before: self.cursor,
+        };
+        match self.undo.last_mut() {
+            Some(step) if self.group_depth > 0 && !self.group_fresh => step.push(edit),
+            _ => self.undo.push(vec![edit]),
+        }
+        self.group_fresh = false;
+        self.redo.clear();
         self.cursor = range.start + with.len();
         self.text.replace_range(range, with);
         self.goal_col = None;
+    }
+
+    /// Makes every edit until the matching `end_group` a single undo step. Calls nest.
+    pub fn begin_group(&mut self) {
+        if self.group_depth == 0 {
+            self.group_fresh = true;
+        }
+        self.group_depth += 1;
+    }
+
+    pub fn end_group(&mut self) {
+        self.group_depth = self.group_depth.saturating_sub(1);
+    }
+
+    /// Reverses the last undo step and puts the cursor where it was before it. False if none.
+    pub fn undo(&mut self) -> bool {
+        let Some(step) = self.undo.pop() else {
+            return false;
+        };
+        let (inverse, cursor) = self.apply(step);
+        self.redo.push(inverse);
+        self.set_cursor(cursor);
+        true
+    }
+
+    /// Re-applies the last undone step. False if none.
+    pub fn redo(&mut self) -> bool {
+        let Some(step) = self.redo.pop() else {
+            return false;
+        };
+        let (inverse, _) = self.apply(step);
+        self.undo.push(inverse);
+        true
+    }
+
+    /// Reverses each edit of `step`, last first. Returns the edits that undo it again, and the
+    /// cursor from before the step's first edit.
+    fn apply(&mut self, step: Vec<Edit>) -> (Vec<Edit>, usize) {
+        let mut inverse = Vec::with_capacity(step.len());
+        let mut cursor = self.cursor;
+        for edit in step.into_iter().rev() {
+            let range = edit.at..edit.at + edit.new_len;
+            inverse.push(Edit {
+                at: edit.at,
+                old: self.text[range.clone()].to_string(),
+                new_len: edit.old.len(),
+                cursor_before: self.cursor,
+            });
+            self.cursor = edit.at + edit.old.len();
+            self.text.replace_range(range, &edit.old);
+            cursor = edit.cursor_before;
+        }
+        self.goal_col = None;
+        (inverse, cursor)
     }
 
     pub fn insert(&mut self, text: &str) {
@@ -170,6 +251,58 @@ mod tests {
         assert_eq!(buf.cursor(), "héllo wörld".len());
         buf.move_line_start();
         assert_eq!(buf.cursor(), 0);
+    }
+
+    #[test]
+    fn undo_reverses_insert_and_delete_and_restores_cursor() {
+        let mut buf = Buffer::new("héllo");
+        buf.set_cursor(3);
+        buf.insert("XY");
+        buf.delete_back();
+        assert_eq!((buf.text(), buf.cursor()), ("héXllo", 4));
+        assert!(buf.undo());
+        assert_eq!((buf.text(), buf.cursor()), ("héXYllo", 5));
+        assert!(buf.undo());
+        assert_eq!((buf.text(), buf.cursor()), ("héllo", 3));
+        assert!(!buf.undo());
+    }
+
+    #[test]
+    fn redo_replays_steps_and_new_edit_clears_it() {
+        let mut buf = Buffer::default();
+        for word in ["one", " two", " three"] {
+            buf.insert(word);
+        }
+        while buf.undo() {}
+        assert_eq!(buf.text(), "");
+        assert!(buf.redo());
+        assert!(buf.redo());
+        assert_eq!((buf.text(), buf.cursor()), ("one two", 7));
+        assert!(buf.undo());
+        assert_eq!(buf.text(), "one");
+        buf.insert("!");
+        assert!(!buf.redo());
+        assert_eq!(buf.text(), "one!");
+    }
+
+    #[test]
+    fn group_is_one_undo_step_and_redoes_whole() {
+        let mut buf = Buffer::new("ab");
+        buf.set_cursor(1);
+        buf.begin_group();
+        buf.insert("1");
+        buf.begin_group();
+        buf.insert("2");
+        buf.end_group();
+        buf.replace(0..1, "AA");
+        buf.end_group();
+        buf.insert("!");
+        assert_eq!(buf.text(), "AA!12b");
+        assert!(buf.undo());
+        assert!(buf.undo());
+        assert_eq!((buf.text(), buf.cursor()), ("ab", 1));
+        assert!(buf.redo());
+        assert_eq!((buf.text(), buf.cursor()), ("AA12b", 2));
     }
 
     #[test]
