@@ -118,6 +118,43 @@ pub fn toggle_underline(buf: &mut Buffer, range: Range<usize>) {
     edit_style(buf, range, "text-decoration", "underline", true);
 }
 
+/// Sets the text color of `range`. One undo step.
+pub fn set_color(buf: &mut Buffer, range: Range<usize>, [r, g, b]: [u8; 3]) {
+    edit_style(
+        buf,
+        range,
+        "color",
+        &format!("#{r:02x}{g:02x}{b:02x}"),
+        false,
+    );
+}
+
+/// Sets the font size of `range` in points. Does nothing unless `pt` is positive. One undo step.
+pub fn set_font_size(buf: &mut Buffer, range: Range<usize>, pt: f32) {
+    if pt.is_finite() && pt > 0.0 {
+        edit_style(buf, range, "font-size", &format!("{pt}pt"), false);
+    }
+}
+
+/// Sets the font family of `range`. Characters that would break the attribute or the CSS are
+/// dropped, and a name that is empty after that does nothing. One undo step.
+pub fn set_font_family(buf: &mut Buffer, range: Range<usize>, name: &str) {
+    let name: String = name
+        .chars()
+        .filter(|c| !c.is_control() && !"\"'\\;:,{}".contains(*c))
+        .collect();
+    let name = name.trim();
+    if name.is_empty() {
+        return;
+    }
+    let value = if name.chars().all(|c| c.is_alphanumeric() || c == '-') {
+        name.to_string()
+    } else {
+        format!("'{name}'")
+    };
+    edit_style(buf, range, "font-family", &value, false);
+}
+
 /// Where a span's `{...}` attribute block sits and what its style attribute holds.
 struct StyleTarget {
     span: Span,
@@ -325,6 +362,7 @@ fn set_css(css: &str, prop: &str, value: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::style::Style;
 
     /// Applies `mark` to the first occurrence of `select` in `src`.
     fn apply(src: &str, select: &str, mark: Mark) -> String {
@@ -452,5 +490,55 @@ mod tests {
         let len = buf.text().len();
         toggle_underline(&mut buf, 0..len);
         assert_eq!(buf.text(), src);
+    }
+
+    #[test]
+    fn color_size_and_font_share_one_span_and_replace_each_other() {
+        let src = "one two three";
+        let start = src.find("two").unwrap();
+        let mut buf = Buffer::new(src);
+        set_color(&mut buf, start..start + 3, [0xcc, 0, 0]);
+        // The text moved; the selection is now the word inside the new span.
+        let start = buf.text().find("two").unwrap();
+        set_font_size(&mut buf, start..start + 3, 14.5);
+        set_font_family(&mut buf, start..start + 3, "Times New Roman");
+        assert_eq!(
+            buf.text(),
+            r##"one [two]{style="color:#cc0000;font-size:14.5pt;font-family:'Times New Roman'"} three"##
+        );
+        set_color(&mut buf, start..start + 3, [0, 0, 255]);
+        assert_eq!(buf.text().matches('[').count(), 1);
+        let spans = parse(buf.text());
+        assert_eq!(spans.len(), 1);
+        assert_eq!(
+            spans[0].style,
+            Style {
+                color: Some([0, 0, 255]),
+                size_pt: Some(14.5),
+                family: Some("Times New Roman".into()),
+                underline: false,
+            }
+        );
+        // Each command is one undo step.
+        assert!(buf.undo());
+        assert_eq!(parse(buf.text())[0].style.color, Some([0xcc, 0, 0]));
+    }
+
+    #[test]
+    fn font_family_is_sanitized_and_bad_size_is_ignored() {
+        let mut buf = Buffer::new("a");
+        set_font_family(&mut buf, 0..1, "\";}{ ");
+        set_font_size(&mut buf, 0..1, 0.0);
+        set_font_size(&mut buf, 0..1, f32::NAN);
+        assert_eq!(buf.text(), "a");
+        set_font_family(&mut buf, 0..1, "Fira\" Code;{x}");
+        assert_eq!(buf.text(), r#"[a]{style="font-family:'Fira Codex'"}"#);
+        assert_eq!(
+            parse(buf.text())[0].style.family.as_deref(),
+            Some("Fira Codex")
+        );
+        let mut buf = Buffer::new("a");
+        set_font_family(&mut buf, 0..1, "Georgia");
+        assert_eq!(buf.text(), r#"[a]{style="font-family:Georgia"}"#);
     }
 }
