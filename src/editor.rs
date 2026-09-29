@@ -1,4 +1,5 @@
 use crate::buffer::Buffer;
+use crate::display::Display;
 use crate::document::Document;
 use crate::vim::{Command, Key, Vim};
 use std::io;
@@ -10,6 +11,11 @@ pub struct Editor {
     pub buf: Buffer,
     pub vim: Vim,
     doc: Document,
+    /// What the screen shows, and the buffer revision it was made from.
+    display: Display,
+    display_revision: Option<u64>,
+    /// Counts the times `display` was rebuilt, so a renderer can tell when it changed.
+    display_version: u64,
 }
 
 impl Editor {
@@ -19,7 +25,21 @@ impl Editor {
             buf: Buffer::new(doc.text()),
             vim: Vim::new(),
             doc,
+            display: Display::default(),
+            display_revision: None,
+            display_version: 0,
         })
+    }
+
+    /// What to draw. It is rebuilt only when the text has changed since the last call, and the
+    /// number that goes with it changes whenever it is.
+    pub fn display(&mut self) -> (&Display, u64) {
+        if self.display_revision != Some(self.buf.revision()) {
+            self.display = Display::normal(self.buf.text());
+            self.display_revision = Some(self.buf.revision());
+            self.display_version += 1;
+        }
+        (&self.display, self.display_version)
     }
 
     /// Feeds a key to the vim engine and carries out what it asks for. True means the app
@@ -133,6 +153,19 @@ mod tests {
         );
         assert!(editor.buf.is_modified());
         std::fs::remove_dir(&path).unwrap();
+    }
+
+    #[test]
+    fn the_display_is_rebuilt_only_when_the_text_changes() {
+        let mut editor = Editor::default();
+        let first = editor.display().1;
+        assert_eq!(editor.display().1, first);
+        type_keys(&mut editor, "l");
+        assert_eq!(editor.display().1, first);
+        type_keys(&mut editor, "i*hi*\x1b");
+        let (display, version) = editor.display();
+        assert_eq!(display.text, "hi");
+        assert!(version > first);
     }
 
     #[test]

@@ -1,4 +1,6 @@
 mod gpu;
+mod rects;
+mod typeset;
 
 use book_writing_app::cli::Args;
 use book_writing_app::editor::Editor;
@@ -69,10 +71,8 @@ impl ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => {
                 if let Some(gpu) = &mut self.gpu {
-                    gpu.draw(&Scene {
-                        text: self.editor.buf.text(),
-                        revision: self.editor.buf.revision(),
-                    });
+                    let (display, version) = self.editor.display();
+                    gpu.draw(&Scene { display, version });
                 }
             }
             _ => {}
@@ -110,10 +110,8 @@ fn main() {
 
     if let Some(path) = &args.screenshot {
         let (width, height) = args.size;
-        let scene = Scene {
-            text: editor.buf.text(),
-            revision: editor.buf.revision(),
-        };
+        let (display, version) = editor.display();
+        let scene = Scene { display, version };
         let pixels = Gpu::headless().screenshot(width, height, &scene);
         let file = std::fs::File::create(path).expect("failed to create the screenshot file");
         let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);

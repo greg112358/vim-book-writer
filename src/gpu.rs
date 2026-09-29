@@ -1,24 +1,26 @@
+use crate::rects::Rects;
+use crate::typeset::{self, FONT_SIZE, LINE_HEIGHT};
+use book_writing_app::display::Display;
 use cosmic_text::fontdb;
 use glyphon::{
-    Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache,
-    TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
+    Attrs, Buffer, Cache, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache, TextArea,
+    TextAtlas, TextBounds, TextRenderer, Viewport,
 };
 use std::sync::Arc;
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
-/// What a frame shows. `revision` changes whenever `text` does, so unchanged text isn't laid out
-/// again.
+/// What a frame shows. `version` changes whenever `display` does, so unchanged text isn't laid
+/// out again.
 pub struct Scene<'a> {
-    pub text: &'a str,
-    pub revision: u64,
+    pub display: &'a Display,
+    pub version: u64,
 }
 
 /// The width of the text column, and the least margin on either side of it.
 const COLUMN_WIDTH: f32 = 720.0;
 const MIN_MARGIN: f32 = 24.0;
 const TOP_MARGIN: f32 = 32.0;
-const FONT_SIZE: f32 = 18.0;
 
 /// Format of the offscreen frame. sRGB, so a color drawn here matches one drawn to a window.
 const SCREENSHOT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
@@ -32,9 +34,10 @@ pub struct Gpu {
     viewport: Viewport,
     atlas: TextAtlas,
     text: TextRenderer,
+    rects: Rects,
     buffer: Buffer,
-    /// The revision, length, and column width of the text `buffer` holds.
-    shown: Option<(u64, usize, u32)>,
+    /// The scene version and column width of the text `buffer` holds.
+    shown: Option<(u64, u32)>,
 }
 
 /// A GPU and the window surface it draws to.
@@ -135,7 +138,8 @@ impl Gpu {
         let viewport = Viewport::new(&device, &cache);
         let mut atlas = TextAtlas::new(&device, &queue, &cache, format);
         let text = TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
-        let buffer = Buffer::new(&mut fonts, Metrics::new(FONT_SIZE, FONT_SIZE * 1.5));
+        let buffer = Buffer::new(&mut fonts, Metrics::new(FONT_SIZE, FONT_SIZE * LINE_HEIGHT));
+        let rects = Rects::new(&device, format);
         Self {
             device,
             queue,
@@ -144,6 +148,7 @@ impl Gpu {
             viewport,
             atlas,
             text,
+            rects,
             buffer,
             shown: None,
         }
@@ -159,11 +164,17 @@ impl Gpu {
     fn paint(&mut self, view: &wgpu::TextureView, width: u32, height: u32, scene: &Scene<'_>) {
         let margin = ((width as f32 - COLUMN_WIDTH) / 2.0).max(MIN_MARGIN);
         let column = (width as f32 - 2.0 * margin).max(1.0);
-        let key = (scene.revision, scene.text.len(), column as u32);
+        let key = (scene.version, column as u32);
         if self.shown != Some(key) {
             self.buffer.set_size(Some(column), Some(height as f32));
-            self.buffer.set_text(
-                scene.text,
+            let display = scene.display;
+            self.buffer.set_rich_text(
+                display.spans.iter().map(|span| {
+                    (
+                        &display.text[span.range.clone()],
+                        typeset::attrs(&span.format),
+                    )
+                }),
                 &Attrs::new().family(Family::Serif),
                 Shaping::Advanced,
                 None,
@@ -186,13 +197,14 @@ impl Gpu {
                     top: TOP_MARGIN,
                     scale: 1.0,
                     bounds: TextBounds::default(),
-                    default_color: Color::rgb(0x22, 0x22, 0x22),
+                    default_color: typeset::TEXT,
                     custom_glyphs: &[],
                 }],
                 &mut self.swash,
             )
             .expect("failed to prepare text");
 
+        let over = typeset::decorations(&self.buffer, margin, TOP_MARGIN);
         let mut encoder = self.device.create_command_encoder(&Default::default());
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -215,6 +227,8 @@ impl Gpu {
             self.text
                 .render(&self.atlas, &self.viewport, &mut pass)
                 .expect("failed to draw text");
+            self.rects
+                .draw(&self.device, &self.queue, &mut pass, (width, height), &over);
         }
         self.queue.submit([encoder.finish()]);
         self.atlas.trim();
