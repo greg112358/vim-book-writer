@@ -91,6 +91,22 @@ pub fn word_back(text: &str, pos: usize) -> usize {
     i
 }
 
+/// The last char of the run of same-class chars that holds `pos`.
+pub fn word_run_end(text: &str, pos: usize) -> usize {
+    let Some(first) = text[pos..].chars().next() else {
+        return pos;
+    };
+    let run_class = class(first);
+    let mut end = pos;
+    for (offset, c) in text[pos..].char_indices() {
+        if class(c) != run_class {
+            break;
+        }
+        end = pos + offset;
+    }
+    end
+}
+
 /// `e`: the last char of this word, or if already there, of the next one. Stays put if there
 /// is no next word.
 pub fn word_end(text: &str, pos: usize) -> usize {
@@ -154,6 +170,14 @@ mod tests {
         assert_eq!(word_end("ab  ", 1), 1);
         assert_eq!(word_end("ab", 1), 1);
         assert_eq!(word_end("", 0), 0);
+    }
+
+    #[test]
+    fn word_run_end_stops_at_a_class_change() {
+        assert_eq!(word_run_end("foo.bar", 1), 2);
+        assert_eq!(word_run_end("foo.bar", 3), 3);
+        assert_eq!(word_run_end("é é", 0), 0);
+        assert_eq!(word_run_end("ab", 1), 1);
     }
 
     #[test]
