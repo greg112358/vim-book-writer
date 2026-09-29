@@ -1,6 +1,8 @@
 use crate::rects::Rect;
+use book_writing_app::editor::View;
 use book_writing_app::runs::Format;
-use glyphon::{Attrs, Buffer, Color, Family, Metrics, Style, Weight};
+use book_writing_app::vim::Mode;
+use glyphon::{Attrs, Buffer, Color, Cursor, Family, Metrics, Style, Weight};
 
 /// Body text size in pixels, and the line height as a multiple of it.
 pub const FONT_SIZE: f32 = 18.0;
@@ -83,4 +85,117 @@ pub fn decorations(buffer: &Buffer, left: f32, top: f32) -> Vec<Rect> {
         }
     }
     rects
+}
+
+const SELECTION: [u8; 4] = [0x7f, 0xae, 0xe6, 0x80];
+const BLOCK: [u8; 4] = [0x2b, 0x5c, 0xb8, 0x66];
+const BAR: [u8; 4] = [0x2b, 0x5c, 0xb8, 0xff];
+
+/// The selection highlight, which goes behind the text and is pushed to `under`, and the caret,
+/// which goes in front and is pushed to `over`. `origin` is where the text's top left corner is
+/// drawn. Inserting shows a thin bar between chars; otherwise a block covers the char it is on.
+pub fn caret_and_selection(
+    buffer: &Buffer,
+    view: &View<'_>,
+    (left, top): (f32, f32),
+    under: &mut Vec<Rect>,
+    over: &mut Vec<Rect>,
+) {
+    let display = view.display;
+    let cursor_at = |offset: usize| {
+        let (line, index) = display.line_and_index(offset);
+        Cursor::new(line, index)
+    };
+    let selection = view
+        .selection
+        .as_ref()
+        .map(|r| (cursor_at(r.start), cursor_at(r.end)));
+    let (cursor_line, cursor_index) = display.line_and_index(view.cursor);
+    // The last run of the caret's line, in case the caret sits past its last glyph.
+    let mut caret: Option<(f32, f32, f32, f32)> = None;
+    for run in buffer.layout_runs() {
+        let (y, height) = (top + run.line_top, run.line_height);
+        // `highlight` assumes the run's line is in range, so check that here.
+        if let Some((start, end)) =
+            selection.filter(|(a, b)| (a.line..=b.line).contains(&run.line_i))
+        {
+            let mut any = false;
+            for (x, w) in run.highlight(start, end) {
+                under.push(Rect {
+                    x: left + x,
+                    y,
+                    w,
+                    h: height,
+                    color: SELECTION,
+                });
+                any = true;
+            }
+            // A selected empty line has no glyphs to highlight, so show its newline.
+            if !any && run.glyphs.is_empty() && (start.line..end.line).contains(&run.line_i) {
+                under.push(Rect {
+                    x: left,
+                    y,
+                    w: FONT_SIZE * 0.5,
+                    h: height,
+                    color: SELECTION,
+                });
+            }
+        }
+        if run.line_i == cursor_line {
+            let glyph = run
+                .glyphs
+                .iter()
+                .find(|g| g.start <= cursor_index && cursor_index < g.end);
+            match glyph {
+                Some(g) => caret = Some((left + g.x, g.w, y, height)),
+                None if caret.is_none()
+                    || run.glyphs.last().is_some_and(|g| g.end <= cursor_index) =>
+                {
+                    let x = run.glyphs.last().map_or(0.0, |g| g.x + g.w);
+                    caret = Some((left + x, FONT_SIZE * 0.5, y, height));
+                }
+                None => {}
+            }
+        }
+    }
+    if let Some((x, w, y, h)) = caret {
+        over.push(match view.mode {
+            Mode::Insert => Rect {
+                x,
+                y,
+                w: 2.0,
+                h,
+                color: BAR,
+            },
+            _ => Rect {
+                x,
+                y,
+                w,
+                h,
+                color: BLOCK,
+            },
+        });
+    }
+}
+
+/// The line and byte index in it of the text at (`x`, `y`), measured from the text's top left
+/// corner. A point above or below the text is on its first or last line, and one to the right of
+/// a line is at its end. With `block` it is the char under the point, as for a block cursor;
+/// without, the boundary nearest the point, as for a bar.
+pub fn hit(buffer: &Buffer, x: f32, y: f32, block: bool) -> Option<(usize, usize)> {
+    let run = buffer
+        .layout_runs()
+        .find(|run| y < run.line_top + run.line_height)
+        .or_else(|| buffer.layout_runs().last())?;
+    let index = run.glyphs.iter().find(|g| x < g.x + g.w).map_or_else(
+        || run.glyphs.last().map_or(0, |g| g.end),
+        |g| {
+            if block || x < g.x + g.w / 2.0 {
+                g.start
+            } else {
+                g.end
+            }
+        },
+    );
+    Some((run.line_i, index))
 }

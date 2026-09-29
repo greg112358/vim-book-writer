@@ -1,6 +1,7 @@
 use crate::rects::Rects;
 use crate::typeset::{self, FONT_SIZE, LINE_HEIGHT};
 use book_writing_app::display::Display;
+use book_writing_app::editor::View;
 use cosmic_text::fontdb;
 use glyphon::{
     Attrs, Buffer, Cache, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache, TextArea,
@@ -9,13 +10,6 @@ use glyphon::{
 use std::sync::Arc;
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
-
-/// What a frame shows. `version` changes whenever `display` does, so unchanged text isn't laid
-/// out again.
-pub struct Scene<'a> {
-    pub display: &'a Display,
-    pub version: u64,
-}
 
 /// The width of the text column, and the least margin on either side of it.
 const COLUMN_WIDTH: f32 = 720.0;
@@ -36,8 +30,10 @@ pub struct Gpu {
     text: TextRenderer,
     rects: Rects,
     buffer: Buffer,
-    /// The scene version and column width of the text `buffer` holds.
+    /// The display version and column width of the text `buffer` holds.
     shown: Option<(u64, u32)>,
+    /// Where the text's top left corner was drawn, for turning clicks into text positions.
+    origin: (f32, f32),
 }
 
 /// A GPU and the window surface it draws to.
@@ -151,7 +147,16 @@ impl Gpu {
             rects,
             buffer,
             shown: None,
+            origin: (0.0, 0.0),
         }
+    }
+
+    /// The displayed offset at the pixel (`x`, `y`) of the last frame: the char under it if
+    /// `block`, else the nearest boundary between chars.
+    pub fn hit(&self, display: &Display, x: f32, y: f32, block: bool) -> Option<usize> {
+        let (line, index) =
+            typeset::hit(&self.buffer, x - self.origin.0, y - self.origin.1, block)?;
+        Some(display.offset(line, index))
     }
 
     /// A GPU with no window, for screenshots.
@@ -161,13 +166,13 @@ impl Gpu {
     }
 
     /// Draws the frame into `view`, which is `width` by `height` pixels.
-    fn paint(&mut self, view: &wgpu::TextureView, width: u32, height: u32, scene: &Scene<'_>) {
+    fn paint(&mut self, target: &wgpu::TextureView, width: u32, height: u32, view: &View<'_>) {
         let margin = ((width as f32 - COLUMN_WIDTH) / 2.0).max(MIN_MARGIN);
         let column = (width as f32 - 2.0 * margin).max(1.0);
-        let key = (scene.version, column as u32);
+        let key = (view.version, column as u32);
         if self.shown != Some(key) {
             self.buffer.set_size(Some(column), Some(height as f32));
-            let display = scene.display;
+            let display = view.display;
             self.buffer.set_rich_text(
                 display.spans.iter().map(|span| {
                     (
@@ -204,12 +209,15 @@ impl Gpu {
             )
             .expect("failed to prepare text");
 
-        let over = typeset::decorations(&self.buffer, margin, TOP_MARGIN);
+        self.origin = (margin, TOP_MARGIN);
+        let mut under = Vec::new();
+        let mut over = typeset::decorations(&self.buffer, margin, TOP_MARGIN);
+        typeset::caret_and_selection(&self.buffer, view, self.origin, &mut under, &mut over);
         let mut encoder = self.device.create_command_encoder(&Default::default());
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view,
+                    view: target,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -224,6 +232,13 @@ impl Gpu {
                 })],
                 ..Default::default()
             });
+            self.rects.draw(
+                &self.device,
+                &self.queue,
+                &mut pass,
+                (width, height),
+                &under,
+            );
             self.text
                 .render(&self.atlas, &self.viewport, &mut pass)
                 .expect("failed to draw text");
@@ -235,7 +250,7 @@ impl Gpu {
     }
 
     /// Draws one frame offscreen and returns it as tightly packed RGBA bytes.
-    pub fn screenshot(&mut self, width: u32, height: u32, scene: &Scene<'_>) -> Vec<u8> {
+    pub fn screenshot(&mut self, width: u32, height: u32, view: &View<'_>) -> Vec<u8> {
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("screenshot"),
             size: wgpu::Extent3d {
@@ -254,7 +269,7 @@ impl Gpu {
             &texture.create_view(&Default::default()),
             width,
             height,
-            scene,
+            view,
         );
 
         // Rows in a buffer copy must start on 256-byte boundaries.
@@ -328,7 +343,7 @@ impl WindowGpu {
         self.surface.configure(&self.gpu.device, &self.config);
     }
 
-    pub fn draw(&mut self, scene: &Scene<'_>) {
+    pub fn draw(&mut self, view: &View<'_>) {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
             | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
@@ -341,7 +356,7 @@ impl WindowGpu {
             &frame.texture.create_view(&Default::default()),
             self.config.width,
             self.config.height,
-            scene,
+            view,
         );
         self.gpu.queue.present(frame);
     }

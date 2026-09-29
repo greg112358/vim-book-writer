@@ -111,7 +111,7 @@ buttons. Smooth scrolling and transitions. Continuous scroll layout with a fixed
 - [x] Keyboard input routed into the vim engine
 - [x] Normal-mode rendering: hidden delimiters, styled headings, bold, italic, strikethrough **[visual]**
 - [x] Insert-mode rendering: styled text with faint delimiters **[visual]**
-- [ ] Caret, selection highlight, and mouse caret placement **[visual]**
+- [x] Caret, selection highlight, and mouse caret placement **[visual]**
 - [ ] Smooth scrolling with a fixed-width text column **[visual]**
 
 ## Milestone 3: App shell
