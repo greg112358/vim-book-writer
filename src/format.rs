@@ -1,5 +1,6 @@
 use crate::buffer::Buffer;
 use crate::djot::{Span, SpanKind, parse};
+use crate::runs::runs;
 use std::ops::Range;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,6 +154,28 @@ pub fn set_font_family(buf: &mut Buffer, range: Range<usize>, name: &str) {
         format!("'{name}'")
     };
     edit_style(buf, range, "font-family", &value, false);
+}
+
+/// Uppercases the characters in `range`. It edits the text rather than styling it, so it survives
+/// export. Markup inside the range (URLs, attribute blocks, fences) is left alone, since
+/// uppercasing it would break links and styles. One undo step, or none if nothing changes.
+pub fn uppercase(buf: &mut Buffer, range: Range<usize>) {
+    let text = buf.text();
+    let edits: Vec<(Range<usize>, String)> = runs(text, &parse(text))
+        .into_iter()
+        .filter(|run| !run.markup && run.range.start < range.end && range.start < run.range.end)
+        .filter_map(|run| {
+            let part = run.range.start.max(range.start)..run.range.end.min(range.end);
+            let upper = text[part.clone()].to_uppercase();
+            (upper != text[part.clone()]).then_some((part, upper))
+        })
+        .collect();
+    buf.begin_group();
+    // Last first, so the offsets of earlier edits stay valid.
+    for (part, upper) in edits.iter().rev() {
+        buf.replace(part.clone(), upper);
+    }
+    buf.end_group();
 }
 
 /// Where a span's `{...}` attribute block sits and what its style attribute holds.
@@ -540,5 +563,27 @@ mod tests {
         let mut buf = Buffer::new("a");
         set_font_family(&mut buf, 0..1, "Georgia");
         assert_eq!(buf.text(), r#"[a]{style="font-family:Georgia"}"#);
+    }
+
+    #[test]
+    fn uppercase_changes_text_but_not_markup() {
+        let src = r#"héllo *world* ß [link](http://x.y) and [c]{style="color:#c00"}"#;
+        let mut buf = Buffer::new(src);
+        uppercase(&mut buf, 0..src.len());
+        assert_eq!(
+            buf.text(),
+            r#"HÉLLO *WORLD* SS [LINK](http://x.y) AND [C]{style="color:#c00"}"#
+        );
+        assert!(buf.undo());
+        assert_eq!(buf.text(), src);
+        assert!(!buf.undo());
+        // A partial selection stops where it stops, even inside a span.
+        let mut buf = Buffer::new("hello *world*");
+        uppercase(&mut buf, 2..9);
+        assert_eq!(buf.text(), "heLLO *WOrld*");
+        // Nothing to change means no undo step.
+        let mut buf = Buffer::new("ABC 123");
+        uppercase(&mut buf, 0..7);
+        assert!(!buf.undo());
     }
 }
