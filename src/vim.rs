@@ -3,6 +3,7 @@ use crate::motion::{
     first_non_blank, line_end, line_start, nth_line_start, text_object, word_back, word_end,
     word_forward, word_run_end,
 };
+use std::collections::HashMap;
 use std::ops::Range;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +49,10 @@ struct Pending {
     /// `i` (`Some(false)`) or `a` (`Some(true)`) was typed after an operator or in visual mode,
     /// and the next key names a text object.
     object: Option<bool>,
+    /// A `"` was typed and the next key names a register.
+    awaiting_register: bool,
+    /// The register named by `"x`, for the command that follows.
+    register: Option<char>,
 }
 
 /// Vim-style modal editing over a `Buffer`. Feed it keys with `handle`.
@@ -57,7 +62,10 @@ pub struct Vim {
     /// Where the visual selection started; the buffer cursor is the other end.
     anchor: usize,
     pending: Pending,
-    unnamed: Option<Register>,
+    /// Registers by lowercase letter, and `"` for the unnamed one.
+    registers: HashMap<char, Register>,
+    /// The register the command being handled reads or writes; `None` is the unnamed one.
+    register: Option<char>,
 }
 
 impl Vim {
@@ -89,6 +97,7 @@ impl Vim {
         }
 
         let p = std::mem::take(&mut self.pending);
+        self.register = p.register;
         let visual = self.mode != Mode::Normal;
         // The whole count: `2d3w` is 6.
         let count = match (p.before, p.count) {
@@ -105,6 +114,23 @@ impl Vim {
             Key::Char('g') if !p.g => self.pending = Pending { g: true, ..p },
             // Any other key after `g` isn't a command we have.
             _ if p.g && key != Key::Char('g') => {}
+            Key::Char('"') if p.op.is_none() && p.object.is_none() && !p.awaiting_register => {
+                self.pending = Pending {
+                    awaiting_register: true,
+                    ..p
+                };
+            }
+            _ if p.awaiting_register => {
+                if let Key::Char(c) = key
+                    && (c.is_ascii_alphabetic() || c == '_' || c == '"')
+                {
+                    self.pending = Pending {
+                        awaiting_register: false,
+                        register: Some(c),
+                        ..p
+                    };
+                }
+            }
             Key::Char(d @ '0'..='9') if d != '0' || p.count.is_some() => {
                 let digit = d as usize - '0' as usize;
                 let count = p
@@ -161,6 +187,7 @@ impl Vim {
                     self.pending = Pending {
                         before: p.count,
                         op: Some(c),
+                        register: p.register,
                         ..Pending::default()
                     }
                 }
@@ -373,10 +400,7 @@ impl Vim {
         if linewise && !yanked.ends_with('\n') {
             yanked.push('\n');
         }
-        self.unnamed = Some(Register {
-            text: yanked,
-            linewise,
-        });
+        self.store(yanked, linewise);
         let ends_with_newline = text[..range.end].ends_with('\n');
         match op {
             'y' => buf.set_cursor(cursor),
@@ -409,9 +433,50 @@ impl Vim {
         }
     }
 
+    /// Puts yanked or deleted text in the register the command names, and in the unnamed one.
+    /// A capital letter appends to that register instead of replacing it; `_` discards.
+    fn store(&mut self, text: String, linewise: bool) {
+        let mut register = Register { text, linewise };
+        match self.register {
+            Some('_') => return,
+            Some(name) if name.is_ascii_alphabetic() => {
+                let key = name.to_ascii_lowercase();
+                if name.is_ascii_uppercase()
+                    && let Some(old) = self.registers.get(&key)
+                {
+                    // Appending lines to characters (or the reverse) makes the result lines.
+                    let mut joined = old.text.clone();
+                    if (linewise || old.linewise) && !joined.ends_with('\n') {
+                        joined.push('\n');
+                    }
+                    joined.push_str(&register.text);
+                    register = Register {
+                        text: joined,
+                        linewise: linewise || old.linewise,
+                    };
+                }
+                self.registers.insert(key, register.clone());
+            }
+            _ => {}
+        }
+        self.registers.insert('"', register);
+    }
+
+    /// The register the running command reads.
+    fn fetch(&self) -> Option<&Register> {
+        let name = self.register.filter(|&c| c != '"').unwrap_or('"');
+        self.registers.get(&name.to_ascii_lowercase())
+    }
+
+    /// The text and whether it is whole lines, of register `name` (`"` for the unnamed one).
+    pub fn register(&self, name: char) -> Option<(&str, bool)> {
+        let register = self.registers.get(&name.to_ascii_lowercase())?;
+        Some((&register.text, register.linewise))
+    }
+
     /// `p` after the cursor or line, `P` before, `count` times.
     fn paste(&mut self, buf: &mut Buffer, before: bool, count: usize) {
-        let Some(register) = &self.unnamed else {
+        let Some(register) = self.fetch() else {
             return;
         };
         let text = register.text.repeat(count);
@@ -1050,5 +1115,38 @@ cd", 0, "9$", 4,
             (vim.mode, vim.selection(&buf)),
             (Mode::VisualLine, Some(0..4))
         );
+    }
+
+    #[test]
+    fn named_registers() {
+        // (text, cursor, keys, text after)
+        for (text, cursor, keys, want) in [
+            ("a\nb", 0, "\"ayyj\"byy\"ap", "a\nb\na"),
+            ("a\nb", 0, "\"ayyj\"byy\"bp\"aP", "a\nb\na\nb"),
+            ("a\nb\nc", 0, "\"ayyjyyj\"app", "a\nb\nc\na\nb"),
+            ("a\nb", 0, "\"add\"ap", "b\na"),
+            ("a\nb", 0, "\"ayy\"Ayyj\"ap", "a\nb\na\na"),
+            ("a\nb\nc", 0, "yyj\"_ddP", "a\na\nc"),
+            ("a\nb", 0, "\"_ddp", "b"),
+            ("one two", 0, "\"ayw\"Ayw$\"ap", "one twoone one "),
+            ("one two", 0, "\"aywwyw\"aP", "one one two"),
+            ("one two", 0, "\"ay2w$\"ap", "one twoone two"),
+            ("one two", 0, "2\"aywP", "one twoone two"),
+            ("one two", 0, "\"ayw\"Ayy$\"ap", "one two\none \none two"),
+            ("one two", 0, "ve\"ay$\"ap", "one twoone"),
+            ("ab", 0, "\"ax\"ap", "ba"),
+            ("ab", 0, "\"acwX\x1b\"ap", "Xab"),
+            // Bad names and Esc drop the register; the command still runs.
+            ("a\nb", 0, "\"!yyp", "a\na\nb"),
+            ("a", 0, "\"a\x1byy\"ap", "a"),
+        ] {
+            let (_, buf) = run(text, cursor, keys);
+            assert_eq!(buf.text(), want, "{keys:?} on {text:?}");
+        }
+        let (vim, _) = run("a\nb", 0, "\"ayyj\"bx");
+        assert_eq!(vim.register('a'), Some(("a\n", true)));
+        assert_eq!(vim.register('b'), Some(("b", false)));
+        assert_eq!(vim.register('"'), Some(("b", false)));
+        assert_eq!(vim.register('c'), None);
     }
 }
