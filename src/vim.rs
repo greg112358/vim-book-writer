@@ -36,7 +36,7 @@ struct Register {
     linewise: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq)]
 struct Pending {
     /// Digits typed so far for the next thing: the operator, or its motion.
     count: Option<usize>,
@@ -66,6 +66,15 @@ pub struct Vim {
     registers: HashMap<char, Register>,
     /// The register the command being handled reads or writes; `None` is the unnamed one.
     register: Option<char>,
+    /// Keys of the normal-mode command being typed, and the buffer revision when it began.
+    command_keys: Vec<Key>,
+    command_revision: u64,
+    /// Keys of the last command that changed the text, including what was typed in insert mode.
+    last_change: Vec<Key>,
+    /// True while typing an insert session that `last_change` should keep growing with.
+    recording_insert: bool,
+    /// True while `.` replays `last_change`, so the replay doesn't overwrite it.
+    replaying: bool,
 }
 
 impl Vim {
@@ -75,6 +84,10 @@ impl Vim {
 
     pub fn handle(&mut self, buf: &mut Buffer, key: Key) {
         if self.mode == Mode::Insert {
+            if self.recording_insert && !self.replaying {
+                self.last_change.push(key);
+                self.recording_insert = key != Key::Esc;
+            }
             match key {
                 Key::Esc => {
                     buf.end_group();
@@ -96,6 +109,12 @@ impl Vim {
             return;
         }
 
+        if !self.replaying {
+            if self.command_keys.is_empty() {
+                self.command_revision = buf.revision();
+            }
+            self.command_keys.push(key);
+        }
         let p = std::mem::take(&mut self.pending);
         self.register = p.register;
         let visual = self.mode != Mode::Normal;
@@ -217,6 +236,23 @@ impl Vim {
                     }
                 }
             }
+            Key::Char('.') if !visual => {
+                let mut keys = std::mem::take(&mut self.last_change);
+                if let Some(count) = count {
+                    // A count replaces the one the change had.
+                    let digits = keys
+                        .iter()
+                        .take_while(|k| matches!(k, Key::Char('0'..='9')))
+                        .count();
+                    keys.splice(..digits, count.to_string().chars().map(Key::Char));
+                }
+                self.replaying = true;
+                for &k in &keys {
+                    self.handle(buf, k);
+                }
+                self.replaying = false;
+                self.last_change = keys;
+            }
             // An insert session, `o` and `O` included, is one undo step.
             Key::Char(c @ ('i' | 'a' | 'A' | 'I' | 'o' | 'O')) if !visual => {
                 buf.begin_group();
@@ -262,6 +298,18 @@ impl Vim {
         // Normal and visual mode never rest past the last char of a line.
         if self.mode != Mode::Insert {
             buf.clamp_to_char();
+        }
+        // A finished command that changed the text, or started an insert, is what `.` repeats.
+        // A visual selection is part of the command that uses it.
+        let finished =
+            self.pending == Pending::default() && matches!(self.mode, Mode::Normal | Mode::Insert);
+        if finished && !self.replaying {
+            let undoing = matches!(key, Key::Char('u' | '.') | Key::Ctrl('r'));
+            if !undoing && (self.mode == Mode::Insert || buf.revision() != self.command_revision) {
+                self.last_change = std::mem::take(&mut self.command_keys);
+                self.recording_insert = self.mode == Mode::Insert;
+            }
+            self.command_keys.clear();
         }
     }
 
@@ -1148,5 +1196,58 @@ cd", 0, "9$", 4,
         assert_eq!(vim.register('b'), Some(("b", false)));
         assert_eq!(vim.register('"'), Some(("b", false)));
         assert_eq!(vim.register('c'), None);
+    }
+
+    #[test]
+    fn dot_repeats_the_last_change() {
+        // (text, cursor, keys, text after)
+        for (text, cursor, keys, want) in [
+            ("one two three four", 0, "dw.", "three four"),
+            ("one two three four", 0, "dw..", "four"),
+            ("one two three four", 0, "d2w.", ""),
+            ("abcdefg", 0, "2x.", "efg"),
+            ("abcdef", 0, "x3.", "ef"),
+            ("abcdef", 0, "3x2.", "f"),
+            ("a\nb\nc\nd", 0, "dd.", "c\nd"),
+            ("a\nb\nc\nd", 0, "2dd.", ""),
+            ("one two three", 0, "cwfoo\x1bw.", "foo foo three"),
+            ("x", 0, "ihi\x1b.", "hhiix"),
+            ("a\nb", 0, "A;\x1bj.", "a;\nb;"),
+            ("a", 0, "ofoo\x1b.", "a\nfoo\nfoo"),
+            ("a", 0, "Ofoo\x1b.", "foo\nfoo\na"),
+            ("a b c", 0, "yyp.", "a b c\na b c\na b c"),
+            ("ab", 0, "x.", ""),
+            ("one two", 0, "dwu.", "two"),
+            ("one two three", 0, "dwyy.", "three"),
+            ("one two three", 0, "dwyw.", "three"),
+            ("abcdef", 0, "vld.", "ef"),
+            ("a\nb\nc\nd", 0, "Vd.", "c\nd"),
+            ("a\nb\nc", 0, "\"add\"ap.", "b\na\na\nc"),
+            ("one two", 0, ".", "one two"),
+            ("abc", 0, "vl\x1b.", "abc"),
+            ("one two", 0, "diw.", "two"),
+        ] {
+            let (_, buf) = run(text, cursor, keys);
+            assert_eq!(buf.text(), want, "{keys:?} on {text:?}");
+        }
+    }
+
+    #[test]
+    fn a_repeated_change_is_one_undo_step_and_can_be_repeated_again() {
+        let (mut vim, mut buf) = run("one two three four", 0, "dw.");
+        assert_eq!(buf.text(), "three four");
+        press(&mut vim, &mut buf, "u");
+        assert_eq!(buf.text(), "two three four");
+        press(&mut vim, &mut buf, "u");
+        assert_eq!(buf.text(), "one two three four");
+        // A repeat with a count becomes the change that the next `.` repeats.
+        let (mut vim, mut buf) = run("a b c d e f", 0, "dw2.");
+        assert_eq!(buf.text(), "d e f");
+        press(&mut vim, &mut buf, ".");
+        assert_eq!(buf.text(), "f");
+        // An insert that was repeated once is a single step.
+        let (mut vim, mut buf) = run("x", 0, "ihi\x1b.");
+        press(&mut vim, &mut buf, "u");
+        assert_eq!(buf.text(), "hix");
     }
 }

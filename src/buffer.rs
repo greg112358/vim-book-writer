@@ -14,6 +14,8 @@ pub struct Buffer {
     group_depth: u32,
     /// True right after `begin_group` opens a step, before its first edit.
     group_fresh: bool,
+    /// Counts every change to the text, undo and redo included.
+    revision: u64,
 }
 
 /// One splice, stored so it can be reversed: `at..at + new_len` now holds what `old` replaced.
@@ -41,6 +43,11 @@ impl Buffer {
         self.cursor
     }
 
+    /// A number that differs whenever the text was changed since it was last read.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
     /// Moves the cursor to `pos`, clamped to the text and rounded down to a char boundary.
     pub fn set_cursor(&mut self, pos: usize) {
         let mut pos = pos.min(self.text.len());
@@ -65,6 +72,7 @@ impl Buffer {
             _ => self.undo.push(vec![edit]),
         }
         self.group_fresh = false;
+        self.revision += 1;
         self.redo.clear();
         self.cursor = range.start + with.len();
         self.text.replace_range(range, with);
@@ -107,6 +115,7 @@ impl Buffer {
     /// Reverses each edit of `step`, last first. Returns the edits that undo it again, and the
     /// cursor from before the step's first edit.
     fn apply(&mut self, step: Vec<Edit>) -> (Vec<Edit>, usize) {
+        self.revision += 1;
         let mut inverse = Vec::with_capacity(step.len());
         let mut cursor = self.cursor;
         for edit in step.into_iter().rev() {

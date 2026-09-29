@@ -91,7 +91,7 @@ buttons. Smooth scrolling and transitions. Continuous scroll layout with a fixed
 - [x] Operators: `d c y` with motions, doubled forms (`dd cc yy`), `x`, `p P`, `u`, `Ctrl-r`
 - [x] Text objects: `iw aw ip ap i" a" i( a(`
 - [x] Registers: unnamed, named (`"a`), and yank/paste through them
-- [ ] Dot-repeat (`.`) for the last change
+- [x] Dot-repeat (`.`) for the last change
 - [ ] Search: `/`, `?`, `n`, `N`
 - [ ] Ex commands: `:w`, `:q`, `:wq`, `:q!`; `:w` triggers the same code path as the Save button
 - [ ] Visual selection then a formatting shortcut applies the format to the selection
