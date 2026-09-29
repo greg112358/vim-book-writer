@@ -94,13 +94,14 @@ const BAR: [u8; 4] = [0x2b, 0x5c, 0xb8, 0xff];
 /// The selection highlight, which goes behind the text and is pushed to `under`, and the caret,
 /// which goes in front and is pushed to `over`. `origin` is where the text's top left corner is
 /// drawn. Inserting shows a thin bar between chars; otherwise a block covers the char it is on.
+/// Returns the top and bottom of the caret's line, measured from the top of the text.
 pub fn caret_and_selection(
     buffer: &Buffer,
     view: &View<'_>,
     (left, top): (f32, f32),
     under: &mut Vec<Rect>,
     over: &mut Vec<Rect>,
-) {
+) -> Option<(f32, f32)> {
     let display = view.display;
     let cursor_at = |offset: usize| {
         let (line, index) = display.line_and_index(offset);
@@ -176,6 +177,15 @@ pub fn caret_and_selection(
             },
         });
     }
+    caret.map(|(_, _, y, h)| (y - top, y - top + h))
+}
+
+/// The bottom of the last line of text in `buffer`.
+pub fn text_height(buffer: &Buffer) -> f32 {
+    buffer
+        .layout_runs()
+        .last()
+        .map_or(0.0, |run| run.line_top + run.line_height)
 }
 
 /// The line and byte index in it of the text at (`x`, `y`), measured from the text's top left

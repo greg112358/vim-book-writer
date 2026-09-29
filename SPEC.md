@@ -112,7 +112,7 @@ buttons. Smooth scrolling and transitions. Continuous scroll layout with a fixed
 - [x] Normal-mode rendering: hidden delimiters, styled headings, bold, italic, strikethrough **[visual]**
 - [x] Insert-mode rendering: styled text with faint delimiters **[visual]**
 - [x] Caret, selection highlight, and mouse caret placement **[visual]**
-- [ ] Smooth scrolling with a fixed-width text column **[visual]**
+- [x] Smooth scrolling with a fixed-width text column **[visual]**
 
 ## Milestone 3: App shell
 - [ ] taffy layout: thin toolbar, editor, right-hand file tree, status bar (mode, word count, file) **[visual]**

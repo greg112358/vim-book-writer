@@ -16,6 +16,16 @@ const COLUMN_WIDTH: f32 = 720.0;
 const MIN_MARGIN: f32 = 24.0;
 const TOP_MARGIN: f32 = 32.0;
 
+/// Where things are in the laid-out text, in pixels from the top of the scrollable area, which
+/// starts with the top margin.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct Layout {
+    /// The height of the text with the margins above and below it.
+    pub content_height: f32,
+    /// The top and bottom of the line the caret is on, if it is laid out.
+    pub caret: Option<(f32, f32)>,
+}
+
 /// Format of the offscreen frame. sRGB, so a color drawn here matches one drawn to a window.
 const SCREENSHOT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
@@ -165,13 +175,15 @@ impl Gpu {
         Self::new(device, queue, SCREENSHOT_FORMAT)
     }
 
-    /// Draws the frame into `view`, which is `width` by `height` pixels.
-    fn paint(&mut self, target: &wgpu::TextureView, width: u32, height: u32, view: &View<'_>) {
+    /// Lays out the view's text for a frame `width` wide. Only shapes again if the text or the
+    /// width changed. Returns the margin to the left of the text column.
+    fn sync(&mut self, view: &View<'_>, width: u32) -> f32 {
         let margin = ((width as f32 - COLUMN_WIDTH) / 2.0).max(MIN_MARGIN);
         let column = (width as f32 - 2.0 * margin).max(1.0);
         let key = (view.version, column as u32);
         if self.shown != Some(key) {
-            self.buffer.set_size(Some(column), Some(height as f32));
+            // No height, so every line is laid out and the caret can be found wherever it is.
+            self.buffer.set_size(Some(column), None);
             let display = view.display;
             self.buffer.set_rich_text(
                 display.spans.iter().map(|span| {
@@ -187,6 +199,37 @@ impl Gpu {
             self.shown = Some(key);
         }
         self.buffer.shape_until_scroll(&mut self.fonts, false);
+        margin
+    }
+
+    /// Lays out the text for a frame `width` wide and says how tall it is and where the caret is,
+    /// so the caller can decide how far to scroll.
+    pub fn layout(&mut self, view: &View<'_>, width: u32) -> Layout {
+        let margin = self.sync(view, width);
+        let caret = typeset::caret_and_selection(
+            &self.buffer,
+            view,
+            (margin, 0.0),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        Layout {
+            content_height: typeset::text_height(&self.buffer) + 2.0 * TOP_MARGIN,
+            caret: caret.map(|(top, bottom)| (top + TOP_MARGIN, bottom + TOP_MARGIN)),
+        }
+    }
+
+    /// Draws the frame into `target`, which is `width` by `height` pixels, with the text scrolled
+    /// up by `scroll` pixels.
+    fn paint(
+        &mut self,
+        target: &wgpu::TextureView,
+        (width, height): (u32, u32),
+        view: &View<'_>,
+        scroll: f32,
+    ) {
+        let margin = self.sync(view, width);
+        let top = TOP_MARGIN - scroll;
         self.viewport
             .update(&self.queue, Resolution { width, height });
         self.text
@@ -199,7 +242,7 @@ impl Gpu {
                 [TextArea {
                     buffer: &self.buffer,
                     left: margin,
-                    top: TOP_MARGIN,
+                    top,
                     scale: 1.0,
                     bounds: TextBounds::default(),
                     default_color: typeset::TEXT,
@@ -209,9 +252,9 @@ impl Gpu {
             )
             .expect("failed to prepare text");
 
-        self.origin = (margin, TOP_MARGIN);
+        self.origin = (margin, top);
         let mut under = Vec::new();
-        let mut over = typeset::decorations(&self.buffer, margin, TOP_MARGIN);
+        let mut over = typeset::decorations(&self.buffer, margin, top);
         typeset::caret_and_selection(&self.buffer, view, self.origin, &mut under, &mut over);
         let mut encoder = self.device.create_command_encoder(&Default::default());
         {
@@ -250,7 +293,7 @@ impl Gpu {
     }
 
     /// Draws one frame offscreen and returns it as tightly packed RGBA bytes.
-    pub fn screenshot(&mut self, width: u32, height: u32, view: &View<'_>) -> Vec<u8> {
+    pub fn screenshot(&mut self, width: u32, height: u32, view: &View<'_>, scroll: f32) -> Vec<u8> {
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("screenshot"),
             size: wgpu::Extent3d {
@@ -267,9 +310,9 @@ impl Gpu {
         });
         self.paint(
             &texture.create_view(&Default::default()),
-            width,
-            height,
+            (width, height),
             view,
+            scroll,
         );
 
         // Rows in a buffer copy must start on 256-byte boundaries.
@@ -343,7 +386,12 @@ impl WindowGpu {
         self.surface.configure(&self.gpu.device, &self.config);
     }
 
-    pub fn draw(&mut self, view: &View<'_>) {
+    /// The size of the window's surface in pixels.
+    pub fn size(&self) -> (u32, u32) {
+        (self.config.width, self.config.height)
+    }
+
+    pub fn draw(&mut self, view: &View<'_>, scroll: f32) {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
             | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
@@ -354,9 +402,9 @@ impl WindowGpu {
         };
         self.gpu.paint(
             &frame.texture.create_view(&Default::default()),
-            self.config.width,
-            self.config.height,
+            (self.config.width, self.config.height),
             view,
+            scroll,
         );
         self.gpu.queue.present(frame);
     }

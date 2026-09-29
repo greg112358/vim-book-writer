@@ -17,6 +17,7 @@ pub mod motion;
 pub mod pdf;
 pub mod recent;
 pub mod runs;
+pub mod scroll;
 pub mod search;
 pub mod style;
 pub mod tree;
