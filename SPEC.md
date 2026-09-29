@@ -118,7 +118,7 @@ buttons. Smooth scrolling and transitions. Continuous scroll layout with a fixed
 - [x] taffy layout: thin toolbar, editor, right-hand file tree, status bar (mode, word count, file) **[visual]**
 - [x] Toolbar buttons wired to the formatting commands **[visual]**
 - [x] Traditional shortcuts (Ctrl/Cmd+B/I/U, Ctrl/Cmd+S) **[visual]**
-- [ ] Start screen: open recent, open folder, open file via `rfd` **[visual]**
+- [x] Start screen: open recent, open folder, open file via `rfd` **[visual]**
 - [ ] File tree UI with Neo-tree keys **[visual]**
 - [ ] Command line (`:`) and search (`/`) prompts **[visual]**
 - [ ] Auto-save toggle button **[visual]**

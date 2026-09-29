@@ -10,6 +10,8 @@ const USAGE: &str =
   --mode MODE         the mode to show: normal, insert, visual, or visual-line
   --size WxH          the size of the screenshot in pixels (default 1000x700)
   --tree              show the file tree
+  --start             show the start screen
+  --recent PATH       a file for the start screen's recent list, once for each (for screenshots)
   --popup MENU        show a toolbar menu open: color, font, or size
   --keys KEYS         keys to press before the screenshot, after the mode is set: text as typed,
                       plus <Esc> <CR> <BS> <Del> <Left> <Right> <Up> <Down> <C-x> and <lt>";
@@ -28,6 +30,10 @@ pub struct Args {
     pub tree: bool,
     /// A toolbar menu to show open in a screenshot.
     pub popup: Option<Menu>,
+    /// Show the start screen even with a file, for screenshots.
+    pub start: bool,
+    /// Recent files to show instead of the saved list, for screenshots.
+    pub recent: Vec<PathBuf>,
 }
 
 impl Default for Args {
@@ -40,6 +46,8 @@ impl Default for Args {
             keys: Vec::new(),
             tree: false,
             popup: None,
+            start: false,
+            recent: Vec::new(),
         }
     }
 }
@@ -69,6 +77,8 @@ impl Args {
                     }
                 }
                 "--tree" => parsed.tree = true,
+                "--start" => parsed.start = true,
+                "--recent" => parsed.recent.push(value("--recent")?.into()),
                 "--popup" => {
                     parsed.popup = Some(match value("--popup")?.as_str() {
                         "color" => Menu::Color,
@@ -186,6 +196,9 @@ mod tests {
         }
         assert_eq!(parse(&["--keys", "ihi<Esc>"]).unwrap().keys.len(), 4);
         assert!(parse(&["--tree"]).unwrap().tree && !parse(&[]).unwrap().tree);
+        let args = parse(&["--start", "--recent", "a.dj", "--recent", "b.dj"]).unwrap();
+        assert!(args.start);
+        assert_eq!(args.recent, [PathBuf::from("a.dj"), PathBuf::from("b.dj")]);
         assert_eq!(parse(&["--popup", "font"]).unwrap().popup, Some(Menu::Font));
         assert!(parse(&["--popup", "nope"]).is_err());
     }

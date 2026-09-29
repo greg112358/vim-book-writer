@@ -2,14 +2,18 @@ mod gpu;
 mod rects;
 mod typeset;
 
+use book_writing_app::app::{App, Effect, Screen};
 use book_writing_app::cli::Args;
+use book_writing_app::config;
 use book_writing_app::editor::Editor;
 use book_writing_app::input;
+use book_writing_app::recent::Recent;
 use book_writing_app::scroll::Scroll;
-use book_writing_app::toolbar::{self, Click, Popup};
-use book_writing_app::ui::{self, Interface, Regions, Status};
+use book_writing_app::toolbar::{self, Click};
+use book_writing_app::ui::Bounds;
 use book_writing_app::vim::{Key, Mode};
 use gpu::{Frame, Gpu, Layout, WindowGpu};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use winit::application::ApplicationHandler;
@@ -22,31 +26,14 @@ use winit::window::{Window, WindowId};
 const PADDING: f32 = 54.0;
 const WHEEL_NOTCH: f32 = 81.0;
 
-/// What the window around the editor shows for the editor's current state.
-fn chrome(editor: &mut Editor, regions: &Regions, interface: &Interface<'_>) -> ui::Chrome {
-    let status = Status {
-        mode: editor.vim.mode,
-        file: editor.file_name(),
-        modified: editor.buf.is_modified(),
-        words: editor.word_count(),
-        message: editor.vim.message.clone(),
-    };
-    ui::chrome(regions, &status, interface)
-}
-
-struct App {
+/// The window and everything that draws to it, around the app that decides what to draw.
+struct Shell {
     window: Option<Arc<Window>>,
     gpu: Option<WindowGpu>,
-    editor: Editor,
+    app: App,
     modifiers: ModifiersState,
     /// Where the mouse is, in pixels from the window's top left.
     mouse: (f32, f32),
-    /// Whether the file tree is showing.
-    tree: bool,
-    /// The toolbar menu that is open, the button the mouse is over, and the last color chosen.
-    popup: Option<Popup>,
-    hover: Option<usize>,
-    color: [u8; 3],
     scroll: Scroll,
     /// The layout of the last frame, for scrolling by the wheel.
     layout: Layout,
@@ -55,24 +42,39 @@ struct App {
     last_frame: Instant,
 }
 
-impl App {
+impl Shell {
+    fn size(&self) -> (f32, f32) {
+        self.gpu.as_ref().map_or((0.0, 0.0), |gpu| {
+            let (width, height) = gpu.size();
+            (width as f32, height as f32)
+        })
+    }
+
+    fn request_redraw(&self) {
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
     /// Draws a frame: scrolls to the caret if the editor changed, eases the scroll, and asks for
     /// another frame while it is still moving.
     fn redraw(&mut self) {
+        let size = self.size();
         let (Some(gpu), Some(window)) = (&mut self.gpu, &self.window) else {
             return;
         };
-        let (width, height) = gpu.size();
-        let regions = ui::regions(width as f32, height as f32, self.tree);
-        let toolbar = toolbar::toolbar(regions.toolbar);
-        let interface = Interface {
-            toolbar: &toolbar,
-            hover: self.hover,
-            popup: self.popup.as_ref(),
-            color: self.color,
-        };
-        let chrome = chrome(&mut self.editor, &regions, &interface);
-        let view = self.editor.view();
+        let chrome = self.app.chrome(size);
+        if self.app.screen != Screen::Editing {
+            gpu.draw(&Frame {
+                view: None,
+                editor: Bounds::default(),
+                scroll: 0.0,
+                chrome: &chrome,
+            });
+            return;
+        }
+        let regions = self.app.regions(size);
+        let view = self.app.editor.view();
         self.layout = gpu.gpu.layout(&view, regions.editor);
         let seen = (view.version, view.cursor);
         let viewport = regions.editor.h;
@@ -90,7 +92,7 @@ impl App {
         self.last_frame = now;
         let moving = self.scroll.step(dt);
         gpu.draw(&Frame {
-            view: &view,
+            view: Some(&view),
             editor: regions.editor,
             scroll: self.scroll.offset(),
             chrome: &chrome,
@@ -100,57 +102,38 @@ impl App {
         }
     }
 
-    /// A left click at `mouse`: on an open menu's choices, the toolbar's buttons, or the text.
-    fn click(&mut self, (x, y): (f32, f32)) {
-        let Some(gpu) = &self.gpu else { return };
-        let (width, height) = gpu.size();
-        let regions = ui::regions(width as f32, height as f32, self.tree);
-        // An open menu takes the click: a choice applies, and anywhere else just closes it.
-        if let Some(popup) = self.popup.take() {
-            if let Some(item) = popup.hit(x, y) {
-                if let Some(color) = item.swatch {
-                    self.color = color;
+    /// Carries out what the app asked for: quitting, and the file dialogs that only the window
+    /// can show.
+    fn carry_out(&mut self, event_loop: &ActiveEventLoop, effects: Vec<Effect>) {
+        for effect in effects {
+            match effect {
+                Effect::Quit => event_loop.exit(),
+                Effect::PickFile => {
+                    let file = rfd::FileDialog::new()
+                        .set_title("Open a djot file")
+                        .add_filter("Djot and text", &["dj", "djot", "md", "txt"])
+                        .pick_file();
+                    if let Some(file) = file {
+                        self.app.open_file(&file);
+                        self.scroll = Scroll::default();
+                        self.seen = None;
+                    }
                 }
-                self.editor.apply(&item.action);
-            }
-            return;
-        }
-        let toolbar = toolbar::toolbar(regions.toolbar);
-        if let Some(i) = toolbar.hit(x, y) {
-            match toolbar.buttons[i].click.clone() {
-                Click::Do(action) => self.editor.apply(&action),
-                Click::Open(menu) => {
-                    let anchor = toolbar.buttons[i].bounds;
-                    self.popup = Some(toolbar::popup(menu, anchor, (width as f32, height as f32)));
+                Effect::PickFolder => {
+                    if let Some(folder) = rfd::FileDialog::new()
+                        .set_title("Open a folder")
+                        .pick_folder()
+                    {
+                        self.app.open_folder(&folder);
+                    }
                 }
             }
-        } else if regions.editor.contains(x, y) {
-            let block = self.editor.vim.mode != Mode::Insert;
-            let (display, _) = self.editor.display();
-            if let Some(offset) = gpu.gpu.hit(display, x, y, block) {
-                self.editor.click(offset);
-            }
         }
-    }
-
-    /// Feeds keys to the editor and redraws. Quits when the editor says to.
-    fn keys(&mut self, event_loop: &ActiveEventLoop, keys: impl IntoIterator<Item = Key>) {
-        for key in keys {
-            // Esc closes an open menu instead of reaching the editor.
-            if key == Key::Esc && self.popup.take().is_some() {
-                continue;
-            }
-            if self.editor.key(key) {
-                event_loop.exit();
-            }
-        }
-        if let Some(window) = &self.window {
-            window.request_redraw();
-        }
+        self.request_redraw();
     }
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler for Shell {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let attributes = Window::default_attributes().with_title("Book Writing App");
         let window = Arc::new(
@@ -171,23 +154,13 @@ impl ApplicationHandler for App {
                 if let Some(gpu) = &mut self.gpu {
                     gpu.resize(size);
                 }
-                if let Some(window) = &self.window {
-                    window.request_redraw();
-                }
+                self.request_redraw();
             }
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::CursorMoved { position, .. } => {
                 self.mouse = (position.x as f32, position.y as f32);
-                if let Some(gpu) = &self.gpu {
-                    let (width, height) = gpu.size();
-                    let regions = ui::regions(width as f32, height as f32, self.tree);
-                    let hover = toolbar::toolbar(regions.toolbar).hit(self.mouse.0, self.mouse.1);
-                    if hover != self.hover {
-                        self.hover = hover;
-                        if let Some(window) = &self.window {
-                            window.request_redraw();
-                        }
-                    }
+                if self.app.hover_at(self.size(), self.mouse.0, self.mouse.1) {
+                    self.request_redraw();
                 }
             }
             WindowEvent::MouseInput {
@@ -195,36 +168,57 @@ impl ApplicationHandler for App {
                 button: MouseButton::Left,
                 ..
             } => {
-                self.click(self.mouse);
-                if let Some(window) = &self.window {
-                    window.request_redraw();
-                }
-            }
-            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
-                let keys = input::keys(&event.logical_key, event.text.as_deref(), self.modifiers);
-                self.keys(event_loop, keys);
-            }
-            // Text composed by an input method arrives whole.
-            WindowEvent::Ime(Ime::Commit(text)) => {
-                self.keys(event_loop, text.chars().map(Key::Char));
+                let (size, mouse) = (self.size(), self.mouse);
+                let Some(gpu) = &self.gpu else { return };
+                let effects = self.app.click(size, mouse, |display, block| {
+                    gpu.gpu.hit(display, mouse.0, mouse.1, block)
+                });
+                self.carry_out(event_loop, effects);
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let pixels = match delta {
                     MouseScrollDelta::LineDelta(_, lines) => lines * WHEEL_NOTCH,
                     MouseScrollDelta::PixelDelta(position) => position.y as f32,
                 };
-                if let (Some(gpu), Some(window)) = (&self.gpu, &self.window) {
-                    let (width, height) = gpu.size();
-                    let viewport = ui::regions(width as f32, height as f32, self.tree).editor.h;
-                    self.scroll
-                        .by(-pixels, self.layout.content_height, viewport);
-                    window.request_redraw();
-                }
+                let viewport = self.app.regions(self.size()).editor.h;
+                self.scroll
+                    .by(-pixels, self.layout.content_height, viewport);
+                self.request_redraw();
+            }
+            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                let keys = input::keys(&event.logical_key, event.text.as_deref(), self.modifiers);
+                let size = self.size();
+                let effects = keys
+                    .into_iter()
+                    .flat_map(|key| self.app.key(size, key))
+                    .collect();
+                self.carry_out(event_loop, effects);
+            }
+            // Text composed by an input method arrives whole.
+            WindowEvent::Ime(Ime::Commit(text)) => {
+                let size = self.size();
+                let effects = text
+                    .chars()
+                    .flat_map(|c| self.app.key(size, Key::Char(c)))
+                    .collect();
+                self.carry_out(event_loop, effects);
             }
             WindowEvent::RedrawRequested => self.redraw(),
             _ => {}
         }
     }
+}
+
+/// Writes RGBA pixels to a PNG file.
+fn write_png(path: &std::path::Path, (width, height): (u32, u32), pixels: &[u8]) {
+    let file = std::fs::File::create(path).expect("failed to create the screenshot file");
+    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder
+        .write_header()
+        .and_then(|mut writer| writer.write_image_data(pixels))
+        .expect("failed to write the PNG");
 }
 
 fn main() {
@@ -237,92 +231,114 @@ fn main() {
         }
     };
 
-    let mut editor = match &args.file {
+    let editor = match &args.file {
         Some(path) => Editor::open(path).unwrap_or_else(|error| {
             eprintln!("can't open {}: {error}", path.display());
             std::process::exit(1);
         }),
         None => Editor::default(),
     };
-    // Screenshots can show any mode, so get into it the way a person would.
-    let mode_key = match args.mode {
-        Mode::Normal => None,
-        Mode::Insert => Some('i'),
-        Mode::Visual => Some('v'),
-        Mode::VisualLine => Some('V'),
-    };
-    if args.screenshot.is_some() {
-        for key in mode_key
-            .map(Key::Char)
-            .into_iter()
-            .chain(args.keys.iter().copied())
-        {
-            editor.key(key);
+    let screenshot = args.screenshot.is_some();
+    // Screenshots list the files they are given; the window lists and saves the user's own.
+    let (recent, recent_path) = if screenshot {
+        let mut recent = Recent::default();
+        for path in args.recent.iter().rev() {
+            recent.add(path.clone());
         }
-    }
+        (recent, None)
+    } else {
+        let path: Option<PathBuf> = config::dir().map(|dir| dir.join("recent.toml"));
+        (
+            path.as_deref().map_or_else(Recent::default, Recent::load),
+            path,
+        )
+    };
+    let start = args.file.is_none() || args.start;
+    let screen = if start {
+        Screen::Start {
+            message: String::new(),
+        }
+    } else {
+        Screen::Editing
+    };
+    let mut app = App::new(editor, screen, recent, recent_path);
+    app.tree_visible = args.tree;
 
     if let Some(path) = &args.screenshot {
         let (width, height) = args.size;
-        let regions = ui::regions(width as f32, height as f32, args.tree);
-        let toolbar = toolbar::toolbar(regions.toolbar);
-        let popup = args.popup.map(|menu| {
+        let size = (width as f32, height as f32);
+        // Screenshots can show any mode, so get into it the way a person would.
+        let mode_key = match args.mode {
+            Mode::Normal => None,
+            Mode::Insert => Some('i'),
+            Mode::Visual => Some('v'),
+            Mode::VisualLine => Some('V'),
+        };
+        if app.screen == Screen::Editing {
+            for key in mode_key
+                .map(Key::Char)
+                .into_iter()
+                .chain(args.keys.iter().copied())
+            {
+                app.editor.key(key);
+            }
+        }
+        let regions = app.regions(size);
+        if let Some(menu) = args.popup {
+            let toolbar = toolbar::toolbar(regions.toolbar);
             let anchor = toolbar
                 .buttons
                 .iter()
                 .find(|b| b.click == Click::Open(menu))
                 .map_or_else(Default::default, |b| b.bounds);
-            toolbar::popup(menu, anchor, (width as f32, height as f32))
-        });
-        let interface = Interface {
-            toolbar: &toolbar,
-            hover: None,
-            popup: popup.as_ref(),
-            color: [0xcc, 0, 0],
-        };
-        let chrome = chrome(&mut editor, &regions, &interface);
-        let view = editor.view();
-        let mut gpu = Gpu::headless();
-        // Scroll to the caret as the window would, but arrive at once.
-        let layout = gpu.layout(&view, regions.editor);
-        let mut scroll = Scroll::default();
-        if let Some((top, bottom)) = layout.caret {
-            let content = layout.content_height;
-            scroll.reveal(top, bottom, PADDING, content, regions.editor.h);
+            app.popup = Some(toolbar::popup(menu, anchor, size));
         }
-        scroll.finish();
-        let pixels = gpu.screenshot(
-            width,
-            height,
-            &Frame {
-                view: &view,
-                editor: regions.editor,
-                scroll: scroll.offset(),
-                chrome: &chrome,
-            },
-        );
-        let file = std::fs::File::create(path).expect("failed to create the screenshot file");
-        let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
-        encoder.set_color(png::ColorType::Rgba);
-        encoder.set_depth(png::BitDepth::Eight);
-        encoder
-            .write_header()
-            .and_then(|mut writer| writer.write_image_data(&pixels))
-            .expect("failed to write the PNG");
+        let chrome = app.chrome(size);
+        let mut gpu = Gpu::headless();
+        let pixels = if app.screen == Screen::Editing {
+            let view = app.editor.view();
+            // Scroll to the caret as the window would, but arrive at once.
+            let layout = gpu.layout(&view, regions.editor);
+            let mut scroll = Scroll::default();
+            if let Some((top, bottom)) = layout.caret {
+                let content = layout.content_height;
+                scroll.reveal(top, bottom, PADDING, content, regions.editor.h);
+            }
+            scroll.finish();
+            gpu.screenshot(
+                width,
+                height,
+                &Frame {
+                    view: Some(&view),
+                    editor: regions.editor,
+                    scroll: scroll.offset(),
+                    chrome: &chrome,
+                },
+            )
+        } else {
+            gpu.screenshot(
+                width,
+                height,
+                &Frame {
+                    view: None,
+                    editor: Bounds::default(),
+                    scroll: 0.0,
+                    chrome: &chrome,
+                },
+            )
+        };
+        write_png(path, args.size, &pixels);
         return;
     }
 
     let event_loop = EventLoop::new().expect("failed to create event loop");
     event_loop
-        .run_app(&mut App {
+        .run_app(&mut Shell {
             window: None,
             gpu: None,
-            editor,
+            app,
             modifiers: ModifiersState::empty(),
             mouse: (0.0, 0.0),
-            tree: args.tree,
-            popup: None,
-            hover: None,
-            color: [0xcc, 0, 0],
             scroll: Scroll::default(),
             layout: Layout::default(),
             seen: None,

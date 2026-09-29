@@ -1,6 +1,7 @@
 //! Headless core of the editor. Everything here is testable without a window or GPU.
 
 pub mod action;
+pub mod app;
 pub mod autosave;
 pub mod blocks;
 pub mod buffer;
@@ -21,6 +22,7 @@ pub mod recent;
 pub mod runs;
 pub mod scroll;
 pub mod search;
+pub mod start;
 pub mod style;
 pub mod toolbar;
 pub mod tree;

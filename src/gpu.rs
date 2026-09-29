@@ -30,7 +30,8 @@ pub struct Layout {
 
 /// What to draw in one frame.
 pub struct Frame<'a, 'v> {
-    pub view: &'a View<'v>,
+    /// The text to show in the editor region, if there is any; the start screen has none.
+    pub view: Option<&'a View<'v>>,
     /// Where the editor goes; the text column is centered in it and clipped to it.
     pub editor: Bounds,
     /// How far the text is scrolled up, in pixels.
@@ -306,9 +307,12 @@ impl Gpu {
         frame: &Frame<'_, '_>,
     ) {
         let editor = frame.editor;
-        let margin = self.sync(frame.view, editor.w);
-        let (left, top) = (editor.x + margin, editor.y + TOP_MARGIN - frame.scroll);
-        self.origin = (left, top);
+        let (mut left, mut top) = (0.0, 0.0);
+        if let Some(view) = frame.view {
+            let margin = self.sync(view, editor.w);
+            (left, top) = (editor.x + margin, editor.y + TOP_MARGIN - frame.scroll);
+            self.origin = (left, top);
+        }
 
         // Shape each label once, and work out where it goes from its width.
         if self.labels.len() > 512 {
@@ -316,20 +320,23 @@ impl Gpu {
         }
         shape_labels(&mut self.labels, &mut self.fonts, &frame.chrome.labels);
         shape_labels(&mut self.labels, &mut self.fonts, &frame.chrome.over_labels);
-        let mut areas = vec![TextArea {
-            buffer: &self.buffer,
-            left,
-            top,
-            scale: 1.0,
-            bounds: TextBounds {
-                left: editor.x as i32,
-                top: editor.y as i32,
-                right: (editor.x + editor.w) as i32,
-                bottom: (editor.y + editor.h) as i32,
-            },
-            default_color: typeset::TEXT,
-            custom_glyphs: &[],
-        }];
+        let mut areas = Vec::new();
+        if frame.view.is_some() {
+            areas.push(TextArea {
+                buffer: &self.buffer,
+                left,
+                top,
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: editor.x as i32,
+                    top: editor.y as i32,
+                    right: (editor.x + editor.w) as i32,
+                    bottom: (editor.y + editor.h) as i32,
+                },
+                default_color: typeset::TEXT,
+                custom_glyphs: &[],
+            });
+        }
         areas.extend(label_areas(&self.labels, &frame.chrome.labels));
         let over_areas = label_areas(&self.labels, &frame.chrome.over_labels);
         self.viewport
@@ -358,8 +365,11 @@ impl Gpu {
             .expect("failed to prepare text");
 
         let mut under = Vec::new();
-        let mut over = typeset::decorations(&self.buffer, left, top);
-        typeset::caret_and_selection(&self.buffer, frame.view, self.origin, &mut under, &mut over);
+        let mut over = Vec::new();
+        if let Some(view) = frame.view {
+            over = typeset::decorations(&self.buffer, left, top);
+            typeset::caret_and_selection(&self.buffer, view, self.origin, &mut under, &mut over);
+        }
         let mut encoder = self.device.create_command_encoder(&Default::default());
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
