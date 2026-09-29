@@ -14,7 +14,7 @@ Work top to bottom. Do the first unchecked item, make `cargo test` and clippy pa
 - [ ] Save/load a whole project folder (chapter files in order) with round-trip tests
 
 ## Phase 2: Window and rendering
-- [ ] wgpu surface + clear color in the winit window; `cargo build` succeeds
+- [x] wgpu surface + clear color in the winit window; `cargo build` succeeds
 - [ ] Draw the buffer's text through glyphon
 - [ ] Keyboard input routed into the buffer
 - [ ] Mouse caret placement and drag selection
