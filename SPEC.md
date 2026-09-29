@@ -68,7 +68,7 @@ buttons. Smooth scrolling and transitions. Continuous scroll layout with a fixed
 - [x] Find in document returning match ranges; tests cover no-match and multiple matches
 
 ### Djot model
-- [ ] Add `jotdown`. Parse a document into styled spans that keep source byte ranges; tests for headings, lists,
+- [x] Add `jotdown`. Parse a document into styled spans that keep source byte ranges; tests for headings, lists,
       blockquote, code, links, emphasis, strong, strikethrough, and nested emphasis
 - [ ] Parse `{style="..."}` attributes into structured style (color, font-size, font-family, underline); tests include
       malformed values, which must be ignored without panicking

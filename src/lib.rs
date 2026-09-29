@@ -2,6 +2,7 @@
 
 pub mod buffer;
 pub mod config;
+pub mod djot;
 pub mod document;
 pub mod files;
 pub mod finder;

@@ -10,6 +10,7 @@ arboard = "3"
 cosmic-text = { version = "0.19", features = ["vi"] }
 glyphon = "0.12"
 ignore = "0.4"
+jotdown = "0.10.0"
 muda = { version = "0.20", optional = true }
 notify = "8"
 nucleo = "0.5"
