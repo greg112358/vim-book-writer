@@ -155,6 +155,17 @@ impl Buffer {
         }
     }
 
+    /// Steps the cursor back onto the last char if it sits past the end of a non-empty line, as
+    /// normal mode requires. Unlike `set_cursor`, it keeps the goal column.
+    pub fn clamp_to_char(&mut self) {
+        if self.cursor > self.line_start() && self.cursor == self.line_end() {
+            self.cursor -= self.text[..self.cursor]
+                .chars()
+                .next_back()
+                .map_or(0, char::len_utf8);
+        }
+    }
+
     pub fn line_start(&self) -> usize {
         self.text[..self.cursor].rfind('\n').map_or(0, |i| i + 1)
     }

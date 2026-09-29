@@ -7,6 +7,7 @@ pub mod document;
 pub mod files;
 pub mod finder;
 pub mod format;
+pub mod motion;
 pub mod runs;
 pub mod search;
 pub mod style;
