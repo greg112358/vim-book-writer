@@ -10,3 +10,4 @@ pub mod format;
 pub mod runs;
 pub mod search;
 pub mod style;
+pub mod vim;
