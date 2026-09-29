@@ -36,6 +36,11 @@ impl Document {
         self.path.as_deref()
     }
 
+    /// Points the document at another file, or at none, without touching the disk.
+    pub fn set_path(&mut self, path: Option<PathBuf>) {
+        self.path = path;
+    }
+
     pub fn text(&self) -> &str {
         &self.text
     }

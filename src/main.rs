@@ -263,6 +263,9 @@ fn main() {
     };
     let mut app = App::new(editor, screen, recent, recent_path);
     app.tree_visible = args.tree;
+    if let Some(folder) = &args.folder {
+        app.open_folder(folder);
+    }
 
     if let Some(path) = &args.screenshot {
         let (width, height) = args.size;
@@ -280,7 +283,7 @@ fn main() {
                 .into_iter()
                 .chain(args.keys.iter().copied())
             {
-                app.editor.key(key);
+                app.key(size, key);
             }
         }
         let regions = app.regions(size);

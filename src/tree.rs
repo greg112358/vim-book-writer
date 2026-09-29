@@ -124,6 +124,31 @@ impl Tree {
         &self.rows
     }
 
+    /// The folder the tree shows.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// The index of the selected row.
+    pub fn selected_index(&self) -> usize {
+        self.selected
+    }
+
+    /// Selects the row at `index`, if there is one.
+    pub fn select(&mut self, index: usize) {
+        if index < self.rows.len() {
+            self.selected = index;
+        }
+    }
+
+    /// `path` as it is written in the prompts for copying and moving: from the tree's folder.
+    pub fn relative(&self, path: &Path) -> String {
+        path.strip_prefix(&self.root)
+            .unwrap_or(path)
+            .display()
+            .to_string()
+    }
+
     pub fn selected(&self) -> Option<&Row> {
         self.rows.get(self.selected)
     }

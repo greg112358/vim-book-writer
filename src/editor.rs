@@ -70,6 +70,16 @@ impl Editor {
         }
     }
 
+    /// The file being edited, if it has one.
+    pub fn path(&self) -> Option<&Path> {
+        self.doc.path()
+    }
+
+    /// Says the text now belongs to another file, or none, because the file was moved or deleted.
+    pub fn set_path(&mut self, path: Option<std::path::PathBuf>) {
+        self.doc.set_path(path);
+    }
+
     /// The name of the file, without its folder, or `[No Name]`.
     pub fn file_name(&self) -> String {
         self.doc

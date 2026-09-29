@@ -173,6 +173,39 @@ pub struct Chrome {
     pub over_labels: Vec<Label>,
 }
 
+pub const TREE_HEADER: f32 = 34.0;
+pub const TREE_ROW: f32 = 22.0;
+
+/// How many tree rows fit in the panel.
+pub fn tree_capacity(panel: Bounds) -> usize {
+    ((panel.h - TREE_HEADER) / TREE_ROW).floor().max(0.0) as usize
+}
+
+/// The row of the tree panel under (`x`, `y`), counting from `first`, the first row shown.
+pub fn tree_row_at(panel: Bounds, first: usize, x: f32, y: f32) -> Option<usize> {
+    let below = y - panel.y - TREE_HEADER;
+    (panel.contains(x, y) && below >= 0.0).then(|| first + (below / TREE_ROW) as usize)
+}
+
+/// One line of the file tree.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TreeRow {
+    pub name: String,
+    pub depth: usize,
+    pub is_dir: bool,
+    pub expanded: bool,
+    pub selected: bool,
+}
+
+/// The file tree as it is now: the folder's name, the rows that fit from the first one showing,
+/// and whether it has the keyboard.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TreeView {
+    pub header: String,
+    pub rows: Vec<TreeRow>,
+    pub focused: bool,
+}
+
 /// The toolbar as it is now, for `chrome` to draw.
 pub struct Interface<'a> {
     pub toolbar: &'a Toolbar,
@@ -181,6 +214,7 @@ pub struct Interface<'a> {
     pub popup: Option<&'a Popup>,
     /// The color last chosen, shown under the color button.
     pub color: [u8; 3],
+    pub tree: Option<&'a TreeView>,
 }
 
 pub const BAR: [u8; 4] = [0xee, 0xe8, 0xda, 0xff];
@@ -310,6 +344,65 @@ pub fn chrome(regions: &Regions, status: &Status, ui: &Interface<'_>) -> Chrome 
             w: 1.0,
             ..Rect::new(tree, BORDER)
         });
+        if let Some(view) = ui.tree {
+            let text = |text: String, x: f32, y: f32, bold: bool, color: [u8; 4]| Label {
+                text,
+                x,
+                y,
+                size: 13.0,
+                color,
+                bold,
+                italic: false,
+                align: Align::Left,
+            };
+            chrome.labels.push(text(
+                view.header.clone(),
+                tree.x + 12.0,
+                tree.y + 9.0,
+                true,
+                INK,
+            ));
+            chrome.rects.push(Rect {
+                y: tree.y + TREE_HEADER - 2.0,
+                x: tree.x + 1.0,
+                w: tree.w - 1.0,
+                ..line(tree)
+            });
+            for (i, row) in view.rows.iter().enumerate() {
+                let y = tree.y + TREE_HEADER + i as f32 * TREE_ROW;
+                if row.selected {
+                    let fill = if view.focused {
+                        [0xd9, 0xcf, 0xb4, 0xff]
+                    } else {
+                        [0xe6, 0xdf, 0xcd, 0xff]
+                    };
+                    let bounds = Bounds {
+                        x: tree.x + 1.0,
+                        y,
+                        w: tree.w - 1.0,
+                        h: TREE_ROW,
+                    };
+                    chrome.rects.push(Rect::new(bounds, fill));
+                }
+                let marker = match (row.is_dir, row.expanded) {
+                    (true, true) => "\u{25be} ",
+                    (true, false) => "\u{25b8} ",
+                    _ => "   ",
+                };
+                let color = if row.is_dir {
+                    INK
+                } else {
+                    [0x44, 0x40, 0x38, 0xff]
+                };
+                chrome.labels.push(text(
+                    format!("{marker}{}", row.name),
+                    tree.x + 10.0 + row.depth as f32 * 14.0,
+                    y + 3.0,
+                    row.is_dir,
+                    color,
+                ));
+            }
+        }
     }
 
     let bar = regions.status;
@@ -426,6 +519,82 @@ mod tests {
     }
 
     #[test]
+    fn tree_rows_are_found_by_position() {
+        let panel = Bounds {
+            x: 700.0,
+            y: 34.0,
+            w: 260.0,
+            h: TREE_HEADER + 10.0 * TREE_ROW,
+        };
+        assert_eq!(tree_capacity(panel), 10);
+        assert_eq!(tree_capacity(Bounds { h: 10.0, ..panel }), 0);
+        let y = |row: f32| panel.y + TREE_HEADER + row * TREE_ROW;
+        assert_eq!(tree_row_at(panel, 0, 710.0, y(0.0) + 1.0), Some(0));
+        assert_eq!(tree_row_at(panel, 0, 710.0, y(3.0) + 5.0), Some(3));
+        // Counted from the first row that is showing, and not in the header or outside the panel.
+        assert_eq!(tree_row_at(panel, 7, 710.0, y(2.0) + 5.0), Some(9));
+        assert_eq!(tree_row_at(panel, 0, 710.0, panel.y + 5.0), None);
+        assert_eq!(tree_row_at(panel, 0, 100.0, y(1.0)), None);
+    }
+
+    #[test]
+    fn the_tree_panel_shows_its_header_rows_and_selection() {
+        let regions = regions(1000.0, 700.0, true);
+        let toolbar = crate::toolbar::Toolbar {
+            buttons: Vec::new(),
+        };
+        let row = |name: &str, depth, is_dir, expanded, selected| TreeRow {
+            name: name.into(),
+            depth,
+            is_dir,
+            expanded,
+            selected,
+        };
+        let view = TreeView {
+            header: "novel".into(),
+            rows: vec![
+                row("chapters", 0, true, true, false),
+                row("one.dj", 1, false, false, true),
+                row("notes", 0, true, false, false),
+            ],
+            focused: true,
+        };
+        let status = Status {
+            mode: Mode::Normal,
+            file: "f".into(),
+            modified: false,
+            words: 0,
+            message: String::new(),
+        };
+        let interface = Interface {
+            toolbar: &toolbar,
+            hover: None,
+            popup: None,
+            color: [0; 3],
+            tree: Some(&view),
+        };
+        let chrome = chrome(&regions, &status, &interface);
+        let labels: Vec<&str> = chrome.labels.iter().map(|l| l.text.as_str()).collect();
+        for want in ["novel", "\u{25be} chapters", "   one.dj", "\u{25b8} notes"] {
+            assert!(labels.contains(&want), "{want:?} in {labels:?}");
+        }
+        // Children are indented past their folder, and the selected row has a highlight behind it.
+        let x = |text: &str| chrome.labels.iter().find(|l| l.text == text).unwrap().x;
+        assert!(x("   one.dj") > x("\u{25be} chapters"));
+        let one = chrome
+            .labels
+            .iter()
+            .find(|l| l.text == "   one.dj")
+            .unwrap();
+        assert!(
+            chrome
+                .rects
+                .iter()
+                .any(|r| r.y <= one.y && one.y < r.y + r.h && r.color == [0xd9, 0xcf, 0xb4, 0xff])
+        );
+    }
+
+    #[test]
     fn bounds_contain_their_top_left_but_not_their_far_edge() {
         let b = Bounds {
             x: 10.0,
@@ -455,6 +624,7 @@ mod tests {
             hover: None,
             popup: None,
             color: [0, 0, 0],
+            tree: None,
         };
         let texts = |s: Status| -> Vec<String> {
             chrome(&regions, &s, &interface)
@@ -486,6 +656,7 @@ mod tests {
             hover: None,
             popup: None,
             color: [0, 0, 0],
+            tree: None,
         };
         for label in chrome(&regions, &status(Mode::Normal, false, 3, ""), &interface).labels {
             assert!(

@@ -10,6 +10,7 @@ const USAGE: &str =
   --mode MODE         the mode to show: normal, insert, visual, or visual-line
   --size WxH          the size of the screenshot in pixels (default 1000x700)
   --tree              show the file tree
+  --folder DIR        open DIR in the file tree
   --start             show the start screen
   --recent PATH       a file for the start screen's recent list, once for each (for screenshots)
   --popup MENU        show a toolbar menu open: color, font, or size
@@ -28,6 +29,8 @@ pub struct Args {
     pub keys: Vec<Key>,
     /// Show the file tree on the right.
     pub tree: bool,
+    /// A folder to open in the tree.
+    pub folder: Option<PathBuf>,
     /// A toolbar menu to show open in a screenshot.
     pub popup: Option<Menu>,
     /// Show the start screen even with a file, for screenshots.
@@ -45,6 +48,7 @@ impl Default for Args {
             size: (1000, 700),
             keys: Vec::new(),
             tree: false,
+            folder: None,
             popup: None,
             start: false,
             recent: Vec::new(),
@@ -77,6 +81,7 @@ impl Args {
                     }
                 }
                 "--tree" => parsed.tree = true,
+                "--folder" => parsed.folder = Some(value("--folder")?.into()),
                 "--start" => parsed.start = true,
                 "--recent" => parsed.recent.push(value("--recent")?.into()),
                 "--popup" => {
@@ -196,6 +201,10 @@ mod tests {
         }
         assert_eq!(parse(&["--keys", "ihi<Esc>"]).unwrap().keys.len(), 4);
         assert!(parse(&["--tree"]).unwrap().tree && !parse(&[]).unwrap().tree);
+        assert_eq!(
+            parse(&["--folder", "book"]).unwrap().folder,
+            Some("book".into())
+        );
         let args = parse(&["--start", "--recent", "a.dj", "--recent", "b.dj"]).unwrap();
         assert!(args.start);
         assert_eq!(args.recent, [PathBuf::from("a.dj"), PathBuf::from("b.dj")]);
