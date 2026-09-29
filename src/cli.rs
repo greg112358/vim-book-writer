@@ -8,6 +8,7 @@ const USAGE: &str =
   --screenshot PNG    draw one frame offscreen to PNG and exit
   --mode MODE         the mode to show: normal, insert, visual, or visual-line
   --size WxH          the size of the screenshot in pixels (default 1000x700)
+  --tree              show the file tree
   --keys KEYS         keys to press before the screenshot, after the mode is set: text as typed,
                       plus <Esc> <CR> <BS> <Del> <Left> <Right> <Up> <Down> <C-x> and <lt>";
 
@@ -21,6 +22,8 @@ pub struct Args {
     pub size: (u32, u32),
     /// Keys to press before a screenshot, once in `mode`.
     pub keys: Vec<Key>,
+    /// Show the file tree on the right.
+    pub tree: bool,
 }
 
 impl Default for Args {
@@ -31,6 +34,7 @@ impl Default for Args {
             mode: Mode::Normal,
             size: (1000, 700),
             keys: Vec::new(),
+            tree: false,
         }
     }
 }
@@ -59,6 +63,7 @@ impl Args {
                         other => return Err(format!("unknown mode {other:?}\n\n{USAGE}")),
                     }
                 }
+                "--tree" => parsed.tree = true,
                 "--keys" => parsed.keys = parse_keys(&value("--keys")?)?,
                 "--size" => {
                     let size = value("--size")?;
@@ -167,6 +172,7 @@ mod tests {
             assert!(parse_keys(bad).is_err(), "{bad}");
         }
         assert_eq!(parse(&["--keys", "ihi<Esc>"]).unwrap().keys.len(), 4);
+        assert!(parse(&["--tree"]).unwrap().tree && !parse(&[]).unwrap().tree);
     }
 
     #[test]

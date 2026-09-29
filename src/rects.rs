@@ -1,14 +1,5 @@
+use book_writing_app::ui::Rect;
 use wgpu::util::DeviceExt;
-
-/// A filled rectangle in pixels from the top left of the frame, in sRGB with alpha.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Rect {
-    pub x: f32,
-    pub y: f32,
-    pub w: f32,
-    pub h: f32,
-    pub color: [u8; 4],
-}
 
 const SHADER: &str = "
 struct Screen { size: vec2<f32> };

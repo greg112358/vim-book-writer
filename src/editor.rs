@@ -30,6 +30,8 @@ pub struct Editor {
     display_key: Option<(u64, bool)>,
     /// Counts the times `display` was rebuilt, so a renderer can tell when it changed.
     display_version: u64,
+    /// The word count and the buffer revision it was counted at.
+    words: Option<(u64, usize)>,
 }
 
 impl Editor {
@@ -42,10 +44,35 @@ impl Editor {
             display: Display::default(),
             display_key: None,
             display_version: 0,
+            words: None,
         };
         // A file that starts with hidden syntax, like `# `, opens with the cursor on the text.
         editor.snap_cursor(0, Key::Esc);
         Ok(editor)
+    }
+
+    /// The number of words, counted again only when the text has changed.
+    pub fn word_count(&mut self) -> usize {
+        let revision = self.buf.revision();
+        match self.words {
+            Some((at, words)) if at == revision => words,
+            _ => {
+                let words = self.buf.text().split_whitespace().count();
+                self.words = Some((revision, words));
+                words
+            }
+        }
+    }
+
+    /// The name of the file, without its folder, or `[No Name]`.
+    pub fn file_name(&self) -> String {
+        self.doc
+            .path()
+            .and_then(|path| path.file_name())
+            .map_or_else(
+                || "[No Name]".to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            )
     }
 
     /// What to draw: the source with faint syntax while inserting, and the finished-looking text
@@ -350,6 +377,26 @@ mod tests {
         let path = temp_file("open_cursor", "## Title\n");
         let editor = Editor::open(&path).unwrap();
         assert_eq!(editor.buf.cursor(), 3);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn word_count_and_file_name() {
+        let mut editor = Editor::default();
+        assert_eq!(
+            (editor.word_count(), editor.file_name().as_str()),
+            (0, "[No Name]")
+        );
+        type_keys(&mut editor, "ione two\nthree\x1b");
+        assert_eq!(editor.word_count(), 3);
+        type_keys(&mut editor, "dd");
+        assert_eq!(editor.word_count(), 2);
+        let path = temp_file("name", "a b");
+        let mut editor = Editor::open(&path).unwrap();
+        assert_eq!(
+            (editor.word_count(), editor.file_name().as_str()),
+            (2, "bwa_editor_name.dj")
+        );
         std::fs::remove_file(&path).unwrap();
     }
 

@@ -21,4 +21,5 @@ pub mod scroll;
 pub mod search;
 pub mod style;
 pub mod tree;
+pub mod ui;
 pub mod vim;

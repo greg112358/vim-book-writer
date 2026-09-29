@@ -115,7 +115,7 @@ buttons. Smooth scrolling and transitions. Continuous scroll layout with a fixed
 - [x] Smooth scrolling with a fixed-width text column **[visual]**
 
 ## Milestone 3: App shell
-- [ ] taffy layout: thin toolbar, editor, right-hand file tree, status bar (mode, word count, file) **[visual]**
+- [x] taffy layout: thin toolbar, editor, right-hand file tree, status bar (mode, word count, file) **[visual]**
 - [ ] Toolbar buttons wired to the formatting commands **[visual]**
 - [ ] Traditional shortcuts (Ctrl/Cmd+B/I/U, Ctrl/Cmd+S) **[visual]**
 - [ ] Start screen: open recent, open folder, open file via `rfd` **[visual]**

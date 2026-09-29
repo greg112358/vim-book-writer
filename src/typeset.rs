@@ -1,6 +1,6 @@
-use crate::rects::Rect;
 use book_writing_app::editor::View;
 use book_writing_app::runs::Format;
+use book_writing_app::ui::Rect;
 use book_writing_app::vim::Mode;
 use glyphon::{Attrs, Buffer, Color, Cursor, Family, Metrics, Style, Weight};
 

@@ -6,8 +6,9 @@ use book_writing_app::cli::Args;
 use book_writing_app::editor::Editor;
 use book_writing_app::input;
 use book_writing_app::scroll::Scroll;
+use book_writing_app::ui::{self, Regions, Status};
 use book_writing_app::vim::{Key, Mode};
-use gpu::{Gpu, Layout, WindowGpu};
+use gpu::{Frame, Gpu, Layout, WindowGpu};
 use std::sync::Arc;
 use std::time::Instant;
 use winit::application::ApplicationHandler;
@@ -20,6 +21,18 @@ use winit::window::{Window, WindowId};
 const PADDING: f32 = 54.0;
 const WHEEL_NOTCH: f32 = 81.0;
 
+/// What the window around the editor shows for the editor's current state.
+fn chrome(editor: &mut Editor, regions: &Regions) -> ui::Chrome {
+    let status = Status {
+        mode: editor.vim.mode,
+        file: editor.file_name(),
+        modified: editor.buf.is_modified(),
+        words: editor.word_count(),
+        message: editor.vim.message.clone(),
+    };
+    ui::chrome(regions, &status)
+}
+
 struct App {
     window: Option<Arc<Window>>,
     gpu: Option<WindowGpu>,
@@ -27,6 +40,8 @@ struct App {
     modifiers: ModifiersState,
     /// Where the mouse is, in pixels from the window's top left.
     mouse: (f32, f32),
+    /// Whether the file tree is showing.
+    tree: bool,
     scroll: Scroll,
     /// The layout of the last frame, for scrolling by the wheel.
     layout: Layout,
@@ -43,24 +58,31 @@ impl App {
             return;
         };
         let (width, height) = gpu.size();
+        let regions = ui::regions(width as f32, height as f32, self.tree);
+        let chrome = chrome(&mut self.editor, &regions);
         let view = self.editor.view();
-        self.layout = gpu.gpu.layout(&view, width);
+        self.layout = gpu.gpu.layout(&view, regions.editor);
         let seen = (view.version, view.cursor);
+        let viewport = regions.editor.h;
         if self.seen != Some(seen) {
             self.seen = Some(seen);
             if let Some((top, bottom)) = self.layout.caret {
                 let content = self.layout.content_height;
-                self.scroll
-                    .reveal(top, bottom, PADDING, content, height as f32);
+                self.scroll.reveal(top, bottom, PADDING, content, viewport);
             }
         }
-        self.scroll.clamp(self.layout.content_height, height as f32);
+        self.scroll.clamp(self.layout.content_height, viewport);
         let now = Instant::now();
         // A long pause, like the window being hidden, shouldn't make the scroll leap.
         let dt = now.duration_since(self.last_frame).as_secs_f32().min(0.05);
         self.last_frame = now;
         let moving = self.scroll.step(dt);
-        gpu.draw(&view, self.scroll.offset());
+        gpu.draw(&Frame {
+            view: &view,
+            editor: regions.editor,
+            scroll: self.scroll.offset(),
+            chrome: &chrome,
+        });
         if moving {
             window.request_redraw();
         }
@@ -114,9 +136,14 @@ impl ApplicationHandler for App {
                 ..
             } => {
                 if let Some(gpu) = &self.gpu {
+                    let (width, height) = gpu.size();
+                    let regions = ui::regions(width as f32, height as f32, self.tree);
                     let block = self.editor.vim.mode != Mode::Insert;
                     let (display, _) = self.editor.display();
-                    if let Some(offset) = gpu.gpu.hit(display, self.mouse.0, self.mouse.1, block) {
+                    if regions.editor.contains(self.mouse.0, self.mouse.1)
+                        && let Some(offset) =
+                            gpu.gpu.hit(display, self.mouse.0, self.mouse.1, block)
+                    {
                         self.editor.click(offset);
                     }
                 }
@@ -138,9 +165,10 @@ impl ApplicationHandler for App {
                     MouseScrollDelta::PixelDelta(position) => position.y as f32,
                 };
                 if let (Some(gpu), Some(window)) = (&self.gpu, &self.window) {
-                    let (_, height) = gpu.size();
-                    let content = self.layout.content_height;
-                    self.scroll.by(-pixels, content, height as f32);
+                    let (width, height) = gpu.size();
+                    let viewport = ui::regions(width as f32, height as f32, self.tree).editor.h;
+                    self.scroll
+                        .by(-pixels, self.layout.content_height, viewport);
                     window.request_redraw();
                 }
             }
@@ -186,16 +214,28 @@ fn main() {
 
     if let Some(path) = &args.screenshot {
         let (width, height) = args.size;
+        let regions = ui::regions(width as f32, height as f32, args.tree);
+        let chrome = chrome(&mut editor, &regions);
         let view = editor.view();
         let mut gpu = Gpu::headless();
         // Scroll to the caret as the window would, but arrive at once.
-        let layout = gpu.layout(&view, width);
+        let layout = gpu.layout(&view, regions.editor);
         let mut scroll = Scroll::default();
         if let Some((top, bottom)) = layout.caret {
-            scroll.reveal(top, bottom, PADDING, layout.content_height, height as f32);
+            let content = layout.content_height;
+            scroll.reveal(top, bottom, PADDING, content, regions.editor.h);
         }
         scroll.finish();
-        let pixels = gpu.screenshot(width, height, &view, scroll.offset());
+        let pixels = gpu.screenshot(
+            width,
+            height,
+            &Frame {
+                view: &view,
+                editor: regions.editor,
+                scroll: scroll.offset(),
+                chrome: &chrome,
+            },
+        );
         let file = std::fs::File::create(path).expect("failed to create the screenshot file");
         let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
         encoder.set_color(png::ColorType::Rgba);
@@ -215,6 +255,7 @@ fn main() {
             editor,
             modifiers: ModifiersState::empty(),
             mouse: (0.0, 0.0),
+            tree: args.tree,
             scroll: Scroll::default(),
             layout: Layout::default(),
             seen: None,

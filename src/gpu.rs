@@ -2,11 +2,13 @@ use crate::rects::Rects;
 use crate::typeset::{self, FONT_SIZE, LINE_HEIGHT};
 use book_writing_app::display::Display;
 use book_writing_app::editor::View;
+use book_writing_app::ui::{Align, Bounds, Chrome};
 use cosmic_text::fontdb;
 use glyphon::{
-    Attrs, Buffer, Cache, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache, TextArea,
-    TextAtlas, TextBounds, TextRenderer, Viewport,
+    Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache,
+    TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Weight,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
@@ -26,6 +28,17 @@ pub struct Layout {
     pub caret: Option<(f32, f32)>,
 }
 
+/// What to draw in one frame.
+pub struct Frame<'a, 'v> {
+    pub view: &'a View<'v>,
+    /// Where the editor goes; the text column is centered in it and clipped to it.
+    pub editor: Bounds,
+    /// How far the text is scrolled up, in pixels.
+    pub scroll: f32,
+    /// The toolbar, status bar, and other parts of the window around the editor.
+    pub chrome: &'a Chrome,
+}
+
 /// Format of the offscreen frame. sRGB, so a color drawn here matches one drawn to a window.
 const SCREENSHOT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
@@ -40,6 +53,8 @@ pub struct Gpu {
     text: TextRenderer,
     rects: Rects,
     buffer: Buffer,
+    /// Shaped interface text, by text, size, and weight.
+    labels: HashMap<(String, u32, bool), Buffer>,
     /// The display version and column width of the text `buffer` holds.
     shown: Option<(u64, u32)>,
     /// Where the text's top left corner was drawn, for turning clicks into text positions.
@@ -156,6 +171,7 @@ impl Gpu {
             text,
             rects,
             buffer,
+            labels: HashMap::new(),
             shown: None,
             origin: (0.0, 0.0),
         }
@@ -175,11 +191,11 @@ impl Gpu {
         Self::new(device, queue, SCREENSHOT_FORMAT)
     }
 
-    /// Lays out the view's text for a frame `width` wide. Only shapes again if the text or the
-    /// width changed. Returns the margin to the left of the text column.
-    fn sync(&mut self, view: &View<'_>, width: u32) -> f32 {
-        let margin = ((width as f32 - COLUMN_WIDTH) / 2.0).max(MIN_MARGIN);
-        let column = (width as f32 - 2.0 * margin).max(1.0);
+    /// Lays out the view's text in a column centered in an editor `width` wide. Only shapes again
+    /// if the text or the width changed. Returns the margin to the left of the column.
+    fn sync(&mut self, view: &View<'_>, width: f32) -> f32 {
+        let margin = ((width - COLUMN_WIDTH) / 2.0).max(MIN_MARGIN);
+        let column = (width - 2.0 * margin).max(1.0);
         let key = (view.version, column as u32);
         if self.shown != Some(key) {
             // No height, so every line is laid out and the caret can be found wherever it is.
@@ -202,10 +218,10 @@ impl Gpu {
         margin
     }
 
-    /// Lays out the text for a frame `width` wide and says how tall it is and where the caret is,
-    /// so the caller can decide how far to scroll.
-    pub fn layout(&mut self, view: &View<'_>, width: u32) -> Layout {
-        let margin = self.sync(view, width);
+    /// Lays out the text for an editor `editor` big and says how tall it is and where the caret
+    /// is, so the caller can decide how far to scroll.
+    pub fn layout(&mut self, view: &View<'_>, editor: Bounds) -> Layout {
+        let margin = self.sync(view, editor.w);
         let caret = typeset::caret_and_selection(
             &self.buffer,
             view,
@@ -219,17 +235,83 @@ impl Gpu {
         }
     }
 
-    /// Draws the frame into `target`, which is `width` by `height` pixels, with the text scrolled
-    /// up by `scroll` pixels.
+    /// Draws the frame into `target`, which is `width` by `height` pixels.
     fn paint(
         &mut self,
         target: &wgpu::TextureView,
         (width, height): (u32, u32),
-        view: &View<'_>,
-        scroll: f32,
+        frame: &Frame<'_, '_>,
     ) {
-        let margin = self.sync(view, width);
-        let top = TOP_MARGIN - scroll;
+        let editor = frame.editor;
+        let margin = self.sync(frame.view, editor.w);
+        let (left, top) = (editor.x + margin, editor.y + TOP_MARGIN - frame.scroll);
+        self.origin = (left, top);
+
+        // Shape each label once, and work out where it goes from its width.
+        if self.labels.len() > 512 {
+            self.labels.clear();
+        }
+        for label in &frame.chrome.labels {
+            let key = (label.text.clone(), label.size.to_bits(), label.bold);
+            self.labels.entry(key).or_insert_with(|| {
+                let mut buffer =
+                    Buffer::new(&mut self.fonts, Metrics::new(label.size, label.size * 1.3));
+                let weight = if label.bold {
+                    Weight::BOLD
+                } else {
+                    Weight::NORMAL
+                };
+                buffer.set_text(
+                    &label.text,
+                    &Attrs::new().family(Family::SansSerif).weight(weight),
+                    Shaping::Advanced,
+                    None,
+                );
+                buffer.shape_until_scroll(&mut self.fonts, false);
+                buffer
+            });
+        }
+        let clip = |b: Bounds| TextBounds {
+            left: b.x as i32,
+            top: b.y as i32,
+            right: (b.x + b.w) as i32,
+            bottom: (b.y + b.h) as i32,
+        };
+        let mut areas = vec![TextArea {
+            buffer: &self.buffer,
+            left,
+            top,
+            scale: 1.0,
+            bounds: clip(editor),
+            default_color: typeset::TEXT,
+            custom_glyphs: &[],
+        }];
+        for label in &frame.chrome.labels {
+            let buffer = &self.labels[&(label.text.clone(), label.size.to_bits(), label.bold)];
+            let text_width = buffer
+                .layout_runs()
+                .map(|run| run.line_w)
+                .fold(0.0, f32::max);
+            let x = match label.align {
+                Align::Left => label.x,
+                Align::Right => label.x - text_width,
+                Align::Center => label.x - text_width / 2.0,
+            };
+            areas.push(TextArea {
+                buffer,
+                left: x,
+                top: label.y,
+                scale: 1.0,
+                bounds: TextBounds::default(),
+                default_color: Color::rgba(
+                    label.color[0],
+                    label.color[1],
+                    label.color[2],
+                    label.color[3],
+                ),
+                custom_glyphs: &[],
+            });
+        }
         self.viewport
             .update(&self.queue, Resolution { width, height });
         self.text
@@ -239,23 +321,14 @@ impl Gpu {
                 &mut self.fonts,
                 &mut self.atlas,
                 &self.viewport,
-                [TextArea {
-                    buffer: &self.buffer,
-                    left: margin,
-                    top,
-                    scale: 1.0,
-                    bounds: TextBounds::default(),
-                    default_color: typeset::TEXT,
-                    custom_glyphs: &[],
-                }],
+                areas,
                 &mut self.swash,
             )
             .expect("failed to prepare text");
 
-        self.origin = (margin, top);
         let mut under = Vec::new();
-        let mut over = typeset::decorations(&self.buffer, margin, top);
-        typeset::caret_and_selection(&self.buffer, view, self.origin, &mut under, &mut over);
+        let mut over = typeset::decorations(&self.buffer, left, top);
+        typeset::caret_and_selection(&self.buffer, frame.view, self.origin, &mut under, &mut over);
         let mut encoder = self.device.create_command_encoder(&Default::default());
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -275,25 +348,42 @@ impl Gpu {
                 })],
                 ..Default::default()
             });
+            let size = (width, height);
             self.rects.draw(
                 &self.device,
                 &self.queue,
                 &mut pass,
-                (width, height),
-                &under,
+                size,
+                &frame.chrome.rects,
             );
+            // The selection and caret stay inside the editor, however far the text is scrolled.
+            pass.set_scissor_rect(
+                editor.x as u32,
+                editor.y as u32,
+                editor.w as u32,
+                editor.h as u32,
+            );
+            self.rects
+                .draw(&self.device, &self.queue, &mut pass, size, &under);
+            pass.set_scissor_rect(0, 0, width, height);
             self.text
                 .render(&self.atlas, &self.viewport, &mut pass)
                 .expect("failed to draw text");
+            pass.set_scissor_rect(
+                editor.x as u32,
+                editor.y as u32,
+                editor.w as u32,
+                editor.h as u32,
+            );
             self.rects
-                .draw(&self.device, &self.queue, &mut pass, (width, height), &over);
+                .draw(&self.device, &self.queue, &mut pass, size, &over);
         }
         self.queue.submit([encoder.finish()]);
         self.atlas.trim();
     }
 
     /// Draws one frame offscreen and returns it as tightly packed RGBA bytes.
-    pub fn screenshot(&mut self, width: u32, height: u32, view: &View<'_>, scroll: f32) -> Vec<u8> {
+    pub fn screenshot(&mut self, width: u32, height: u32, frame: &Frame<'_, '_>) -> Vec<u8> {
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("screenshot"),
             size: wgpu::Extent3d {
@@ -311,8 +401,7 @@ impl Gpu {
         self.paint(
             &texture.create_view(&Default::default()),
             (width, height),
-            view,
-            scroll,
+            frame,
         );
 
         // Rows in a buffer copy must start on 256-byte boundaries.
@@ -391,8 +480,8 @@ impl WindowGpu {
         (self.config.width, self.config.height)
     }
 
-    pub fn draw(&mut self, view: &View<'_>, scroll: f32) {
-        let frame = match self.surface.get_current_texture() {
+    pub fn draw(&mut self, frame: &Frame<'_, '_>) {
+        let surface_frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
             | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
             _ => {
@@ -401,11 +490,10 @@ impl WindowGpu {
             }
         };
         self.gpu.paint(
-            &frame.texture.create_view(&Default::default()),
+            &surface_frame.texture.create_view(&Default::default()),
             (self.config.width, self.config.height),
-            view,
-            scroll,
+            frame,
         );
-        self.gpu.queue.present(frame);
+        self.gpu.queue.present(surface_frame);
     }
 }
