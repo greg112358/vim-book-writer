@@ -1,11 +1,12 @@
 # Book Writing App
 
-A word editor for writing books. Rust, fully custom-drawn, one codebase for macOS and Linux.
+A fast, lightweight word processor for writing in djot (`.dj`), with vim controls. Rust, fully custom-drawn, one codebase
+for macOS and Linux. Read `SPEC.md` for the product and the task list.
 
 ## Stack
 winit (window/input/IME) · wgpu 30 (GPU) · glyphon 0.12 + cosmic-text 0.19 with `vi` (text, editing, vim, undo) ·
 taffy (layout) · rfd (file dialogs) · arboard (clipboard) · muda (menus, optional) · nucleo (fuzzy search) ·
-ignore (directory walk) · notify (file watching) · serde + toml (config) · accesskit (optional) · cargo-packager.
+jotdown (djot parser) · printpdf (PDF export) · ignore (directory walk) · notify (file watching) · serde + toml (config) · accesskit (optional) · cargo-packager.
 
 Pinned to stable lines: winit 0.30 (0.31 is beta) and notify 8 (9 is rc). Don't bump to pre-releases.
 
