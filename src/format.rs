@@ -653,4 +653,27 @@ mod tests {
             r##"é [ü]{style="color:#000000"}"##
         );
     }
+
+    #[test]
+    fn every_command_is_one_undo_step_however_many_edits() {
+        let src = "**a** b\n\nc [d]{style=\"color:#c00\"}";
+        let commands: [fn(&mut Buffer, Range<usize>); 8] = [
+            |b, r| toggle(b, r, Mark::Bold),
+            |b, r| toggle(b, r, Mark::Italic),
+            |b, r| toggle(b, r, Mark::Strikethrough),
+            toggle_underline,
+            |b, r| set_color(b, r, [1, 2, 3]),
+            |b, r| set_font_size(b, r, 12.0),
+            |b, r| set_font_family(b, r, "Georgia"),
+            uppercase,
+        ];
+        for command in commands {
+            let mut buf = Buffer::new(src);
+            command(&mut buf, 0..src.len());
+            assert_ne!(buf.text(), src);
+            assert!(buf.undo());
+            assert_eq!(buf.text(), src);
+            assert!(!buf.undo());
+        }
+    }
 }

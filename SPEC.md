@@ -83,7 +83,7 @@ buttons. Smooth scrolling and transitions. Continuous scroll layout with a fixed
 - [x] Apply font color, size, and name via a style span; merge into an existing span instead of nesting a new one
 - [x] Uppercase the selection
 - [x] With no selection, formatting applies to the word under the cursor
-- [ ] Each formatting command is one undo step
+- [x] Each formatting command is one undo step
 
 ### Vim engine
 - [ ] Modes: normal, insert, visual, visual-line, with correct transitions (`i a o O A I`, `v V`, `Esc`)
