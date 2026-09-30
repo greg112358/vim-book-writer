@@ -49,6 +49,11 @@ buttons. Smooth scrolling and transitions. Continuous scroll layout with a fixed
 - Layout: continuous scroll.
 - Vim depth: solid core. Motions, operators, text objects (`ciw`, `di"`, `ap`), visual and visual-line, registers,
   dot-repeat, undo/redo, search (`/`, `n`, `N`), `:w` `:q` `:wq`. No macros, marks, visual-block, or `:s`/`:g`.
+- Vim extras added after the core: `{ } W B E`, `f F t T ; ,`, `r ~ J`, visual `o p u U ~ J`, `Ctrl-d/u/f/b` and `zz zt zb`
+  (smooth scrolling; in normal mode Ctrl-b and Ctrl-u scroll instead of formatting), `:N`, and insert `Ctrl-w` / `Ctrl-h`.
+- Panels: the outline (left) and the file tree (right) both take the keyboard: `Ctrl-E` for the tree, `Ctrl-T` for
+  the outline, `j`/`k` to move, Enter to open or fold. The tree also has buttons for new file/folder, rename, delete
+  (asks first in a dialog), copy, move, yank and paste. `F1` or `:help` lists every key.
 - Djot scope for v1: headings, paragraphs, emphasis/strong, strikethrough, links, lists, blockquotes, code,
   thematic break, attributes. No images, tables, footnotes, math, definition lists, task lists, or divs yet.
 - Export: Markdown and PDF only.

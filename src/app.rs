@@ -2,12 +2,16 @@ use crate::autosave::AutoSave;
 use crate::config::Config;
 use crate::display::Display;
 use crate::editor::Editor;
+use crate::outline;
 use crate::recent::Recent;
 use crate::start::{self, StartAction, StartItem};
 use crate::toolbar::{self, Click, Popup};
 use crate::tree::Tree;
-use crate::ui::{self, Chrome, Interface, Regions, Status, TreeRow, TreeView};
-use crate::vim::Key;
+use crate::ui::{
+    self, Chrome, Dialog, Interface, OutlineRow, OutlineView, Regions, Status, Theme, TreeRow,
+    TreeView,
+};
+use crate::vim::{Key, ViewMove};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -23,24 +27,28 @@ pub enum Screen {
 
 /// How long the text must sit unchanged before auto-save writes it.
 const AUTOSAVE_DELAY: Duration = Duration::from_millis(2000);
+/// How long the mouse rests on a toolbar button before its tip shows.
+const TIP_DELAY: Duration = Duration::from_millis(500);
 
-/// What has the keyboard: the text, or the file tree.
+/// What has the keyboard: the text, the file tree, or the outline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Editor,
     Tree,
+    Outline,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PromptKind {
     Add,
+    AddFolder,
     Rename,
     Copy,
     Move,
     ConfirmDelete,
 }
 
-/// A line the tree asks you to type, or to confirm, on the status bar.
+/// A name the tree asks you to type, or a question to answer, in a dialog.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Prompt {
     pub label: String,
@@ -77,6 +85,10 @@ pub enum Effect {
     SetClipboard(String),
     /// Read the system clipboard; the window then calls `clipboard_text` with what it holds.
     ReadClipboard(ClipboardUse),
+    /// Scroll the view by this many rows of text, down if positive.
+    ScrollRows(i32),
+    /// Put the cursor's line in the middle, at the top or at the bottom of the view.
+    Align(ViewMove),
 }
 
 /// Everything about the running app that isn't drawing: the screen, the editor, the recent files,
@@ -107,6 +119,19 @@ pub struct App {
     pub autosave: AutoSave,
     config: Config,
     config_path: Option<PathBuf>,
+    /// When the mouse came to rest on the hovered button, and whether its tip is showing yet.
+    hover_since: Instant,
+    pub tip_shown: bool,
+    /// Counts the files opened, so the window can start a new one at the top.
+    pub opened: u64,
+    /// The first outline row showing, so the list scrolls only when the current heading leaves it.
+    outline_first: usize,
+    /// The heading the outline's own cursor is on, while it has the keyboard.
+    outline_sel: usize,
+    /// The list of keys is showing.
+    pub help: bool,
+    /// The file tree button the mouse is over.
+    tree_hover: Option<usize>,
 }
 
 impl App {
@@ -135,6 +160,13 @@ impl App {
             autosave: AutoSave::new(AUTOSAVE_DELAY, Instant::now()),
             config: Config::default(),
             config_path: None,
+            hover_since: Instant::now(),
+            tip_shown: false,
+            opened: 0,
+            outline_first: 0,
+            outline_sel: 0,
+            help: false,
+            tree_hover: None,
         }
     }
 
@@ -148,19 +180,36 @@ impl App {
     /// Call after input and when `next_wake` comes: saves the file if auto-save is on and the text
     /// has been still for long enough.
     pub fn tick(&mut self, now: Instant) {
+        if self.hovering() && !self.tip_shown && now >= self.hover_since + TIP_DELAY {
+            self.tip_shown = true;
+        }
         let due = self.autosave.poll(now, &self.editor.buf);
         if due && self.screen == Screen::Editing && self.editor.path().is_some() {
             self.editor.save();
         }
     }
 
+    fn hovering(&self) -> bool {
+        self.hover.is_some() || self.tree_hover.is_some()
+    }
+
     /// When `tick` next has something to do, for the window to wake at.
     pub fn next_wake(&self) -> Option<Instant> {
-        self.autosave.next_deadline()
+        let tip = (self.hovering() && !self.tip_shown && self.screen == Screen::Editing)
+            .then(|| self.hover_since + TIP_DELAY);
+        [self.autosave.next_deadline(), tip]
+            .into_iter()
+            .flatten()
+            .min()
+    }
+
+    /// The colors to draw with.
+    pub fn theme(&self) -> &'static Theme {
+        Theme::new(self.config.dark)
     }
 
     pub fn regions(&self, size: (f32, f32)) -> Regions {
-        ui::regions(size.0, size.1, self.tree_visible)
+        ui::regions(size.0, size.1, self.tree_visible, self.config.outline)
     }
 
     fn start_items(&self, size: (f32, f32)) -> Vec<StartItem> {
@@ -172,14 +221,14 @@ impl App {
         match &self.screen {
             Screen::Start { message } => {
                 let items = self.start_items(size);
-                let mut chrome = start::chrome(size, &items, self.hover);
+                let mut chrome = start::chrome(size, &items, self.hover, self.theme());
                 if !message.is_empty() {
                     chrome.labels.push(ui::Label {
                         text: message.clone(),
                         x: 24.0,
                         y: size.1 - 28.0,
                         size: 12.0,
-                        color: [0xb0, 0x30, 0x30, 0xff],
+                        color: self.theme().error,
                         bold: false,
                         italic: false,
                         align: ui::Align::Left,
@@ -190,28 +239,51 @@ impl App {
             Screen::Editing => {
                 let regions = self.regions(size);
                 let toolbar = toolbar::toolbar(regions.toolbar);
-                // What is being typed comes first: a tree prompt, or the `:` and `/` line.
-                let message = match (&self.prompt, self.editor.vim.command_line()) {
-                    (Some(prompt), _) => format!("{}{}\u{258f}", prompt.label, prompt.text),
-                    (None, Some((prompt, line))) => format!("{prompt}{line}\u{258f}"),
-                    (None, None) if !self.message.is_empty() => self.message.clone(),
-                    (None, None) => self.editor.vim.message.clone(),
+                // What is being typed comes first: the `:` and `/` line.
+                let message = match self.editor.vim.command_line() {
+                    Some((prompt, line)) => format!("{prompt}{line}\u{258f}"),
+                    None if !self.message.is_empty() => self.message.clone(),
+                    None => self.editor.vim.message.clone(),
                 };
                 let status = Status {
                     mode: self.editor.vim.mode,
                     file: self.editor.file_name(),
                     modified: self.editor.buf.is_modified(),
                     words: self.editor.word_count(),
+                    spot: self.editor.spot(),
                     message,
                 };
                 let tree = self.tree_view(regions.tree);
+                let outline = self.outline_view(regions.outline);
+                let tree_buttons = regions.tree.map(toolbar::tree_buttons);
+                let dialog = self.prompt.as_ref().map(|prompt| match prompt.kind {
+                    PromptKind::ConfirmDelete => Dialog {
+                        title: prompt.label.clone(),
+                        input: None,
+                        buttons: Some(("Delete (y)", "Keep it (n)")),
+                        hint: "This can't be undone.",
+                    },
+                    _ => Dialog {
+                        title: prompt.label.trim_end().to_string(),
+                        input: Some(prompt.text.clone()),
+                        buttons: None,
+                        hint: "Enter to confirm   Esc to cancel",
+                    },
+                });
                 let interface = Interface {
+                    outline: outline.as_ref(),
+                    tree_buttons: tree_buttons.as_ref(),
+                    tree_hover: self.tree_hover,
+                    dialog: dialog.as_ref(),
+                    help: self.help,
                     toolbar: &toolbar,
                     hover: self.hover,
                     popup: self.popup.as_ref(),
                     color: self.color,
                     tree: tree.as_ref(),
                     autosave: self.autosave.enabled,
+                    theme: self.theme(),
+                    tip: self.tip_shown,
                 };
                 ui::chrome(&regions, &status, &interface)
             }
@@ -220,11 +292,25 @@ impl App {
 
     /// Moves the mouse to (`x`, `y`). True if what is under it changed, so it needs a redraw.
     pub fn hover_at(&mut self, size: (f32, f32), x: f32, y: f32) -> bool {
-        let hover = match self.screen {
-            Screen::Start { .. } => start::hit(&self.start_items(size), x, y),
-            Screen::Editing => toolbar::toolbar(self.regions(size).toolbar).hit(x, y),
+        let (hover, tree_hover) = match self.screen {
+            Screen::Start { .. } => (start::hit(&self.start_items(size), x, y), None),
+            Screen::Editing => {
+                let regions = self.regions(size);
+                (
+                    toolbar::toolbar(regions.toolbar).hit(x, y),
+                    regions
+                        .tree
+                        .and_then(|p| toolbar::tree_buttons(p).hit(x, y)),
+                )
+            }
         };
-        std::mem::replace(&mut self.hover, hover) != hover
+        let changed = std::mem::replace(&mut self.hover, hover) != hover
+            || std::mem::replace(&mut self.tree_hover, tree_hover) != tree_hover;
+        if changed {
+            self.hover_since = Instant::now();
+            self.tip_shown = false;
+        }
+        changed
     }
 
     /// A left click at (`x`, `y`). In the text, `text_offset` is asked for the displayed offset
@@ -243,6 +329,25 @@ impl App {
                 None => Vec::new(),
             };
         }
+        // A click leaves the `:` or `/` line, whose preview no longer matches what is shown.
+        self.editor.vim.close_command_line();
+        // A dialog or the list of keys is in the way of everything else.
+        if let Some(prompt) = &self.prompt {
+            if prompt.kind == PromptKind::ConfirmDelete {
+                let dialog = ui::dialog_bounds(size);
+                let (yes, no) = ui::dialog_buttons(dialog);
+                if yes.contains(x, y) {
+                    self.prompt_key(Key::Char('y'));
+                } else if no.contains(x, y) || !dialog.contains(x, y) {
+                    self.prompt_key(Key::Char('n'));
+                }
+            }
+            return Vec::new();
+        }
+        if self.help {
+            self.help = false;
+            return Vec::new();
+        }
         // An open menu takes the click: a choice applies, and anywhere else just closes it.
         if let Some(popup) = self.popup.take() {
             if let Some(item) = popup.hit(x, y) {
@@ -253,35 +358,46 @@ impl App {
             }
             return Vec::new();
         }
+        // A click answers the tip.
+        self.hover_since = Instant::now();
+        self.tip_shown = false;
         let regions = self.regions(size);
         let toolbar = toolbar::toolbar(regions.toolbar);
-        if let Some(panel) = regions.tree.filter(|p| p.contains(x, y)) {
+        if let Some(panel) = regions.outline.filter(|p| p.contains(x, y)) {
+            // A heading takes the cursor there and the view to it.
+            let row = ui::tree_row_at(panel, ui::TREE_HEADER, self.outline_first, x, y);
+            let offset = row.and_then(|i| self.editor.headings().get(i).map(|h| h.offset));
+            if let Some(offset) = offset {
+                self.focus = Focus::Editor;
+                self.editor.goto(offset);
+                return vec![Effect::Align(ViewMove::Top)];
+            }
+        } else if let Some(panel) = regions.tree.filter(|p| p.contains(x, y)) {
             self.focus = Focus::Tree;
-            let row = ui::tree_row_at(panel, self.tree_first, x, y);
-            if let (Some(row), Some(tree)) = (row, &mut self.tree) {
+            let row = ui::tree_row_at(panel, ui::TREE_TOP, self.tree_first, x, y);
+            let buttons = toolbar::tree_buttons(panel);
+            if let Some(Click::TreeKey(key)) =
+                buttons.hit(x, y).map(|i| buttons.buttons[i].click.clone())
+            {
+                self.tree_key(Key::Char(key));
+            } else if let (Some(row), Some(tree)) = (row, &mut self.tree) {
                 tree.select(row);
                 self.tree_key(Key::Enter);
             }
         } else if let Some(i) = toolbar.hit(x, y) {
             match toolbar.buttons[i].click.clone() {
                 Click::Do(action) => self.editor.apply(&action),
-                Click::Open(menu) => {
-                    let anchor = toolbar.buttons[i].bounds;
-                    self.popup = Some(toolbar::popup(menu, anchor, size));
-                }
+                Click::Open(menu) => self.open_menu(menu, toolbar.buttons[i].bounds, size),
                 Click::Save => {
                     self.editor.save();
                 }
                 Click::ExportMarkdown => return vec![Effect::PickExport(ExportKind::Markdown)],
                 Click::ExportPdf => return vec![Effect::PickExport(ExportKind::Pdf)],
-                Click::ToggleAutoSave => {
-                    self.autosave.enabled = !self.autosave.enabled;
-                    self.config.auto_save = self.autosave.enabled;
-                    if let Some(path) = &self.config_path {
-                        // A setting that won't save still works until the app closes.
-                        let _ = self.config.save(path);
-                    }
+                click @ (Click::ToggleAutoSave | Click::ToggleDark | Click::ToggleOutline) => {
+                    self.toggle_setting(&click)
                 }
+                Click::Help => self.help = true,
+                Click::TreeKey(_) => {}
             }
         } else if regions.editor.contains(x, y) {
             self.focus = Focus::Editor;
@@ -294,11 +410,76 @@ impl App {
         Vec::new()
     }
 
+    /// Opens the list under a toolbar button, with the font in force marked in the font list.
+    pub fn open_menu(&mut self, menu: toolbar::Menu, anchor: ui::Bounds, size: (f32, f32)) {
+        let mut popup = toolbar::popup(menu, anchor, size);
+        if menu == toolbar::Menu::Font
+            && let Some(font) = self.editor.current_font()
+        {
+            popup.mark(&font);
+        }
+        self.popup = Some(popup);
+    }
+
+    /// Flips a setting the toolbar has a button for, and remembers it in the settings file.
+    fn toggle_setting(&mut self, which: &Click) {
+        match which {
+            Click::ToggleDark => self.config.dark = !self.config.dark,
+            Click::ToggleOutline => self.config.outline = !self.config.outline,
+            _ => {
+                self.autosave.enabled = !self.autosave.enabled;
+                self.config.auto_save = self.autosave.enabled;
+            }
+        }
+        if let Some(path) = &self.config_path {
+            // A setting that won't save still works until the app closes.
+            let _ = self.config.save(path);
+        }
+    }
+
+    /// The outline as its panel shows it: the rows from the first one showing, which moves only
+    /// far enough to keep the heading the cursor is under in view.
+    fn outline_view(&mut self, panel: Option<ui::Bounds>) -> Option<OutlineView> {
+        let panel = panel?;
+        let cursor = self.editor.buf.cursor();
+        let focused = self.focus == Focus::Outline;
+        let headings = self.editor.headings();
+        let current = outline::current(headings, cursor);
+        let capacity = ui::tree_capacity(panel, ui::TREE_HEADER).max(1);
+        self.outline_sel = self.outline_sel.min(headings.len().saturating_sub(1));
+        // Keep in view the row that has the cursor: the outline's own while it has the keyboard.
+        if let Some(anchor) = if focused {
+            Some(self.outline_sel)
+        } else {
+            current
+        } {
+            if anchor < self.outline_first {
+                self.outline_first = anchor;
+            } else if anchor >= self.outline_first + capacity {
+                self.outline_first = anchor + 1 - capacity;
+            }
+        }
+        self.outline_first = self.outline_first.min(headings.len().saturating_sub(1));
+        let rows = headings
+            .iter()
+            .enumerate()
+            .skip(self.outline_first)
+            .take(capacity)
+            .map(|(i, h)| OutlineRow {
+                title: h.title.clone(),
+                level: h.level,
+                current: Some(i) == current,
+                selected: focused && i == self.outline_sel,
+            })
+            .collect();
+        Some(OutlineView { rows, focused })
+    }
+
     /// The tree as its panel shows it: the rows from the first one showing, which moves only far
     /// enough to keep the selection in view.
     fn tree_view(&mut self, panel: Option<ui::Bounds>) -> Option<TreeView> {
         let (tree, panel) = (self.tree.as_ref()?, panel?);
-        let capacity = ui::tree_capacity(panel).max(1);
+        let capacity = ui::tree_capacity(panel, ui::TREE_TOP).max(1);
         let selected = tree.selected_index();
         if selected < self.tree_first {
             self.tree_first = selected;
@@ -361,9 +542,9 @@ impl App {
     fn start_prompt(&mut self, kind: PromptKind) {
         let Some(tree) = &self.tree else { return };
         let Some(row) = tree.selected() else {
-            if kind == PromptKind::Add {
+            if matches!(kind, PromptKind::Add | PromptKind::AddFolder) {
                 self.prompt = Some(Prompt {
-                    label: "Add (end with / for a folder): ".into(),
+                    label: "New file: ".into(),
                     text: String::new(),
                     kind,
                 });
@@ -375,11 +556,12 @@ impl App {
             .file_name()
             .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
         let (label, text) = match kind {
-            PromptKind::Add => ("Add (end with / for a folder): ".to_string(), String::new()),
+            PromptKind::Add => ("New file: ".to_string(), String::new()),
+            PromptKind::AddFolder => ("New folder: ".to_string(), String::new()),
             PromptKind::Rename => ("Rename to: ".into(), name),
             PromptKind::Copy => ("Copy to: ".into(), tree.relative(&row.path)),
             PromptKind::Move => ("Move to: ".into(), tree.relative(&row.path)),
-            PromptKind::ConfirmDelete => (format!("Delete {name}? (y/n) "), String::new()),
+            PromptKind::ConfirmDelete => (format!("Delete \u{201c}{name}\u{201d}?"), String::new()),
         };
         self.prompt = Some(Prompt { label, text, kind });
     }
@@ -423,6 +605,7 @@ impl App {
             .is_some_and(|s| Some(s) == open_path.as_ref());
         let result = match kind {
             PromptKind::Add => tree.add(&text),
+            PromptKind::AddFolder => tree.add(&format!("{}/", text.trim().trim_end_matches('/'))),
             PromptKind::Rename => tree.rename(&text),
             PromptKind::Copy => tree.copy_to(&text),
             PromptKind::Move => tree.move_to(&text),
@@ -462,6 +645,7 @@ impl App {
             Key::Char('j') | Key::Down => tree.move_selection(1),
             Key::Char('k') | Key::Up => tree.move_selection(-1),
             Key::Char('a') => self.start_prompt(PromptKind::Add),
+            Key::Char('A') => self.start_prompt(PromptKind::AddFolder),
             Key::Char('d') => self.start_prompt(PromptKind::ConfirmDelete),
             Key::Char('r') => self.start_prompt(PromptKind::Rename),
             Key::Char('c') => self.start_prompt(PromptKind::Copy),
@@ -496,12 +680,47 @@ impl App {
         }
     }
 
+    /// A key while the outline has the keyboard: `j` `k` move, Enter goes to the heading and back
+    /// to the text, Tab or `o` goes without leaving, `q` hides the outline, Esc leaves it.
+    fn outline_key(&mut self, key: Key) -> Vec<Effect> {
+        let last = self.editor.headings().len().saturating_sub(1);
+        match key {
+            Key::Char('j') | Key::Down => self.outline_sel = (self.outline_sel + 1).min(last),
+            Key::Char('k') | Key::Up => self.outline_sel = self.outline_sel.saturating_sub(1),
+            Key::Enter | Key::Char('\t' | 'o') => {
+                let offset = self
+                    .editor
+                    .headings()
+                    .get(self.outline_sel)
+                    .map(|h| h.offset);
+                if let Some(offset) = offset {
+                    self.editor.goto(offset);
+                    if key == Key::Enter {
+                        self.focus = Focus::Editor;
+                    }
+                    return vec![Effect::Align(ViewMove::Top)];
+                }
+            }
+            Key::Char('q') => {
+                self.toggle_setting(&Click::ToggleOutline);
+                self.focus = Focus::Editor;
+            }
+            Key::Esc => self.focus = Focus::Editor,
+            _ => {}
+        }
+        Vec::new()
+    }
+
     fn start_action(&mut self, action: StartAction) -> Vec<Effect> {
         match action {
             StartAction::OpenFile => vec![Effect::PickFile],
             StartAction::OpenFolder => vec![Effect::PickFolder],
             StartAction::Open(path) => {
-                self.open_file(&path);
+                if path.is_dir() {
+                    self.open_folder(&path);
+                } else {
+                    self.open_file(&path);
+                }
                 Vec::new()
             }
         }
@@ -524,15 +743,37 @@ impl App {
             self.prompt_key(key);
             return Vec::new();
         }
+        // The list of keys closes on any key; F1 opens it from anywhere.
+        if std::mem::take(&mut self.help) {
+            return Vec::new();
+        }
+        if key == Key::Help {
+            self.help = true;
+            return Vec::new();
+        }
         // Esc closes an open menu instead of reaching the editor.
         if key == Key::Esc && self.popup.take().is_some() {
             return Vec::new();
         }
+        // Ctrl-E goes to the file tree and Ctrl-T to the outline, showing them if hidden; the
+        // same key again goes back to the text.
         if key == Key::Ctrl('e') {
-            // Show the tree and go to it; from there, go back to the text, and to it again.
-            if !self.tree_visible || self.focus == Focus::Editor {
+            if self.focus != Focus::Tree {
                 self.ensure_tree();
                 self.focus = Focus::Tree;
+            } else {
+                self.focus = Focus::Editor;
+            }
+            return Vec::new();
+        }
+        if key == Key::Ctrl('t') {
+            if self.focus != Focus::Outline {
+                if !self.config.outline {
+                    self.toggle_setting(&Click::ToggleOutline);
+                }
+                let cursor = self.editor.buf.cursor();
+                self.outline_sel = outline::current(self.editor.headings(), cursor).unwrap_or(0);
+                self.focus = Focus::Outline;
             } else {
                 self.focus = Focus::Editor;
             }
@@ -541,6 +782,9 @@ impl App {
         if self.focus == Focus::Tree {
             self.tree_key(key);
             return Vec::new();
+        }
+        if self.focus == Focus::Outline {
+            return self.outline_key(key);
         }
         if key == Key::Ctrl('o') {
             if self.editor.buf.is_modified() {
@@ -573,6 +817,29 @@ impl App {
         let mut effects = Vec::new();
         if self.editor.key(key) {
             effects.push(Effect::Quit);
+        }
+        self.help |= std::mem::take(&mut self.editor.help);
+        if let Some(by) = self.editor.scroll.take() {
+            let rows = (self.regions(size).editor.h / ui::BODY_ROW) as usize;
+            let (down, n) = match by {
+                ViewMove::HalfDown => (true, rows / 2),
+                ViewMove::HalfUp => (false, rows / 2),
+                ViewMove::PageDown => (true, rows.saturating_sub(2)),
+                ViewMove::PageUp => (false, rows.saturating_sub(2)),
+                align => {
+                    effects.push(Effect::Align(align));
+                    (true, 0)
+                }
+            };
+            if n > 0 {
+                // The cursor keeps its place on the screen as the text moves past it.
+                self.editor.move_rows(down, n);
+                effects.push(Effect::ScrollRows(if down {
+                    n as i32
+                } else {
+                    -(n as i32)
+                }));
+            }
         }
         // Yanks go out to the clipboard, and `"+` and `"*` come in from it.
         effects.extend(
@@ -649,15 +916,11 @@ impl App {
         match Editor::open(path) {
             Ok(editor) => {
                 self.editor = editor;
+                self.opened += 1;
                 self.screen = Screen::Editing;
                 self.popup = None;
                 self.hover = None;
-                let absolute = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-                self.recent.add(absolute);
-                if let Some(saved) = &self.recent_path {
-                    // A recent list that won't save isn't worth interrupting writing for.
-                    let _ = self.recent.save(saved);
-                }
+                self.remember(path);
             }
             Err(error) => {
                 let message = format!("Can't open {}: {error}", path.display());
@@ -669,8 +932,20 @@ impl App {
         }
     }
 
-    /// Shows `folder`'s files in the tree on the right, ready to edit in a new document.
+    /// Puts a file or folder first in the recent list and saves the list.
+    fn remember(&mut self, path: &Path) {
+        let absolute = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        self.recent.add(absolute);
+        if let Some(saved) = &self.recent_path {
+            // A recent list that won't save isn't worth interrupting writing for.
+            let _ = self.recent.save(saved);
+        }
+    }
+
+    /// Shows `folder`'s files in the tree on the right, ready to edit in a new document, and puts
+    /// it first in the recent list.
     pub fn open_folder(&mut self, folder: &Path) {
+        self.remember(folder);
         self.tree = Some(Tree::new(folder));
         self.tree_visible = true;
         if let Screen::Start { .. } = self.screen {
@@ -788,6 +1063,22 @@ mod tests {
         assert!(app.tree_visible);
         assert_eq!(app.tree.as_ref().unwrap().rows().len(), 1);
         assert!(app.regions(SIZE).tree.is_some());
+        // The folder is remembered with the files, and opens again from the start screen.
+        let canonical = std::fs::canonicalize(&dir).unwrap();
+        assert_eq!(app.recent.files(), [canonical]);
+        app.screen = Screen::Start {
+            message: String::new(),
+        };
+        app.tree = None;
+        let items = start::layout(SIZE, app.recent.files());
+        assert!(items[2].title.ends_with("bwa_app_folder/"));
+        app.click(
+            SIZE,
+            (items[2].bounds.x + 5.0, items[2].bounds.y + 5.0),
+            |_, _| None,
+        );
+        assert_eq!(app.screen, Screen::Editing);
+        assert_eq!(app.tree.as_ref().unwrap().rows().len(), 1);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1009,22 +1300,22 @@ mod tests {
     fn add_rename_and_delete_go_through_prompts() {
         let (mut app, root) = tree_app("prompts");
         press(&mut app, "\x05j");
-        // Add: the prompt shows on the status bar, a file is made and opened.
+        // Add: a dialog asks for the name, and shows what is typed; a file is made and opened.
         press(&mut app, "a");
-        assert!(
-            app.chrome(SIZE)
-                .labels
-                .iter()
-                .any(|l| l.text.starts_with("Add (end with / for a folder): "))
-        );
-        press(&mut app, "new.dj\n");
+        press(&mut app, "ne");
+        let dialog = app.chrome(SIZE).over_labels;
+        assert!(dialog.iter().any(|l| l.text == "New file:"));
+        assert!(dialog.iter().any(|l| l.text.starts_with("ne\u{258f}")));
+        press(&mut app, "w.dj\n");
         assert!(root.join("new.dj").is_file());
         assert_eq!(app.editor.file_name(), "new.dj");
         assert!(app.prompt.is_none());
-        // A name that ends in / is a folder, and Esc drops a prompt.
+        // A name that ends in / is a folder, A makes one whatever is typed, and Esc drops a prompt.
         press(&mut app, "a");
         press(&mut app, "more/\n");
         assert!(root.join("more").is_dir());
+        press(&mut app, "Aplain\n");
+        assert!(root.join("more/plain").is_dir());
         press(&mut app, "aoops\x1b");
         assert!(app.prompt.is_none() && !root.join("oops").exists());
         // Rename starts with the current name; the open document follows its file.
@@ -1037,8 +1328,16 @@ mod tests {
         press(&mut app, "\x08\x08\x08\x08\x08\x08\x08\x08moved.dj\n");
         assert!(root.join("moved.dj").is_file() && !root.join("new.dj").exists());
         assert!(app.editor.path().unwrap().ends_with("moved.dj"));
-        // Delete asks first: n keeps it, y removes it, and the document lets go of the file.
-        press(&mut app, "dn");
+        // Delete asks first, in a dialog with buttons: n keeps it, y removes it, and the document
+        // lets go of the file.
+        press(&mut app, "d");
+        let ask = app.chrome(SIZE).over_labels;
+        assert!(
+            ask.iter()
+                .any(|l| l.text.starts_with("Delete \u{201c}moved.dj"))
+        );
+        assert!(ask.iter().any(|l| l.text == "Delete (y)"));
+        press(&mut app, "n");
         assert!(root.join("moved.dj").exists());
         press(&mut app, "dy");
         assert!(!root.join("moved.dj").exists());
@@ -1090,7 +1389,7 @@ mod tests {
         let row = |i: f32| {
             (
                 panel.x + 30.0,
-                panel.y + ui::TREE_HEADER + i * ui::TREE_ROW + 4.0,
+                panel.y + ui::TREE_TOP + i * ui::TREE_ROW + 4.0,
             )
         };
         // The chapters folder opens; then the first file in it opens in the editor.
@@ -1124,7 +1423,7 @@ mod tests {
                 .map(|r| r.name)
                 .collect()
         };
-        let capacity = ui::tree_capacity(app.regions(SIZE).tree.unwrap());
+        let capacity = ui::tree_capacity(app.regions(SIZE).tree.unwrap(), ui::TREE_TOP);
         assert_eq!(visible(&mut app).len(), capacity);
         assert_eq!(visible(&mut app)[0], "chapters");
         for _ in 0..30 {
@@ -1219,7 +1518,135 @@ mod tests {
         app.click(SIZE, button("Auto"), |_, _| None);
         assert!(!app.autosave.enabled && !lit(&mut app));
         assert!(!Config::load(&settings).auto_save);
+        // The theme button switches the look and the choice is remembered.
+        assert!(!app.theme().dark);
+        app.click(SIZE, button("\u{263e}"), |_, _| None);
+        assert!(app.theme().dark && Config::load(&settings).dark);
+        app.click(SIZE, button("\u{263e}"), |_, _| None);
+        assert!(!app.theme().dark && !Config::load(&settings).dark);
+        // A tip shows once the mouse has rested on a button, and goes when it moves off.
+        let (x, y) = button("Save");
+        let shown = |app: &mut App| {
+            app.chrome(SIZE)
+                .over_labels
+                .iter()
+                .any(|l| l.text.starts_with("Save ("))
+        };
+        assert!(app.hover_at(SIZE, x, y) && !shown(&mut app));
+        assert!(app.next_wake().is_some());
+        app.tick(Instant::now() + Duration::from_secs(1));
+        assert!(shown(&mut app));
+        app.hover_at(SIZE, 500.0, 300.0);
+        assert!(!shown(&mut app));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_outline_lists_headings_marks_the_current_one_and_jumps_on_click() {
+        let path = temp_file("outline", "# One\n\ntext\n\n## Two\n\nmore\n\n## Three\n");
+        let mut app = App::new(
+            Editor::open(&path).unwrap(),
+            Screen::Editing,
+            Recent::default(),
+            None,
+        );
+        let settings = std::env::temp_dir().join("bwa_outline_settings.toml");
+        app.set_config(Config::default(), Some(settings.clone()));
+        let panel = app.regions(SIZE).outline.unwrap();
+        let rows = |app: &mut App| {
+            let panel = app.regions(SIZE).outline;
+            app.outline_view(panel)
+                .unwrap()
+                .rows
+                .into_iter()
+                .map(|r| (r.title, r.current))
+                .collect::<Vec<_>>()
+        };
+        let row = |i: f32| {
+            (
+                panel.x + 30.0,
+                panel.y + ui::TREE_HEADER + i * ui::TREE_ROW + 4.0,
+            )
+        };
+        assert_eq!(
+            rows(&mut app),
+            [
+                ("One".into(), true),
+                ("Two".into(), false),
+                ("Three".into(), false)
+            ]
+        );
+        // Clicking a heading moves the cursor there and asks for it at the top of the view.
+        assert_eq!(
+            app.click(SIZE, row(2.0), |_, _| None),
+            [Effect::Align(ViewMove::Top)]
+        );
+        assert_eq!(
+            app.editor.buf.cursor(),
+            "# One\n\ntext\n\n## Two\n\nmore\n\n## ".len()
+        );
+        assert_eq!(rows(&mut app)[2], ("Three".into(), true));
+        // Ctrl-T gives the outline the keyboard, on the current heading; j and k move, and Enter
+        // goes there and back to the text.
+        assert_eq!(app.key(SIZE, Key::Ctrl('t')), []);
+        assert_eq!(app.focus, Focus::Outline);
+        app.key(SIZE, Key::Char('k'));
+        let selected = |app: &mut App| {
+            let panel = app.regions(SIZE).outline;
+            let rows = app.outline_view(panel).unwrap().rows;
+            rows.iter().position(|r| r.selected)
+        };
+        assert_eq!(selected(&mut app), Some(1));
+        app.key(SIZE, Key::Char('j'));
+        app.key(SIZE, Key::Char('k'));
+        app.key(SIZE, Key::Char('k'));
+        assert_eq!(app.key(SIZE, Key::Enter), [Effect::Align(ViewMove::Top)]);
+        assert_eq!(app.focus, Focus::Editor);
+        assert_eq!(app.editor.buf.cursor(), 2);
+        // `q` in the outline hides it and the editor takes its room; the choice is remembered.
+        let width = app.regions(SIZE).editor.w;
+        app.key(SIZE, Key::Ctrl('t'));
+        app.key(SIZE, Key::Char('q'));
+        assert!(app.regions(SIZE).outline.is_none() && app.focus == Focus::Editor);
+        assert_eq!(app.regions(SIZE).editor.w, width + ui::OUTLINE_WIDTH);
+        assert!(!Config::load(&settings).outline);
+        // Ctrl-T shows it again.
+        app.key(SIZE, Key::Ctrl('t'));
+        assert!(app.regions(SIZE).outline.is_some() && app.focus == Focus::Outline);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(&settings).unwrap();
+    }
+
+    #[test]
+    fn page_keys_move_the_cursor_and_ask_the_window_to_scroll_by_as_many_rows() {
+        let text: String = (0..200).map(|i| format!("line {i}\n")).collect();
+        let path = temp_file("pages", &text);
+        let mut app = App::new(
+            Editor::open(&path).unwrap(),
+            Screen::Editing,
+            Recent::default(),
+            None,
+        );
+        let rows = (app.regions(SIZE).editor.h / ui::BODY_ROW) as usize;
+        let line = |app: &App| {
+            app.editor.buf.text()[..app.editor.buf.cursor()]
+                .matches('\n')
+                .count()
+        };
+        let half = (rows / 2) as i32;
+        assert_eq!(app.key(SIZE, Key::Ctrl('d')), [Effect::ScrollRows(half)]);
+        assert_eq!(line(&app), half as usize);
+        assert_eq!(app.key(SIZE, Key::Ctrl('u')), [Effect::ScrollRows(-half)]);
+        assert_eq!(line(&app), 0);
+        let page = rows as i32 - 2;
+        assert_eq!(app.key(SIZE, Key::Ctrl('f')), [Effect::ScrollRows(page)]);
+        assert_eq!(line(&app), page as usize);
+        assert_eq!(app.key(SIZE, Key::Char('z')), []);
+        assert_eq!(
+            app.key(SIZE, Key::Char('z')),
+            [Effect::Align(ViewMove::Center)]
+        );
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]

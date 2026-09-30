@@ -19,12 +19,22 @@ pub enum Click {
     ExportMarkdown,
     ExportPdf,
     ToggleAutoSave,
+    /// Switch between the light and dark looks.
+    ToggleDark,
+    /// Show or hide the outline of headings.
+    ToggleOutline,
+    /// Show the list of keys.
+    Help,
+    /// A file tree button: the key it stands for.
+    TreeKey(char),
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Button {
     pub bounds: Bounds,
     pub label: String,
+    /// What the button does and its shortcut, shown when the mouse rests on it.
+    pub tip: String,
     pub click: Click,
 }
 
@@ -40,37 +50,94 @@ const PADDING: f32 = 8.0;
 
 /// Places the buttons in `bounds`, the thin strip along the top of the window.
 pub fn toolbar(bounds: Bounds) -> Toolbar {
-    // (label, width, click) with `None` for the space between groups.
-    let mut spec: Vec<Option<(&str, f32, Click)>> = Vec::new();
-    let mut add = |label, width, click| spec.push(Some((label, width, click)));
-    add("B", 26.0, Click::Do(Action::Bold));
-    add("I", 26.0, Click::Do(Action::Italic));
-    add("U", 26.0, Click::Do(Action::Underline));
-    add("S", 26.0, Click::Do(Action::Strikethrough));
+    let cmd = if cfg!(target_os = "macos") {
+        "Cmd"
+    } else {
+        "Ctrl"
+    };
+    // (label, width, click, tip) with `None` for the space between groups.
+    let mut spec: Vec<Option<(&str, f32, Click, String)>> = Vec::new();
+    let mut add =
+        |label, width, click, tip: &str| spec.push(Some((label, width, click, tip.to_string())));
+    add("B", 26.0, Click::Do(Action::Bold), "Bold (Ctrl+B)");
+    add("I", 26.0, Click::Do(Action::Italic), "Italic (Ctrl+I)");
+    add(
+        "U",
+        26.0,
+        Click::Do(Action::Underline),
+        "Underline (Ctrl+U)",
+    );
+    add("S", 26.0, Click::Do(Action::Strikethrough), "Strikethrough");
     spec.push(None);
-    let mut add = |label, width, click| spec.push(Some((label, width, click)));
-    add("Font", 52.0, Click::Open(Menu::Font));
-    add("Size", 44.0, Click::Open(Menu::Size));
-    add("A", 26.0, Click::Open(Menu::Color));
-    add("AA", 30.0, Click::Do(Action::Uppercase));
+    let mut add =
+        |label, width, click, tip: &str| spec.push(Some((label, width, click, tip.to_string())));
+    add("Font", 52.0, Click::Open(Menu::Font), "Font name");
+    add("Size", 44.0, Click::Open(Menu::Size), "Font size");
+    add("A", 26.0, Click::Open(Menu::Color), "Font color");
+    add("AA", 30.0, Click::Do(Action::Uppercase), "Make uppercase");
     spec.push(None);
-    let mut add = |label, width, click| spec.push(Some((label, width, click)));
-    add("H1", 28.0, Click::Do(Action::Heading(1)));
-    add("H2", 28.0, Click::Do(Action::Heading(2)));
-    add("H3", 28.0, Click::Do(Action::Heading(3)));
+    let mut add =
+        |label, width, click, tip: &str| spec.push(Some((label, width, click, tip.to_string())));
+    add(
+        "H1",
+        28.0,
+        Click::Do(Action::Heading(1)),
+        "Heading 1 (again for plain text)",
+    );
+    add(
+        "H2",
+        28.0,
+        Click::Do(Action::Heading(2)),
+        "Heading 2 (again for plain text)",
+    );
+    add(
+        "H3",
+        28.0,
+        Click::Do(Action::Heading(3)),
+        "Heading 3 (again for plain text)",
+    );
     spec.push(None);
-    let mut add = |label, width, click| spec.push(Some((label, width, click)));
-    add("\u{2022}", 26.0, Click::Do(Action::BulletList));
-    add("1.", 26.0, Click::Do(Action::NumberedList));
-    add("\"", 26.0, Click::Do(Action::Quote));
-    add("Link", 40.0, Click::Do(Action::Link));
+    let mut add =
+        |label, width, click, tip: &str| spec.push(Some((label, width, click, tip.to_string())));
+    add(
+        "\u{2022}",
+        26.0,
+        Click::Do(Action::BulletList),
+        "Bulleted list",
+    );
+    add("1.", 26.0, Click::Do(Action::NumberedList), "Numbered list");
+    add("\"", 26.0, Click::Do(Action::Quote), "Block quote");
+    add("Link", 40.0, Click::Do(Action::Link), "Link");
 
     // The buttons for the file rather than the text sit at the right end.
-    let right: [(&str, f32, Click); 4] = [
-        ("Save", 44.0, Click::Save),
-        ("MD", 34.0, Click::ExportMarkdown),
-        ("PDF", 38.0, Click::ExportPdf),
-        ("Auto", 46.0, Click::ToggleAutoSave),
+    let right: [(&str, f32, Click, String); 7] = [
+        (
+            "Outline",
+            56.0,
+            Click::ToggleOutline,
+            "Show or hide the headings (Ctrl+T goes there)".into(),
+        ),
+        ("Save", 44.0, Click::Save, "Save (Ctrl+S or :w)".into()),
+        (
+            "MD",
+            34.0,
+            Click::ExportMarkdown,
+            "Export as Markdown".into(),
+        ),
+        ("PDF", 38.0, Click::ExportPdf, "Export as PDF".into()),
+        (
+            "Auto",
+            46.0,
+            Click::ToggleAutoSave,
+            "Auto-save after you stop typing".into(),
+        ),
+        (
+            "\u{263e}",
+            26.0,
+            Click::ToggleDark,
+            "Switch between light and dark".into(),
+        ),
+        ("?", 26.0, Click::Help, "Every key (F1)".into()),
     ];
     let height = (bounds.h - 8.0).max(0.0);
     let y = bounds.y + (bounds.h - height) / 2.0;
@@ -78,7 +145,7 @@ pub fn toolbar(bounds: Bounds) -> Toolbar {
     let mut buttons = Vec::new();
     for entry in spec {
         match entry {
-            Some((label, width, click)) => {
+            Some((label, width, click, tip)) => {
                 buttons.push(Button {
                     bounds: Bounds {
                         x,
@@ -87,6 +154,7 @@ pub fn toolbar(bounds: Bounds) -> Toolbar {
                         h: height,
                     },
                     label: label.to_string(),
+                    tip: tip.replace("Ctrl", cmd),
                     click,
                 });
                 x += width + GAP;
@@ -94,9 +162,9 @@ pub fn toolbar(bounds: Bounds) -> Toolbar {
             None => x += GROUP_GAP - GAP,
         }
     }
-    let right_width: f32 = right.iter().map(|(_, w, _)| w + GAP).sum::<f32>() - GAP;
+    let right_width: f32 = right.iter().map(|(_, w, _, _)| w + GAP).sum::<f32>() - GAP;
     let mut x = (bounds.x + bounds.w - PADDING - right_width).max(x + GROUP_GAP - GAP);
-    for (label, width, click) in right {
+    for (label, width, click, tip) in right {
         buttons.push(Button {
             bounds: Bounds {
                 x,
@@ -105,9 +173,47 @@ pub fn toolbar(bounds: Bounds) -> Toolbar {
                 h: height,
             },
             label: label.to_string(),
+            tip: tip.replace("Ctrl", cmd),
             click,
         });
         x += width + GAP;
+    }
+    Toolbar { buttons }
+}
+
+/// The buttons under the file tree's header, in two rows, for the panel `panel`.
+pub fn tree_buttons(panel: Bounds) -> Toolbar {
+    const ROWS: [&[(&str, f32, char, &str)]; 2] = [
+        &[
+            ("+File", 42.0, 'a', "New file (a)"),
+            ("+Folder", 52.0, 'A', "New folder (A)"),
+            ("Rename", 50.0, 'r', "Rename (r)"),
+            ("Delete", 46.0, 'd', "Delete, after asking (d)"),
+            ("Copy", 38.0, 'c', "Copy to a path (c)"),
+        ],
+        &[
+            ("Move", 38.0, 'm', "Move to a path (m)"),
+            ("Yank", 38.0, 'y', "Yank, to paste a copy (y)"),
+            ("Paste", 42.0, 'p', "Paste a copy of what was yanked (p)"),
+        ],
+    ];
+    let mut buttons = Vec::new();
+    for (row, entries) in ROWS.iter().enumerate() {
+        let mut x = panel.x + 10.0;
+        for &(label, w, key, tip) in *entries {
+            buttons.push(Button {
+                bounds: Bounds {
+                    x,
+                    y: panel.y + crate::ui::TREE_HEADER + row as f32 * 26.0,
+                    w,
+                    h: 22.0,
+                },
+                label: label.into(),
+                tip: tip.into(),
+                click: Click::TreeKey(key),
+            });
+            x += w + 4.0;
+        }
     }
     Toolbar { buttons }
 }
@@ -126,6 +232,8 @@ pub struct PopupItem {
     /// A color to show as a square instead of text.
     pub swatch: Option<[u8; 3]>,
     pub action: Action,
+    /// The choice that is in force now, shown marked.
+    pub selected: bool,
 }
 
 /// The list a menu button opens, with where each choice is.
@@ -189,6 +297,7 @@ pub fn popup(menu: Menu, anchor: Bounds, window: (f32, f32)) -> Popup {
                     label: String::new(),
                     swatch: Some(*color),
                     action: Action::Color(*color),
+                    selected: false,
                 });
             }
             let rows = COLORS.len().div_ceil(columns) as f32;
@@ -226,6 +335,7 @@ pub fn popup(menu: Menu, anchor: Bounds, window: (f32, f32)) -> Popup {
                     label,
                     swatch: None,
                     action,
+                    selected: false,
                 });
             }
             (width, 2.0 * PAD + count * row)
@@ -250,6 +360,13 @@ pub fn popup(menu: Menu, anchor: Bounds, window: (f32, f32)) -> Popup {
 }
 
 impl Popup {
+    /// Marks the choice named `label`, ignoring case, as the one in force.
+    pub fn mark(&mut self, label: &str) {
+        for item in &mut self.items {
+            item.selected = item.label.eq_ignore_ascii_case(label);
+        }
+    }
+
     /// The choice under (`x`, `y`).
     pub fn hit(&self, x: f32, y: f32) -> Option<&PopupItem> {
         self.items.iter().find(|item| item.bounds.contains(x, y))
@@ -277,7 +394,7 @@ mod tests {
             labels,
             [
                 "B", "I", "U", "S", "Font", "Size", "A", "AA", "H1", "H2", "H3", "\u{2022}", "1.",
-                "\"", "Link", "Save", "MD", "PDF", "Auto"
+                "\"", "Link", "Outline", "Save", "MD", "PDF", "Auto", "\u{263e}", "?"
             ]
         );
         let strip = strip();
@@ -291,10 +408,15 @@ mod tests {
         // The file buttons are at the right end, clear of the text buttons.
         let last = toolbar.buttons.last().unwrap().bounds;
         assert_eq!(last.x + last.w, strip.w - PADDING);
-        assert_eq!(toolbar.buttons[15].click, Click::Save);
-        assert_eq!(toolbar.buttons[16].click, Click::ExportMarkdown);
-        assert_eq!(toolbar.buttons[17].click, Click::ExportPdf);
-        assert_eq!(toolbar.buttons[18].click, Click::ToggleAutoSave);
+        assert_eq!(toolbar.buttons[15].click, Click::ToggleOutline);
+        assert_eq!(toolbar.buttons[16].click, Click::Save);
+        assert_eq!(toolbar.buttons[17].click, Click::ExportMarkdown);
+        assert_eq!(toolbar.buttons[18].click, Click::ExportPdf);
+        assert_eq!(toolbar.buttons[19].click, Click::ToggleAutoSave);
+        assert_eq!(toolbar.buttons[20].click, Click::ToggleDark);
+        assert_eq!(toolbar.buttons[21].click, Click::Help);
+        assert_eq!(toolbar.buttons[0].tip.split(' ').next(), Some("Bold"));
+        assert!(toolbar.buttons.iter().all(|b| !b.tip.is_empty()));
         // Groups have a wider gap between them than buttons do.
         let gap = |i: usize| {
             toolbar.buttons[i + 1].bounds.x

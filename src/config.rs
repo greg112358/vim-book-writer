@@ -24,6 +24,10 @@ pub struct Config {
     pub vim_mode: bool,
     /// Save the file by itself once edits stop.
     pub auto_save: bool,
+    /// The dark look instead of the light one.
+    pub dark: bool,
+    /// The outline of headings is showing on the left.
+    pub outline: bool,
 }
 
 impl Default for Config {
@@ -33,6 +37,8 @@ impl Default for Config {
             font_size: 16.0,
             vim_mode: false,
             auto_save: false,
+            dark: false,
+            outline: true,
         }
     }
 }

@@ -29,6 +29,12 @@ impl Scroll {
         self.clamp(content, viewport);
     }
 
+    /// Heads for `position`, which is what putting a line in the middle of the view does.
+    pub fn to(&mut self, position: f32, content: f32, viewport: f32) {
+        self.target = position;
+        self.clamp(content, viewport);
+    }
+
     /// Heads for the least scroll that shows the stretch from `top` to `bottom` with `padding`
     /// to spare above and below. Does nothing if it is already in view.
     pub fn reveal(&mut self, top: f32, bottom: f32, padding: f32, content: f32, viewport: f32) {

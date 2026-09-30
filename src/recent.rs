@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 const CAP: usize = 20;
 
-/// The files opened lately, newest first, for the start screen's "Open recent".
+/// The files and folders opened lately, newest first, for the start screen's "Open recent".
 #[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Recent {

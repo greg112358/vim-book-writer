@@ -17,6 +17,7 @@ pub fn keys(logical: &WinitKey, text: Option<&str>, mods: ModifiersState) -> Vec
             NamedKey::ArrowUp => vec![Key::Up],
             NamedKey::ArrowDown => vec![Key::Down],
             NamedKey::Tab => vec![Key::Char('\t')],
+            NamedKey::F1 => vec![Key::Help],
             NamedKey::Space => vec![Key::Char(' ')],
             _ => Vec::new(),
         },
@@ -59,7 +60,7 @@ mod tests {
             assert_eq!(keys(&WinitKey::Named(named), None, none), [want]);
         }
         // Keys with no meaning here, and bare modifiers, give nothing.
-        assert!(keys(&WinitKey::Named(NamedKey::F1), None, none).is_empty());
+        assert!(keys(&WinitKey::Named(NamedKey::F2), None, none).is_empty());
         assert!(
             keys(
                 &WinitKey::Named(NamedKey::Shift),

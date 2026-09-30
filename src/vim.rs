@@ -1,9 +1,12 @@
 use crate::buffer::Buffer;
 use crate::format::{Mark, toggle, toggle_underline};
 use crate::motion::{
-    first_non_blank, line_end, line_start, nth_line_start, text_object, word_back, word_end,
-    word_forward, word_run_end,
+    find_in_line, first_non_blank, line_end, line_start, nth_line_start, paragraph_back,
+    paragraph_forward, text_object, word_back, word_back_by, word_end_by, word_forward_by,
+    word_run_end_by,
 };
+use crate::substitute::{self, Substitute, Substituted};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::Range;
 
@@ -19,6 +22,8 @@ pub enum Key {
     Right,
     Up,
     Down,
+    /// F1, which shows the list of keys.
+    Help,
 }
 
 /// Something the engine can't do itself and asks the app to do. `Save` is what `:w` and the Save
@@ -33,6 +38,25 @@ pub enum Command {
     SaveQuit,
     /// Read the file again, dropping changes: `:e!`.
     Reload,
+    /// Move the view, and for the page scrolls the cursor with it.
+    Scroll(ViewMove),
+    /// Show the list of keys: `:help`.
+    Help,
+}
+
+/// How a key moves the view over the text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewMove {
+    /// `Ctrl-d`, `Ctrl-u`: half a screen.
+    HalfDown,
+    HalfUp,
+    /// `Ctrl-f`, `Ctrl-b`: a screen.
+    PageDown,
+    PageUp,
+    /// `zz`, `zt`, `zb`: the cursor's line in the middle, at the top, or at the bottom.
+    Center,
+    Top,
+    Bottom,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -68,6 +92,8 @@ struct Pending {
     awaiting_register: bool,
     /// The register named by `"x`, for the command that follows.
     register: Option<char>,
+    /// `f`, `F`, `t`, `T`, `r` or `z` was typed and the next key completes it.
+    wait: Option<char>,
 }
 
 /// Vim-style modal editing over a `Buffer`. Feed it keys with `handle`.
@@ -83,6 +109,12 @@ pub struct Vim {
     cmdline: Option<(char, String)>,
     /// The last search pattern, and whether it went forward.
     search: Option<(String, bool)>,
+    /// What was selected when `:` was typed in visual mode, for the `'<,'>` range.
+    visual_lines: Option<Range<usize>>,
+    /// Whether the last search is shown highlighted. `:noh` turns it off until the next search.
+    hlsearch: bool,
+    /// The char, direction and kind (till or not) of the last `f`, `F`, `t` or `T`, for `;` and `,`.
+    last_find: Option<(char, bool, bool)>,
     /// Where the visual selection started; the buffer cursor is the other end.
     anchor: usize,
     pending: Pending,
@@ -160,10 +192,30 @@ impl Vim {
                 Key::Delete => buf.delete_forward(),
                 Key::Left => buf.move_left(),
                 Key::Right => buf.move_right(),
-                Key::Up => buf.move_up(),
-                Key::Down => buf.move_down(),
+                Key::Up => {
+                    if !buf.move_row(false, true) {
+                        buf.move_up();
+                    }
+                }
+                Key::Down => {
+                    if !buf.move_row(true, true) {
+                        buf.move_down();
+                    }
+                }
                 Key::Ctrl(c @ ('b' | 'i' | 'u')) => self.shortcut(buf, c),
-                Key::Ctrl(_) => {}
+                // Delete the word before the cursor, or join to the line above from its start.
+                Key::Ctrl('w') => {
+                    let (at, start) = (buf.cursor(), buf.line_start());
+                    if at == start {
+                        buf.delete_back();
+                    } else {
+                        let to = word_back(buf.text(), at).max(start);
+                        buf.replace(to..at, "");
+                        buf.set_cursor(to);
+                    }
+                }
+                Key::Ctrl('h') => buf.delete_back(),
+                Key::Ctrl(_) | Key::Help => {}
             }
             return;
         }
@@ -174,7 +226,10 @@ impl Vim {
             }
             self.command_keys.push(key);
         }
-        if let Key::Ctrl(c @ ('b' | 'i' | 'u')) = key {
+        // In normal mode Ctrl-b and Ctrl-u scroll, as in vim; elsewhere they format.
+        if let Key::Ctrl(c @ ('b' | 'i' | 'u')) = key
+            && (c == 'i' || self.mode != Mode::Normal)
+        {
             self.pending = Pending::default();
             self.shortcut(buf, c);
             return;
@@ -194,6 +249,7 @@ impl Vim {
                     self.mode = Mode::Normal;
                 }
             }
+            _ if p.wait.is_some() => self.finish_prefix(buf, &p, key, count),
             Key::Char('g') if !p.g => self.pending = Pending { g: true, ..p },
             // Any other key after `g` isn't a command we have.
             _ if p.g && key != Key::Char('g') => {}
@@ -216,8 +272,12 @@ impl Vim {
             }
             Key::Char(c @ ('/' | '?' | ':')) if p.op.is_none() && p.object.is_none() => {
                 self.cmdline = Some((c, String::new()));
-                // There are no ranges, so a selection has nothing to do with an ex command.
+                // From visual mode the command starts with the selection as its range, as in vim.
                 if c == ':' {
+                    if visual {
+                        self.visual_lines = self.selection(buf);
+                        self.cmdline = Some((c, "'<,'>".into()));
+                    }
                     self.mode = Mode::Normal;
                 }
             }
@@ -265,6 +325,56 @@ impl Vim {
                 }
             }
             _ if p.object.is_some() => {}
+            // Wait for the char to find, replace with, or the kind of `z`.
+            Key::Char(c @ ('f' | 'F' | 't' | 'T')) => self.pending = Pending { wait: Some(c), ..p },
+            Key::Char(c @ ('r' | 'z')) if p.op.is_none() && (c == 'z' || !visual) => {
+                self.pending = Pending { wait: Some(c), ..p }
+            }
+            Key::Char(c @ (';' | ',')) => self.find(buf, p.op, c == ',', count, true),
+            Key::Ctrl(c @ ('d' | 'f' | 'u' | 'b')) => {
+                self.command = Some(Command::Scroll(match c {
+                    'd' => ViewMove::HalfDown,
+                    'u' => ViewMove::HalfUp,
+                    'f' => ViewMove::PageDown,
+                    _ => ViewMove::PageUp,
+                }));
+            }
+            Key::Char('o') if visual => {
+                let anchor = std::mem::replace(&mut self.anchor, buf.cursor());
+                buf.set_cursor(anchor);
+            }
+            Key::Char(c @ ('~' | 'u' | 'U')) if visual => {
+                let range = self.selection(buf).unwrap_or_default();
+                self.mode = Mode::Normal;
+                change_case(buf, range.clone(), c);
+                buf.set_cursor(range.start);
+            }
+            Key::Char('~') => {
+                let at = buf.cursor();
+                let text = buf.text();
+                let end = text[at..text.len().min(line_end(text, at))]
+                    .char_indices()
+                    .nth(n)
+                    .map_or(line_end(text, at), |(i, _)| at + i);
+                change_case(buf, at..end, '~');
+                buf.set_cursor(end);
+            }
+            Key::Char('J') => {
+                let joins = if visual {
+                    let range = self.selection(buf).unwrap_or_default();
+                    self.mode = Mode::Normal;
+                    buf.set_cursor(range.start);
+                    buf.text()[range]
+                        .trim_end_matches('\n')
+                        .matches('\n')
+                        .count()
+                        .max(1)
+                } else {
+                    n.saturating_sub(1).max(1)
+                };
+                join_lines(buf, joins);
+            }
+            Key::Char(c @ ('p' | 'P')) if visual => self.visual_paste(buf, c == 'P'),
             Key::Char(op @ ('d' | 'c' | 'y')) if visual => self.visual_operator(buf, op),
             Key::Char('x') if visual => self.visual_operator(buf, 'd'),
             // Capital operators work on whole lines.
@@ -369,6 +479,15 @@ impl Vim {
                     Mode::VisualLine
                 };
             }
+            // With the window's wrapping known, up and down go a row at a time.
+            Key::Char('j' | 'k') | Key::Up | Key::Down if !p.g && !buf.rows.is_empty() => {
+                let down = matches!(key, Key::Char('j') | Key::Down);
+                for _ in 0..n {
+                    if !buf.move_row(down, false) {
+                        break;
+                    }
+                }
+            }
             _ => move_cursor(buf, key, p.g, count),
         }
         // Normal and visual mode never rest past the last char of a line.
@@ -439,6 +558,72 @@ impl Vim {
         self.mode = Mode::Insert;
     }
 
+    /// The text to show highlighted: what is being typed after `/` or `?`, else the last search
+    /// unless `:noh` hid it.
+    pub fn highlight_pattern(&self) -> Option<Cow<'_, str>> {
+        if let Some((prompt, text)) = &self.cmdline {
+            // A `:s` being typed shows what it looks for.
+            if *prompt == ':' {
+                if let Some(sub) = substitute::parse(text) {
+                    return Some(Cow::Owned(sub.pattern));
+                }
+            } else if !text.is_empty() {
+                return Some(Cow::Borrowed(text));
+            }
+        }
+        self.search
+            .as_ref()
+            .filter(|_| self.hlsearch)
+            .map(|(pattern, _)| Cow::Borrowed(pattern.as_str()))
+    }
+
+    /// Closes the `:` or `/` line without running it, as a click elsewhere does.
+    pub fn close_command_line(&mut self) {
+        self.cmdline = None;
+    }
+
+    /// What the `:s` command being typed would make of the text, once it has a replacement, so
+    /// it can be shown before Enter.
+    pub fn preview_substitute(&self, buf: &Buffer, typed: &str) -> Option<Substituted> {
+        let sub = substitute::parse(typed)?;
+        let replacement = sub.replacement.as_deref()?;
+        let text = buf.text();
+        let region =
+            substitute::region(text, buf.cursor(), &sub.range, self.visual_lines.as_ref())?;
+        let made = substitute::substitute(text, region, &sub.pattern, replacement, sub.global);
+        (!made.changes.is_empty()).then_some(made)
+    }
+
+    /// Runs `:s`: replaces in the lines of its range, as one undo step, and leaves the cursor on
+    /// the last line changed.
+    fn run_substitute(&mut self, buf: &mut Buffer, sub: &Substitute) {
+        let text = buf.text();
+        let Some(region) =
+            substitute::region(text, buf.cursor(), &sub.range, self.visual_lines.as_ref())
+        else {
+            self.message = "E16: Invalid range".into();
+            return;
+        };
+        let replacement = sub.replacement.as_deref().unwrap_or("");
+        let made =
+            substitute::substitute(text, region.clone(), &sub.pattern, replacement, sub.global);
+        // `n` finds the pattern again.
+        self.search = Some((sub.pattern.clone(), true));
+        let Some((_, last)) = made.changes.last() else {
+            self.message = format!("E486: Pattern not found: {}", sub.pattern);
+            return;
+        };
+        let end = (region.end as isize + made.text.len() as isize - text.len() as isize) as usize;
+        let (count, lines) = (made.changes.len(), made.lines);
+        buf.replace(region.clone(), &made.text[region.start..end]);
+        buf.set_cursor(first_non_blank(buf.text(), last.start));
+        self.message = format!(
+            "{count} substitution{} on {lines} line{}",
+            if count == 1 { "" } else { "s" },
+            if lines == 1 { "" } else { "s" }
+        );
+    }
+
     /// The prompt char and text of the open command line, for the status bar to draw.
     pub fn command_line(&self) -> Option<(char, &str)> {
         self.cmdline
@@ -447,8 +632,24 @@ impl Vim {
     }
 
     /// Runs the ex command `text`: `w`, `q`, `wq` (or `x`), and `q!`.
-    fn ex_command(&mut self, buf: &Buffer, text: &str) {
+    fn ex_command(&mut self, buf: &mut Buffer, text: &str) {
+        self.command = None;
+        if let Some(sub) = substitute::parse(text) {
+            self.run_substitute(buf, &sub);
+            return;
+        }
         self.command = match text.trim() {
+            // Just the selection as a range, with no command.
+            "'<,'>" => None,
+            // A line number goes to that line; `$` is the last.
+            line if line == "$"
+                || (!line.is_empty() && line.bytes().all(|b| b.is_ascii_digit())) =>
+            {
+                let n = line.parse().unwrap_or(usize::MAX).max(1);
+                let text = buf.text();
+                buf.set_cursor(first_non_blank(text, nth_line_start(text, n - 1)));
+                None
+            }
             "" => None,
             "w" | "w!" | "write" => Some(Command::Save),
             "wq" | "x" | "wq!" | "xit" | "exit" => Some(Command::SaveQuit),
@@ -458,6 +659,11 @@ impl Vim {
             }
             "q" | "quit" => Some(Command::Quit),
             "q!" | "quit!" => Some(Command::ForceQuit),
+            "help" | "h" => Some(Command::Help),
+            "noh" | "nohl" | "nohlsearch" => {
+                self.hlsearch = false;
+                None
+            }
             "e!" | "edit!" => Some(Command::Reload),
             "e" | "edit" if buf.is_modified() => {
                 self.message = "E37: No write since last change (add ! to override)".into();
@@ -468,6 +674,117 @@ impl Vim {
                 self.message = format!("E492: Not an editor command: {other}");
                 None
             }
+        };
+    }
+
+    /// Completes `f`, `F`, `t`, `T`, `r` or `z` with the char just typed. Other keys cancel it.
+    fn finish_prefix(&mut self, buf: &mut Buffer, p: &Pending, key: Key, count: Option<usize>) {
+        let (Some(prefix), Key::Char(ch)) = (p.wait, key) else {
+            return;
+        };
+        match prefix {
+            'r' => {
+                let at = buf.cursor();
+                let text = buf.text();
+                let n = count.unwrap_or(1);
+                let line = &text[at..line_end(text, at)];
+                // Like vim, replace nothing if the line has fewer than `n` chars left.
+                if let Some((end, _)) = line.char_indices().nth(n - 1) {
+                    let end = at + end + line[end..].chars().next().map_or(0, char::len_utf8);
+                    buf.replace(at..end, &ch.to_string().repeat(n));
+                    buf.set_cursor(at + (n - 1) * ch.len_utf8());
+                }
+            }
+            'z' => {
+                self.command = match ch {
+                    'z' | '.' => Some(Command::Scroll(ViewMove::Center)),
+                    't' => Some(Command::Scroll(ViewMove::Top)),
+                    'b' | '-' => Some(Command::Scroll(ViewMove::Bottom)),
+                    _ => None,
+                };
+            }
+            _ => {
+                self.last_find =
+                    Some((ch, matches!(prefix, 'f' | 't'), matches!(prefix, 't' | 'T')));
+                self.find(buf, p.op, false, count, false);
+            }
+        }
+    }
+
+    /// Moves to, or with `op` operates up to, the char the last `f`, `F`, `t` or `T` looked for.
+    /// `reverse` is `,` and `repeat` is `;` or `,`.
+    fn find(
+        &mut self,
+        buf: &mut Buffer,
+        op: Option<char>,
+        reverse: bool,
+        count: Option<usize>,
+        repeat: bool,
+    ) {
+        let Some((ch, forward, till)) = self.last_find else {
+            return;
+        };
+        let forward = forward != reverse;
+        let start = buf.cursor();
+        let Some(to) = find_in_line(
+            buf.text(),
+            start,
+            ch,
+            forward,
+            till,
+            count.unwrap_or(1),
+            repeat,
+        ) else {
+            return;
+        };
+        let Some(op) = op else {
+            buf.set_cursor(to);
+            return;
+        };
+        // Going forward the char it lands on goes with it; going back the char it started on stays.
+        let (lo, hi) = (start.min(to), start.max(to));
+        let end = if forward {
+            hi + buf.text()[hi..].chars().next().map_or(0, char::len_utf8)
+        } else {
+            hi
+        };
+        self.apply_operator(buf, op, lo..end, false, lo);
+    }
+
+    /// `p` or `P` in visual mode: the selection is replaced by the register, and what was
+    /// selected goes to the unnamed register.
+    fn visual_paste(&mut self, buf: &mut Buffer, keep: bool) {
+        let Some(mut put) = self.fetch().cloned() else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        let range = self.selection(buf).unwrap_or_default();
+        let linewise = self.mode == Mode::VisualLine;
+        let at_end = range.end >= buf.text().len();
+        self.mode = Mode::Normal;
+        self.register = None;
+        self.apply_operator(buf, 'd', range.clone(), linewise, range.start);
+        let deleted = self.registers.get(&'"').cloned();
+        // A line goes in as a line, whatever the selection was.
+        if linewise && !put.text.ends_with('\n') {
+            put.text.push('\n');
+        }
+        put.linewise |= linewise;
+        self.registers.insert('"', put);
+        if linewise {
+            // The last lines are gone, so the cursor is on the line above them.
+            self.paste(buf, !at_end || buf.text().is_empty(), 1);
+        } else if buf.cursor() >= buf.line_end() && buf.cursor() > buf.line_start() {
+            // The selection ran to the end of its line: put after the char that is left.
+            buf.move_left();
+            self.paste(buf, false, 1);
+        } else {
+            self.paste(buf, true, 1);
+        }
+        // `P` leaves the unnamed register as it was.
+        match deleted {
+            Some(register) if !keep => self.registers.insert('"', register),
+            _ => None,
         };
     }
 
@@ -496,6 +813,7 @@ impl Vim {
         count: usize,
     ) -> Option<usize> {
         let (pattern, forward) = self.search.as_ref()?;
+        self.hlsearch = true;
         let forward = *forward != reverse;
         let mut at = from;
         let mut wrapped = false;
@@ -572,8 +890,8 @@ impl Vim {
         let n = count.unwrap_or(1);
         let start = buf.cursor();
         let text = buf.text();
-        let linewise = g || matches!(key, Key::Char('j' | 'k' | 'G') | Key::Up | Key::Down);
-        let mut inclusive = matches!(key, Key::Char('e' | '$'));
+        let mut linewise = g || matches!(key, Key::Char('j' | 'k' | 'G') | Key::Up | Key::Down);
+        let mut inclusive = matches!(key, Key::Char('e' | 'E' | '$'));
         let target = match key {
             // Unlike plain `l`, this may reach the end of the line, so `x` can take the last char.
             Key::Char('l') | Key::Right if !g => {
@@ -588,7 +906,7 @@ impl Vim {
             }
             // `cw` on a word changes to the end of the word, like `ce` but without moving on
             // when already at its last char.
-            Key::Char('w')
+            Key::Char(c @ ('w' | 'W'))
                 if op == 'c'
                     && text[start..]
                         .chars()
@@ -596,9 +914,10 @@ impl Vim {
                         .is_some_and(|c| !c.is_whitespace()) =>
             {
                 inclusive = true;
-                let mut to = word_run_end(text, start);
+                let big = c == 'W';
+                let mut to = word_run_end_by(text, start, big);
                 for _ in 1..n {
-                    let next = word_end(text, to);
+                    let next = word_end_by(text, to, big);
                     if next == to {
                         break;
                     }
@@ -614,10 +933,10 @@ impl Vim {
             }
             // `dw` on the last word of a line stops at the line's end instead of joining the
             // next line.
-            Key::Char('w') if !g => {
+            Key::Char(c @ ('w' | 'W')) if !g => {
                 let (mut prev, mut to) = (start, start);
                 for _ in 0..n {
-                    let next = word_forward(text, to);
+                    let next = word_forward_by(text, to, c == 'W');
                     if next == to {
                         break;
                     }
@@ -639,6 +958,13 @@ impl Vim {
             return;
         }
         let text = buf.text();
+        let mut target = target;
+        // A `}` that lands at the start of a line stops at the end of the one before, and takes
+        // whole lines if it started at the start of one.
+        if !g && key == Key::Char('}') && target > start && target == line_start(text, target) {
+            linewise |= start <= first_non_blank(text, start);
+            target -= 1;
+        }
         let (lo, hi) = (start.min(target), start.max(target));
         let range = if linewise {
             line_start(text, lo)..(line_end(text, hi) + 1).min(text.len())
@@ -827,6 +1153,55 @@ impl Vim {
     }
 }
 
+/// Changes the case of `range`: `~` swaps it, `u` makes it lowercase and `U` uppercase.
+fn change_case(buf: &mut Buffer, range: Range<usize>, how: char) {
+    let old = &buf.text()[range.clone()];
+    let new: String = match how {
+        'u' => old.to_lowercase(),
+        'U' => old.to_uppercase(),
+        _ => old
+            .chars()
+            .flat_map(|c| {
+                if c.is_lowercase() {
+                    c.to_uppercase().collect::<Vec<_>>()
+                } else {
+                    c.to_lowercase().collect()
+                }
+            })
+            .collect(),
+    };
+    if new != old {
+        buf.replace(range, &new);
+    }
+}
+
+/// `J`: joins the line after the cursor's onto it `times`, with one space between unless a side
+/// is empty or the line already ends in a blank. The cursor ends where the last join was.
+fn join_lines(buf: &mut Buffer, times: usize) {
+    buf.begin_group();
+    for _ in 0..times {
+        let text = buf.text();
+        let end = line_end(text, buf.cursor());
+        if end >= text.len() {
+            break;
+        }
+        let next = end + 1;
+        let blanks = text[next..]
+            .bytes()
+            .take_while(|b| matches!(b, b' ' | b'\t'))
+            .count();
+        let rest = &text[next + blanks..];
+        let line = &text[line_start(text, end)..end];
+        let space = !(rest.is_empty()
+            || rest.starts_with(['\n', ')'])
+            || line.is_empty()
+            || line.ends_with([' ', '\t']));
+        buf.replace(end..next + blanks, if space { " " } else { "" });
+        buf.set_cursor(end);
+    }
+    buf.end_group();
+}
+
 /// True for the keys that are cursor motions, or, with `g`, for the second `g` of `gg`.
 fn is_motion(key: Key, g: bool) -> bool {
     if g {
@@ -834,8 +1209,23 @@ fn is_motion(key: Key, g: bool) -> bool {
     }
     matches!(
         key,
-        Key::Char('h' | 'j' | 'k' | 'l' | 'w' | 'b' | 'e' | '0' | '^' | '$' | 'G')
-            | Key::Left
+        Key::Char(
+            'h' | 'j'
+                | 'k'
+                | 'l'
+                | 'w'
+                | 'b'
+                | 'e'
+                | 'W'
+                | 'B'
+                | 'E'
+                | '{'
+                | '}'
+                | '0'
+                | '^'
+                | '$'
+                | 'G',
+        ) | Key::Left
             | Key::Right
             | Key::Up
             | Key::Down
@@ -886,15 +1276,18 @@ fn move_cursor(buf: &mut Buffer, key: Key, g: bool, count: Option<usize>) {
                 buf.move_up();
             }
         }
-        Key::Char(c @ ('w' | 'b' | 'e')) => {
-            let step = match c {
-                'w' => word_forward,
-                'b' => word_back,
-                _ => word_end,
-            };
+        Key::Char(c @ ('w' | 'b' | 'e' | 'W' | 'B' | 'E' | '{' | '}')) => {
+            let big = c.is_ascii_uppercase();
             for _ in 0..n {
                 let at = buf.cursor();
-                let to = step(buf.text(), at);
+                let text = buf.text();
+                let to = match c {
+                    'w' | 'W' => word_forward_by(text, at, big),
+                    'b' | 'B' => word_back_by(text, at, big),
+                    '{' => paragraph_back(text, at),
+                    '}' => paragraph_forward(text, at),
+                    _ => word_end_by(text, at, big),
+                };
                 if to == at {
                     break;
                 }
@@ -938,6 +1331,7 @@ mod tests {
                     '\x09' => Key::Ctrl('i'),
                     '\x12' => Key::Ctrl('r'),
                     '\x15' => Key::Ctrl('u'),
+                    '\x17' => Key::Ctrl('w'),
                     c => Key::Char(c),
                 },
             );
@@ -1347,9 +1741,9 @@ cd", 0, "9$", 4,
         let (mut vim, mut buf) = run("one two", 0, "vwd");
         press(&mut vim, &mut buf, "u");
         assert_eq!(buf.text(), "one two");
-        // p and u do nothing in visual mode yet, and don't end it.
-        let (vim, buf) = run("abc", 0, "vlpu");
-        assert_eq!((buf.text(), vim.mode), ("abc", Mode::Visual));
+        // With nothing yanked, p leaves the text alone and ends the selection.
+        let (vim, buf) = run("abc", 0, "vlp");
+        assert_eq!((buf.text(), vim.mode), ("abc", Mode::Normal));
     }
 
     #[test]
@@ -1596,6 +1990,178 @@ cd", 0, "9$", 4,
     }
 
     #[test]
+    fn finding_a_char_and_repeating_it() {
+        // (text, cursor, keys, cursor after)
+        for (text, cursor, keys, want) in [
+            ("one, two, three", 0, "f,", 3),
+            ("one, two, three", 0, "f,;", 8),
+            ("one, two, three", 0, "f,;,", 3),
+            ("one, two, three", 0, "2f,", 8),
+            ("one, two, three", 0, "t,", 2),
+            ("one, two, three", 0, "t,;", 7),
+            ("one, two, three", 14, "F,", 8),
+            ("one, two, three", 14, "T,", 9),
+            // Not on this line, or not there at all: stay put.
+            ("ab\nc,d", 0, "f,", 0),
+            ("abc", 0, "fz", 0),
+        ] {
+            let (_, buf) = run(text, cursor, keys);
+            assert_eq!(buf.cursor(), want, "{keys:?} on {text:?}");
+        }
+        for (text, keys, want) in [
+            ("one, two, three", "dt,", ", two, three"),
+            ("one, two, three", "df,", " two, three"),
+            ("one, two, three", "cf,X\x1b", "X two, three"),
+            ("one, two, three", "$dF,", "one, twoe"),
+            ("a,b,c,d", "df,.", "c,d"),
+        ] {
+            let (_, buf) = run(text, 0, keys);
+            assert_eq!(buf.text(), want, "{keys:?}");
+        }
+    }
+
+    #[test]
+    fn paragraph_and_big_word_motions() {
+        let text = "one two\nthree\n\nfour\n\nfive";
+        for (cursor, keys, want) in [
+            (0, "}", 14),
+            (0, "}}", 20),
+            (0, "2}", 20),
+            (0, "}}}", 24),
+            (21, "{", 20),
+            (21, "{{", 14),
+        ] {
+            let (_, buf) = run(text, cursor, keys);
+            assert_eq!(buf.cursor(), want, "{keys:?}");
+        }
+        // From the start of a paragraph `d}` takes its lines; from inside it, up to the line's end.
+        assert_eq!(run(text, 0, "d}").1.text(), "\nfour\n\nfive");
+        assert_eq!(run(text, 4, "d}").1.text(), "one \n\nfour\n\nfive");
+        let (_, buf) = run("a.b c-d e", 0, "W");
+        assert_eq!(buf.cursor(), 4);
+        assert_eq!(run("a.b c-d e", 0, "E").1.cursor(), 2);
+        assert_eq!(run("a.b c-d e", 8, "B").1.cursor(), 4);
+        assert_eq!(run("a.b c-d e", 0, "dW").1.text(), "c-d e");
+        assert_eq!(run("a.b c-d e", 0, "cWX\x1b").1.text(), "X c-d e");
+    }
+
+    #[test]
+    fn replace_case_join_and_ex_line_numbers() {
+        for (text, cursor, keys, want, at) in [
+            ("abc", 0, "rx", "xbc", 0),
+            ("abc", 0, "2rx", "xxc", 1),
+            ("abc", 1, "3rx", "abc", 1),
+            ("aBc", 0, "~", "ABc", 1),
+            ("aBc", 0, "3~", "AbC", 2),
+            ("a\n  b\nc", 0, "J", "a b\nc", 1),
+            ("a\n  b\nc", 0, "3J", "a b c", 3),
+            ("a \nb", 0, "J", "a b", 2),
+            ("a\n\nb", 0, "J", "a\nb", 0),
+            ("hello world", 0, "veU", "HELLO world", 0),
+            ("HELLO", 0, "veu", "hello", 0),
+            ("abcd", 1, "vlohd", "d", 0),
+            ("a\nb\nc", 0, ":3\n", "a\nb\nc", 4),
+            ("a\nb\nc", 0, ":$\n", "a\nb\nc", 4),
+            ("a\nb\nc", 4, ":1\n", "a\nb\nc", 0),
+        ] {
+            let (_, buf) = run(text, cursor, keys);
+            assert_eq!(
+                (buf.text(), buf.cursor()),
+                (want, at),
+                "{keys:?} on {text:?}"
+            );
+        }
+        // Visual J joins every selected line, and each is one undo step.
+        let (_, mut buf) = run("a\nb\nc\nd", 0, "VjjJ");
+        assert_eq!(buf.text(), "a b c\nd");
+        buf.undo();
+        assert_eq!(buf.text(), "a\nb\nc\nd");
+    }
+
+    #[test]
+    fn visual_paste_swaps_the_selection_with_the_register() {
+        let (_, buf) = run("one two", 0, "yiwwviwp");
+        assert_eq!(buf.text(), "one one");
+        // What was selected is now the unnamed register.
+        let (_, buf) = run("one two", 0, "yiwwviwp0P");
+        assert_eq!(buf.text(), "twoone one");
+        let (_, buf) = run("one two three", 0, "yiwwviwP$p");
+        assert_eq!(buf.text(), "one one threeone");
+        let (_, buf) = run("a\nb\nc", 0, "yyjVp");
+        assert_eq!(buf.text(), "a\na\nc");
+    }
+
+    #[test]
+    fn insert_mode_ctrl_w_deletes_a_word_and_scroll_keys_ask_the_window() {
+        assert_eq!(run("", 0, "ione two\x17X\x1b").1.text(), "one X");
+        assert_eq!(run("a\nb", 2, "i\x17X\x1b").1.text(), "aXb");
+        let (mut vim, mut buf) = (Vim::new(), Buffer::new("abc"));
+        let by = |command| Some(Command::Scroll(command));
+        assert_eq!(vim.handle(&mut buf, Key::Ctrl('d')), by(ViewMove::HalfDown));
+        assert_eq!(vim.handle(&mut buf, Key::Ctrl('f')), by(ViewMove::PageDown));
+        assert_eq!(vim.handle(&mut buf, Key::Ctrl('u')), by(ViewMove::HalfUp));
+        assert_eq!(vim.handle(&mut buf, Key::Ctrl('b')), by(ViewMove::PageUp));
+        assert_eq!(vim.handle(&mut buf, Key::Char('z')), None);
+        assert_eq!(vim.handle(&mut buf, Key::Char('z')), by(ViewMove::Center));
+        assert_eq!(vim.handle(&mut buf, Key::Char('z')), None);
+        assert_eq!(vim.handle(&mut buf, Key::Char('t')), by(ViewMove::Top));
+        // Where Ctrl-u and Ctrl-b format, they still do: in visual mode there is a selection.
+        press(&mut vim, &mut buf, "v");
+        assert_eq!(vim.handle(&mut buf, Key::Ctrl('b')), None);
+        assert_eq!(buf.text(), "*a*bc");
+    }
+
+    #[test]
+    fn substitute_replaces_in_its_range_as_one_undo_step() {
+        let text = "foo bar foo\nfoo\nbaz foo";
+        // (keys, text after, cursor after)
+        for (keys, want, at) in [
+            (":s/foo/X/\n", "X bar foo\nfoo\nbaz foo", 0),
+            (":s/foo/X/g\n", "X bar X\nfoo\nbaz foo", 0),
+            (":%s/foo/X/g\n", "X bar X\nX\nbaz X", 10),
+            (":%s/foo//g\n", " bar \n\nbaz ", 7),
+            (":2,3s/foo/X/\n", "foo bar foo\nX\nbaz X", 14),
+            (":%s#foo#a/b#\n", "a/b bar foo\na/b\nbaz a/b", 16),
+            (":%s/foo/x\\ny/\n", "x\ny bar foo\nx\ny\nbaz x\ny", 16),
+            // Visual mode starts the command with its lines as the range.
+            ("jVj:s/foo/X/\n", "foo bar foo\nX\nbaz X", 14),
+        ] {
+            let (mut vim, mut buf) = (Vim::new(), Buffer::new(text));
+            press(&mut vim, &mut buf, keys);
+            assert_eq!((buf.text(), buf.cursor()), (want, at), "{keys:?}");
+            press(&mut vim, &mut buf, "u");
+            assert_eq!(buf.text(), text, "one undo for {keys:?}");
+        }
+        let (mut vim, mut buf) = (Vim::new(), Buffer::new(text));
+        press(&mut vim, &mut buf, ":%s/foo/X/g\n");
+        assert_eq!(vim.message, "4 substitutions on 3 lines");
+        press(&mut vim, &mut buf, ":%s/zzz/X/\n");
+        assert_eq!(vim.message, "E486: Pattern not found: zzz");
+        // What is typed so far is what it looks for, before Enter.
+        press(&mut vim, &mut buf, ":%s/ba");
+        assert_eq!(vim.highlight_pattern().as_deref(), Some("ba"));
+        let made = vim.preview_substitute(&buf, "%s/ba/Q").unwrap();
+        assert_eq!(made.text, "X Qr X\nX\nQz X");
+        assert!(vim.preview_substitute(&buf, "%s/ba").is_none());
+    }
+
+    #[test]
+    fn the_last_search_stays_highlighted_until_noh() {
+        let (mut vim, mut buf) = (Vim::new(), Buffer::new("a foo b foo"));
+        assert_eq!(vim.highlight_pattern().as_deref(), None);
+        // While typing, what is typed so far; after Enter, the search.
+        press(&mut vim, &mut buf, "/fo");
+        assert_eq!(vim.highlight_pattern().as_deref(), Some("fo"));
+        press(&mut vim, &mut buf, "o\n");
+        assert_eq!(vim.highlight_pattern().as_deref(), Some("foo"));
+        press(&mut vim, &mut buf, ":noh\n");
+        assert_eq!(vim.highlight_pattern().as_deref(), None);
+        // Searching again, even with `n`, turns it back on.
+        press(&mut vim, &mut buf, "n");
+        assert_eq!(vim.highlight_pattern().as_deref(), Some("foo"));
+    }
+
+    #[test]
     fn ex_commands_ask_the_app() {
         let (mut vim, mut buf) = (Vim::new(), Buffer::new("abc"));
         let send = |vim: &mut Vim, buf: &mut Buffer, keys: &str| {
@@ -1658,7 +2224,7 @@ cd", 0, "9$", 4,
     fn colon_leaves_visual_mode_and_esc_cancels_it() {
         let (mut vim, mut buf) = run("abc", 0, "v:");
         assert_eq!(vim.mode, Mode::Normal);
-        assert_eq!(vim.command_line(), Some((':', "")));
+        assert_eq!(vim.command_line(), Some((':', "'<,'>")));
         press(&mut vim, &mut buf, "q\x1bx");
         assert_eq!(buf.text(), "bc");
         // Not while an operator waits, where it isn't a motion.
@@ -1684,10 +2250,10 @@ cd", 0, "9$", 4,
             ("hello world", 3, "V\x02", "*hello world*", 1),
             ("a\nb\n\nc", 0, "Vjjj\x02", "*a\nb*\n\n*c*", 1),
             ("one two three", 0, "vee\x02", "*one two* three", 1),
-            // With no selection it is the word at the cursor, in normal mode and in insert mode.
-            ("one two", 5, "\x02", "one *two*", 6),
-            ("one two", 0, "\x02", "*one* two", 1),
-            ("a  b", 2, "\x02", "a  b", 2),
+            // With no selection it is the word at the cursor, in insert mode. (In normal mode
+            // Ctrl-b and Ctrl-u scroll.)
+            ("one two", 5, "i\x02\x1b", "one *two*", 5),
+            ("a  b", 2, "i\x02\x1b", "a  b", 1),
             ("one two", 3, "A\x02x\x1b", "one *two*x", 9),
             ("one two", 0, "i\x02x\x1b", "*xone* two", 1),
         ] {

@@ -2,7 +2,7 @@ use crate::rects::Rects;
 use crate::typeset::{self, FONT_SIZE, LINE_HEIGHT};
 use book_writing_app::display::Display;
 use book_writing_app::editor::View;
-use book_writing_app::ui::{Align, Bounds, Chrome, Label};
+use book_writing_app::ui::{Align, Bounds, Chrome, Label, Theme};
 use cosmic_text::fontdb;
 use glyphon::{
     Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, Style,
@@ -38,6 +38,7 @@ pub struct Frame<'a, 'v> {
     pub scroll: f32,
     /// The toolbar, status bar, and other parts of the window around the editor.
     pub chrome: &'a Chrome,
+    pub theme: &'static Theme,
 }
 
 /// Format of the offscreen frame. sRGB, so a color drawn here matches one drawn to a window.
@@ -58,8 +59,10 @@ pub struct Gpu {
     buffer: Buffer,
     /// Shaped interface text, by text, size, and weight.
     labels: HashMap<LabelKey, Buffer>,
-    /// The display version and column width of the text `buffer` holds.
-    shown: Option<(u64, u32)>,
+    /// The display version, column width and theme of the text `buffer` holds.
+    shown: Option<(u64, u32, bool)>,
+    /// Where each wrapped row of the text in `buffer` starts, as displayed offsets.
+    pub rows: Vec<usize>,
     /// Where the text's top left corner was drawn, for turning clicks into text positions.
     origin: (f32, f32),
 }
@@ -237,6 +240,7 @@ impl Gpu {
             buffer,
             labels: HashMap::new(),
             shown: None,
+            rows: Vec::new(),
             origin: (0.0, 0.0),
         }
     }
@@ -257,11 +261,12 @@ impl Gpu {
 
     /// Lays out the view's text in a column centered in an editor `width` wide. Only shapes again
     /// if the text or the width changed. Returns the margin to the left of the column.
-    fn sync(&mut self, view: &View<'_>, width: f32) -> f32 {
+    fn sync(&mut self, view: &View<'_>, width: f32, theme: &Theme) -> f32 {
         let margin = ((width - COLUMN_WIDTH) / 2.0).max(MIN_MARGIN);
         let column = (width - 2.0 * margin).max(1.0);
-        let key = (view.version, column as u32);
-        if self.shown != Some(key) {
+        let key = (view.version, column as u32, theme.dark);
+        let reshaped = self.shown != Some(key);
+        if reshaped {
             // No height, so every line is laid out and the caret can be found wherever it is.
             self.buffer.set_size(Some(column), None);
             let display = view.display;
@@ -269,7 +274,7 @@ impl Gpu {
                 display.spans.iter().map(|span| {
                     (
                         &display.text[span.range.clone()],
-                        typeset::attrs(&span.format, span.faint),
+                        typeset::attrs(&span.format, span.faint, theme),
                     )
                 }),
                 &Attrs::new().family(Family::Serif),
@@ -279,19 +284,27 @@ impl Gpu {
             self.shown = Some(key);
         }
         self.buffer.shape_until_scroll(&mut self.fonts, false);
+        if reshaped {
+            self.rows.clear();
+            self.rows.extend(self.buffer.layout_runs().map(|run| {
+                let index = run.glyphs.first().map_or(0, |g| g.start);
+                view.display.offset(run.line_i, index)
+            }));
+        }
         margin
     }
 
     /// Lays out the text for an editor `editor` big and says how tall it is and where the caret
     /// is, so the caller can decide how far to scroll.
-    pub fn layout(&mut self, view: &View<'_>, editor: Bounds) -> Layout {
-        let margin = self.sync(view, editor.w);
+    pub fn layout(&mut self, view: &View<'_>, editor: Bounds, theme: &Theme) -> Layout {
+        let margin = self.sync(view, editor.w, theme);
         let caret = typeset::caret_and_selection(
             &self.buffer,
             view,
             (margin, 0.0),
             &mut Vec::new(),
             &mut Vec::new(),
+            theme,
         );
         Layout {
             content_height: typeset::text_height(&self.buffer) + 2.0 * TOP_MARGIN,
@@ -309,7 +322,7 @@ impl Gpu {
         let editor = frame.editor;
         let (mut left, mut top) = (0.0, 0.0);
         if let Some(view) = frame.view {
-            let margin = self.sync(view, editor.w);
+            let margin = self.sync(view, editor.w, frame.theme);
             (left, top) = (editor.x + margin, editor.y + TOP_MARGIN - frame.scroll);
             self.origin = (left, top);
         }
@@ -333,7 +346,7 @@ impl Gpu {
                     right: (editor.x + editor.w) as i32,
                     bottom: (editor.y + editor.h) as i32,
                 },
-                default_color: typeset::TEXT,
+                default_color: typeset::text_color(frame.theme),
                 custom_glyphs: &[],
             });
         }
@@ -367,8 +380,31 @@ impl Gpu {
         let mut under = Vec::new();
         let mut over = Vec::new();
         if let Some(view) = frame.view {
-            over = typeset::decorations(&self.buffer, left, top);
-            typeset::caret_and_selection(&self.buffer, view, self.origin, &mut under, &mut over);
+            over = typeset::decorations(&self.buffer, left, top, frame.theme);
+            typeset::caret_and_selection(
+                &self.buffer,
+                view,
+                self.origin,
+                &mut under,
+                &mut over,
+                frame.theme,
+            );
+        }
+        // A thin thumb at the editor's right edge shows how far through the text the view is.
+        if frame.view.is_some() {
+            let content = typeset::text_height(&self.buffer) + 2.0 * TOP_MARGIN;
+            if content > editor.h {
+                let thumb = (editor.h * editor.h / content).max(24.0);
+                let range = (content - editor.h).max(1.0);
+                let [r, g, b, _] = frame.theme.muted;
+                over.push(book_writing_app::ui::Rect {
+                    x: editor.x + editor.w - 8.0,
+                    y: editor.y + (frame.scroll / range).clamp(0.0, 1.0) * (editor.h - thumb),
+                    w: 4.0,
+                    h: thumb,
+                    color: [r, g, b, 0x70],
+                });
+            }
         }
         let mut encoder = self.device.create_command_encoder(&Default::default());
         {
@@ -379,9 +415,9 @@ impl Gpu {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.96,
-                            g: 0.94,
-                            b: 0.88,
+                            r: frame.theme.page[0],
+                            g: frame.theme.page[1],
+                            b: frame.theme.page[2],
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,

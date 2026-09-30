@@ -10,8 +10,8 @@ use book_writing_app::input;
 use book_writing_app::recent::Recent;
 use book_writing_app::scroll::Scroll;
 use book_writing_app::toolbar::{self, Click};
-use book_writing_app::ui::Bounds;
-use book_writing_app::vim::{Key, Mode};
+use book_writing_app::ui::{BODY_ROW, Bounds};
+use book_writing_app::vim::{Key, Mode, ViewMove};
 use book_writing_app::watch::FileWatcher;
 use gpu::{Frame, Gpu, Layout, WindowGpu};
 use std::path::PathBuf;
@@ -47,6 +47,10 @@ struct Shell {
     /// The display version and cursor of the last frame, to scroll to the caret when they change.
     seen: Option<(u64, usize)>,
     last_frame: Instant,
+    /// Where to put the cursor's line in the view, once the next frame has laid it out.
+    align: Option<ViewMove>,
+    /// The count of files opened as of the last frame, to start at the top of a new one.
+    opened: u64,
     /// The system clipboard, kept for as long as the app runs because on some systems the text
     /// on it lives only while its owner does. `None` where there is no clipboard.
     clipboard: Option<arboard::Clipboard>,
@@ -77,21 +81,40 @@ impl Shell {
             return;
         };
         let chrome = self.app.chrome(size);
+        let theme = self.app.theme();
         if self.app.screen != Screen::Editing {
             gpu.draw(&Frame {
                 view: None,
                 editor: Bounds::default(),
                 scroll: 0.0,
                 chrome: &chrome,
+                theme,
             });
             return;
         }
+        if self.opened != self.app.opened {
+            self.opened = self.app.opened;
+            self.scroll = Scroll::default();
+            self.seen = None;
+        }
         let regions = self.app.regions(size);
         let view = self.app.editor.view();
-        self.layout = gpu.gpu.layout(&view, regions.editor);
+        self.layout = gpu.gpu.layout(&view, regions.editor, theme);
         let seen = (view.version, view.cursor);
         let viewport = regions.editor.h;
-        if self.seen != Some(seen) {
+        if let Some(by) = self.align.take() {
+            if let Some((top, bottom)) = self.layout.caret {
+                let position = match by {
+                    ViewMove::Top => top - PADDING,
+                    ViewMove::Bottom => bottom + PADDING - viewport,
+                    _ => (top + bottom - viewport) / 2.0,
+                };
+                self.scroll
+                    .to(position, self.layout.content_height, viewport);
+            }
+            // The view was put where it should be, so don't move it to the cursor as well.
+            self.seen = Some(seen);
+        } else if self.seen != Some(seen) {
             self.seen = Some(seen);
             if let Some((top, bottom)) = self.layout.caret {
                 let content = self.layout.content_height;
@@ -109,7 +132,10 @@ impl Shell {
             editor: regions.editor,
             scroll: self.scroll.offset(),
             chrome: &chrome,
+            theme,
         });
+        // Up and down follow the rows this frame wrapped the text into.
+        self.app.editor.set_rows(&gpu.gpu.rows);
         if moving {
             window.request_redraw();
         }
@@ -128,8 +154,6 @@ impl Shell {
                         .pick_file();
                     if let Some(file) = file {
                         self.app.open_file(&file);
-                        self.scroll = Scroll::default();
-                        self.seen = None;
                     }
                 }
                 Effect::PickExport(kind) => {
@@ -165,6 +189,13 @@ impl Shell {
                         .unwrap_or_default();
                     self.app.clipboard_text(purpose, text);
                 }
+                Effect::ScrollRows(rows) => {
+                    let viewport = self.app.regions(self.size()).editor.h;
+                    self.scroll
+                        .by(rows as f32 * BODY_ROW, self.layout.content_height, viewport);
+                }
+                // The cursor may have moved, so wait for the next layout to know where it is.
+                Effect::Align(by) => self.align = Some(by),
                 Effect::PickFolder => {
                     if let Some(folder) = rfd::FileDialog::new()
                         .set_title("Open a folder")
@@ -284,8 +315,9 @@ impl ApplicationHandler<UserEvent> for Shell {
             });
         }
         let modified = self.app.editor.buf.is_modified();
+        let tip = self.app.tip_shown;
         self.app.tick(Instant::now());
-        if modified != self.app.editor.buf.is_modified() {
+        if modified != self.app.editor.buf.is_modified() || tip != self.app.tip_shown {
             self.request_redraw();
         }
         event_loop.set_control_flow(match self.app.next_wake() {
@@ -355,6 +387,7 @@ fn main() {
         _ => Config::default(),
     };
     config.auto_save |= args.autosave;
+    config.dark |= args.dark;
     app.set_config(config, config_path.filter(|_| !screenshot));
     app.tree_visible = args.tree;
     if let Some(folder) = &args.folder {
@@ -399,14 +432,20 @@ fn main() {
                 .iter()
                 .find(|b| b.click == Click::Open(menu))
                 .map_or_else(Default::default, |b| b.bounds);
-            app.popup = Some(toolbar::popup(menu, anchor, size));
+            app.open_menu(menu, anchor, size);
+        }
+        if let Some(label) = &args.hover {
+            let toolbar = toolbar::toolbar(regions.toolbar);
+            app.hover = toolbar.buttons.iter().position(|b| &b.label == label);
+            app.tip_shown = true;
         }
         let chrome = app.chrome(size);
+        let theme = app.theme();
         let mut gpu = Gpu::headless();
         let pixels = if app.screen == Screen::Editing {
             let view = app.editor.view();
             // Scroll to the caret as the window would, but arrive at once.
-            let layout = gpu.layout(&view, regions.editor);
+            let layout = gpu.layout(&view, regions.editor, theme);
             let mut scroll = Scroll::default();
             if let Some((top, bottom)) = layout.caret {
                 let content = layout.content_height;
@@ -421,6 +460,7 @@ fn main() {
                     editor: regions.editor,
                     scroll: scroll.offset(),
                     chrome: &chrome,
+                    theme,
                 },
             )
         } else {
@@ -432,6 +472,7 @@ fn main() {
                     editor: Bounds::default(),
                     scroll: 0.0,
                     chrome: &chrome,
+                    theme,
                 },
             )
         };
@@ -454,6 +495,8 @@ fn main() {
             layout: Layout::default(),
             seen: None,
             last_frame: Instant::now(),
+            align: None,
+            opened: 0,
             clipboard: arboard::Clipboard::new().ok(),
             proxy,
             watching: None,

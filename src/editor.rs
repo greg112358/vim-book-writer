@@ -8,10 +8,15 @@ use crate::format::{
     uppercase,
 };
 use crate::motion::{word_back, word_end};
-use crate::vim::{Command, Key, Mode, Vim};
+use crate::outline::{self, Heading};
+use crate::ui::Spot;
+use crate::vim::{Command, Key, Mode, ViewMove, Vim};
 use std::io;
 use std::ops::Range;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_VERSION: AtomicU64 = AtomicU64::new(1);
 
 /// What the window needs to draw a frame.
 pub struct View<'a> {
@@ -23,6 +28,17 @@ pub struct View<'a> {
     pub cursor: usize,
     /// The visual selection, as offsets in `display.text`.
     pub selection: Option<Range<usize>>,
+    /// Where the searched-for text is, as offsets in `display.text`, in order.
+    pub found: &'a [Range<usize>],
+}
+
+/// What the window shows while a `:s` is being typed: the text with it done.
+#[derive(Debug)]
+struct Preview {
+    display: Display,
+    version: u64,
+    cursor: usize,
+    found: Vec<Range<usize>>,
 }
 
 /// The document being edited: its text and cursor, the vim state, and the file behind it.
@@ -34,10 +50,28 @@ pub struct Editor {
     /// What the screen shows, and the buffer revision and mode it was made for.
     display: Display,
     display_key: Option<(u64, bool)>,
-    /// Counts the times `display` was rebuilt, so a renderer can tell when it changed.
+    /// Differs from every earlier version, of any editor, whenever `display` is rebuilt, so a
+    /// renderer can tell when it changed.
     display_version: u64,
     /// The word count and the buffer revision it was counted at.
     words: Option<(u64, usize)>,
+    /// `spot` for the buffer revision, cursor and selection it was worked out at.
+    spot: Option<((u64, usize, usize, usize), Spot)>,
+    /// The `display_key` that `buf.rows` were laid out for.
+    rows_key: Option<(u64, bool)>,
+    /// A scroll the last key asked for, for the app to carry out.
+    pub scroll: Option<ViewMove>,
+    /// `:help` was typed, for the app to show the list of keys.
+    pub help: bool,
+    /// Where the highlighted search text is in `display`, and the display version and pattern
+    /// that was worked out for.
+    found: Vec<Range<usize>>,
+    found_for: (u64, String),
+    /// The text a `:s` being typed would make, and the revision and command it was made for.
+    preview: Option<Preview>,
+    preview_for: (u64, String),
+    /// The headings, and the buffer revision they were read at.
+    headings: Option<(u64, Vec<Heading>)>,
 }
 
 impl Editor {
@@ -51,6 +85,15 @@ impl Editor {
             display_key: None,
             display_version: 0,
             words: None,
+            spot: None,
+            rows_key: None,
+            scroll: None,
+            help: false,
+            found: Vec::new(),
+            found_for: (0, String::new()),
+            preview: None,
+            preview_for: (0, String::new()),
+            headings: None,
         };
         // A file that starts with hidden syntax, like `# `, opens with the cursor on the text.
         editor.snap_cursor(0, Key::Esc);
@@ -68,6 +111,76 @@ impl Editor {
                 words
             }
         }
+    }
+
+    /// The word the cursor is on, or how many words are selected. Worked out again only when the
+    /// text, cursor or selection moves.
+    pub fn spot(&mut self) -> Spot {
+        let (cursor, selection) = (self.buf.cursor(), self.vim.selection(&self.buf));
+        let (from, to) = selection
+            .as_ref()
+            .map_or((0, usize::MAX), |r| (r.start, r.end));
+        let key = (self.buf.revision(), cursor, from, to);
+        if let Some((at, spot)) = &self.spot
+            && *at == key
+        {
+            return *spot;
+        }
+        let text = self.buf.text();
+        let spot = match &selection {
+            Some(range) => Spot::Selected(text[range.clone()].split_whitespace().count()),
+            None => {
+                // Up to and including the char under the cursor, so a cursor on a word's first
+                // letter is on that word and one in the blanks after it is still on it.
+                let end = cursor + text[cursor..].chars().next().map_or(0, char::len_utf8);
+                Spot::Word(text[..end].split_whitespace().count())
+            }
+        };
+        self.spot = Some((key, spot));
+        spot
+    }
+
+    /// The headings of the text, read again only when it has changed.
+    pub fn headings(&mut self) -> &[Heading] {
+        let revision = self.buf.revision();
+        match &mut self.headings {
+            Some((at, _)) if *at == revision => {}
+            slot => *slot = Some((revision, outline::headings(self.buf.text()))),
+        }
+        &self.headings.as_ref().unwrap().1
+    }
+
+    /// The font family of the selection, or of the text under the cursor: `None` if the selection
+    /// holds more than one. Text with no family of its own is in the body font, `Serif`.
+    pub fn current_font(&mut self) -> Option<String> {
+        let cursor = self.buf.cursor();
+        let selection = self.vim.selection(&self.buf);
+        let (display, _) = self.display();
+        let families = |range: Range<usize>| -> Vec<Option<&str>> {
+            let mut found: Vec<Option<&str>> = display
+                .spans
+                .iter()
+                .filter(|s| !s.faint && s.source.start < range.end && s.source.end > range.start)
+                .map(|s| s.format.style.family.as_deref())
+                .collect();
+            found.dedup();
+            found
+        };
+        // With no selection, the char under the cursor, or the one before it at the end.
+        let mut found = families(selection.unwrap_or(cursor..cursor + 1));
+        if found.is_empty() {
+            found = families(cursor.saturating_sub(1)..cursor);
+        }
+        match found.as_slice() {
+            [family] => Some(family.unwrap_or("Serif").to_string()),
+            _ => None,
+        }
+    }
+
+    /// Puts the cursor at source offset `offset`, moved off any hidden syntax there.
+    pub fn goto(&mut self, offset: usize) {
+        self.buf.set_cursor(offset);
+        self.snap_cursor(0, Key::Esc);
     }
 
     /// The file being edited, if it has one.
@@ -103,21 +216,71 @@ impl Editor {
                 Display::normal(self.buf.text())
             };
             self.display_key = Some(key);
-            self.display_version += 1;
+            // Numbered across all editors, so the window never mistakes a newly opened file's
+            // display for the old one's.
+            self.display_version = NEXT_VERSION.fetch_add(1, Ordering::Relaxed);
         }
         (&self.display, self.display_version)
+    }
+
+    /// Tells the editor where the window wrapped the text it last drew, as displayed offsets of
+    /// where each row starts, so up and down move a row at a time.
+    pub fn set_rows(&mut self, rows: &[usize]) {
+        if self.rows_key == self.display_key {
+            return;
+        }
+        self.buf.rows.clear();
+        self.buf
+            .rows
+            .extend(rows.iter().map(|&at| self.display.to_source(at)));
+        self.rows_key = self.display_key;
+    }
+
+    /// Moves the cursor down or up `rows` rows, or as far as it can go: wrapped rows when the
+    /// window has laid the text out, else whole lines.
+    pub fn move_rows(&mut self, down: bool, rows: usize) {
+        let before = self.buf.cursor();
+        let inserting = self.vim.mode == Mode::Insert;
+        for _ in 0..rows {
+            let moved = if !self.buf.rows.is_empty() {
+                self.buf.move_row(down, inserting)
+            } else if down && self.buf.line_end() + 1 < self.buf.text().len() {
+                self.buf.move_down();
+                true
+            } else if !down && self.buf.line_start() > 0 {
+                self.buf.move_up();
+                true
+            } else {
+                false
+            };
+            if !moved {
+                break;
+            }
+        }
+        if !inserting {
+            self.buf.clamp_to_char();
+            self.snap_cursor(before, Key::Char(if down { 'j' } else { 'k' }));
+        }
     }
 
     /// Feeds a key to the vim engine and carries out what it asks for. True means the app
     /// should quit.
     pub fn key(&mut self, key: Key) -> bool {
+        // Rows laid out for other text, or the other mode's display, say nothing about this one.
+        if self.rows_key.is_some()
+            && self.rows_key != Some((self.buf.revision(), self.vim.mode == Mode::Insert))
+        {
+            self.buf.rows.clear();
+            self.rows_key = None;
+        }
         // Shortcuts work in every mode, and do what the toolbar buttons do.
         match key {
             Key::Ctrl('s') => {
                 self.save();
                 return false;
             }
-            Key::Ctrl(c @ ('b' | 'i' | 'u')) => {
+            // In normal mode Ctrl-b and Ctrl-u scroll instead.
+            Key::Ctrl(c @ ('b' | 'i' | 'u')) if c == 'i' || self.vim.mode != Mode::Normal => {
                 self.apply(&match c {
                     'b' => Action::Bold,
                     'i' => Action::Italic,
@@ -139,6 +302,14 @@ impl Editor {
                 false
             }
             Some(Command::Quit | Command::ForceQuit) => true,
+            Some(Command::Help) => {
+                self.help = true;
+                false
+            }
+            Some(Command::Scroll(by)) => {
+                self.scroll = Some(by);
+                false
+            }
             None => false,
         };
         self.snap_cursor(before, key);
@@ -199,13 +370,72 @@ impl Editor {
         let cursor = self.buf.cursor();
         let selection = self.vim.selection(&self.buf);
         let mode = self.vim.mode;
-        let (display, version) = self.display();
+        let version = self.display().1;
+        // A `:s` being typed shows the text it would make, replacements lit, until Enter.
+        let revision = self.buf.revision();
+        match self.vim.command_line() {
+            Some((':', typed)) => {
+                if self.preview_for.0 != revision || self.preview_for.1 != typed {
+                    self.preview_for = (revision, typed.to_string());
+                    self.preview = self.vim.preview_substitute(&self.buf, typed).map(|made| {
+                        let display = Display::normal(&made.text);
+                        let found = made
+                            .changes
+                            .iter()
+                            .map(|(_, new)| {
+                                display.to_display(new.start)..display.to_display(new.end)
+                            })
+                            .filter(|range| !range.is_empty())
+                            .collect();
+                        Preview {
+                            cursor: display.to_display(made.map_cursor(cursor)),
+                            found,
+                            version: NEXT_VERSION.fetch_add(1, Ordering::Relaxed),
+                            display,
+                        }
+                    });
+                }
+            }
+            _ => {
+                self.preview = None;
+                self.preview_for.1.clear();
+            }
+        }
+        if let Some(preview) = &self.preview {
+            return View {
+                display: &preview.display,
+                version: preview.version,
+                mode,
+                cursor: preview.cursor,
+                selection: None,
+                found: &preview.found,
+            };
+        }
+        let display = &self.display;
+        let pattern = self.vim.highlight_pattern();
+        let pattern = pattern.as_deref().unwrap_or("");
+        if self.found_for.0 != version || self.found_for.1 != pattern {
+            self.found_for.0 = version;
+            self.found_for.1.clear();
+            self.found_for.1.push_str(pattern);
+            self.found.clear();
+            if !pattern.is_empty() {
+                // A few thousand is more than anyone looks at, and keeps a one-letter search cheap.
+                for (at, found) in self.buf.text().match_indices(pattern).take(20_000) {
+                    let range = display.to_display(at)..display.to_display(at + found.len());
+                    if !range.is_empty() {
+                        self.found.push(range);
+                    }
+                }
+            }
+        }
         View {
             display,
             version,
             mode,
             cursor: display.to_display(cursor),
             selection: selection.map(|r| display.to_display(r.start)..display.to_display(r.end)),
+            found: &self.found,
         }
     }
 
@@ -559,6 +789,119 @@ mod tests {
     }
 
     #[test]
+    fn a_new_editor_never_shares_a_display_version_with_an_old_one() {
+        let (mut a, mut b) = (Editor::default(), Editor::default());
+        assert_ne!(a.display().1, b.display().1);
+    }
+
+    #[test]
+    fn the_view_lists_where_the_search_text_is_in_display_offsets() {
+        let mut editor = Editor::default();
+        type_keys(&mut editor, "ia **foo** b foo\x1b/foo\n");
+        // The `**` is hidden, so the first match is at 2, not 4.
+        assert_eq!(editor.view().found, [2..5, 8..11]);
+        type_keys(&mut editor, ":noh\n");
+        assert!(editor.view().found.is_empty());
+    }
+
+    #[test]
+    fn the_current_font_is_the_one_at_the_cursor_or_shared_by_the_selection() {
+        let mut editor = Editor::default();
+        type_keys(&mut editor, "ione two three\x1b0w");
+        assert_eq!(editor.current_font().as_deref(), Some("Serif"));
+        editor.apply(&Action::FontFamily("Georgia".into()));
+        assert_eq!(editor.current_font().as_deref(), Some("Georgia"));
+        // On another word it is the body font again; across both it is none.
+        type_keys(&mut editor, "w");
+        assert_eq!(editor.current_font().as_deref(), Some("Serif"));
+        type_keys(&mut editor, "bvee");
+        assert_eq!(editor.current_font(), None);
+        type_keys(&mut editor, "\x1b0wve");
+        assert_eq!(editor.current_font().as_deref(), Some("Georgia"));
+    }
+
+    #[test]
+    fn a_substitute_being_typed_shows_its_result_in_the_view() {
+        let mut editor = Editor::default();
+        type_keys(&mut editor, "ione two one\x1b0");
+        // Nothing to show until there is a replacement, but the pattern is already lit.
+        type_keys(&mut editor, ":%s/one");
+        assert_eq!(editor.view().display.text, "one two one");
+        assert_eq!(editor.view().found, [0..3, 8..11]);
+        type_keys(&mut editor, "/uno/g");
+        let view = editor.view();
+        assert_eq!(view.display.text, "uno two uno");
+        assert_eq!(view.found, [0..3, 8..11]);
+        // The real text is untouched until Enter, and Esc drops the preview.
+        assert_eq!(editor.buf.text(), "one two one");
+        type_keys(&mut editor, "\x1b");
+        assert_eq!(editor.view().display.text, "one two one");
+        type_keys(&mut editor, ":%s/one/1/g\n");
+        assert_eq!(editor.buf.text(), "1 two 1");
+        assert_eq!(editor.view().display.text, "1 two 1");
+    }
+
+    #[test]
+    fn headings_are_kept_until_the_text_changes_and_goto_lands_on_the_title() {
+        let mut editor = Editor::default();
+        type_keys(&mut editor, "i# One\ntext\n## Two\x1b");
+        let found: Vec<(usize, String)> = editor
+            .headings()
+            .iter()
+            .map(|h| (h.level, h.title.clone()))
+            .collect();
+        assert_eq!(found, [(1, "One".to_string()), (2, "Two".to_string())]);
+        // In normal mode the `## ` is hidden, so the cursor rests on the T.
+        editor.goto(12);
+        assert_eq!(editor.buf.cursor(), 14);
+        editor.goto(0);
+        assert_eq!(editor.buf.cursor(), 2);
+        type_keys(&mut editor, "dd");
+        assert_eq!(editor.headings().len(), 1);
+    }
+
+    #[test]
+    fn spot_is_the_word_under_the_cursor_or_the_words_selected() {
+        let mut editor = Editor::default();
+        assert_eq!(editor.spot(), Spot::Word(0));
+        type_keys(&mut editor, "ione two  three\x1b0");
+        assert_eq!(editor.spot(), Spot::Word(1));
+        type_keys(&mut editor, "w");
+        assert_eq!(editor.spot(), Spot::Word(2));
+        // In the blanks after a word it is still that word.
+        type_keys(&mut editor, "e");
+        type_keys(&mut editor, "l");
+        assert_eq!(editor.spot(), Spot::Word(2));
+        type_keys(&mut editor, "0v$");
+        assert_eq!(editor.spot(), Spot::Selected(3));
+        type_keys(&mut editor, "\x1bwv");
+        assert_eq!(editor.spot(), Spot::Selected(1));
+    }
+
+    #[test]
+    fn up_and_down_follow_the_rows_the_window_wrapped_the_text_into() {
+        let mut editor = Editor::default();
+        type_keys(&mut editor, "ione two three\nfour\x1b0");
+        // Before the window has laid anything out, whole lines.
+        type_keys(&mut editor, "j");
+        assert_eq!(editor.buf.cursor(), 14);
+        type_keys(&mut editor, "k");
+        // The window wrapped the first line after "two ".
+        editor.view();
+        editor.set_rows(&[0, 8, 14]);
+        type_keys(&mut editor, "j");
+        assert_eq!(editor.buf.cursor(), 8);
+        type_keys(&mut editor, "j");
+        assert_eq!(editor.buf.cursor(), 14);
+        // An operator still works on whole lines.
+        type_keys(&mut editor, "kdj");
+        assert_eq!(editor.buf.text(), "");
+        // Once the text changes, the old rows say nothing about it.
+        type_keys(&mut editor, "ione two three\x1b0");
+        assert!(editor.buf.rows.is_empty());
+    }
+
+    #[test]
     fn actions_format_the_selection_or_the_word_at_the_cursor() {
         let mut editor = Editor::default();
         type_keys(&mut editor, "ione two three\x1b0w");
@@ -632,25 +975,26 @@ mod tests {
         let path = temp_file("shortcuts", "one two three");
         let mut editor = Editor::open(&path).unwrap();
         let ctrl = |editor: &mut Editor, c: char| editor.key(Key::Ctrl(c));
-        // Ctrl+B on the word at the cursor, Ctrl+I over a visual selection.
-        type_keys(&mut editor, "w");
+        // Ctrl+B over a visual selection. (In normal mode Ctrl+B and Ctrl+U scroll.)
+        type_keys(&mut editor, "wviw");
         ctrl(&mut editor, 'b');
         assert_eq!(editor.buf.text(), "one *two* three");
         type_keys(&mut editor, "wve");
         ctrl(&mut editor, 'i');
         assert_eq!(editor.buf.text(), "one *two* _three_");
         assert_eq!(editor.vim.mode, Mode::Normal);
+        type_keys(&mut editor, "0viw");
         ctrl(&mut editor, 'u');
         assert_eq!(
             editor.buf.text(),
-            "one *two* _[three]{style=\"text-decoration:underline\"}_"
+            "[one]{style=\"text-decoration:underline\"} *two* _three_"
         );
         // While inserting, and Ctrl+S without leaving insert mode.
         type_keys(&mut editor, "A!");
         ctrl(&mut editor, 's');
         assert_eq!(editor.vim.mode, Mode::Insert);
         assert!(!editor.buf.is_modified());
-        assert!(std::fs::read_to_string(&path).unwrap().ends_with("}_!"));
+        assert!(std::fs::read_to_string(&path).unwrap().ends_with("_!"));
         std::fs::remove_file(&path).unwrap();
     }
 

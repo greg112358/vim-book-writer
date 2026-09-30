@@ -16,8 +16,10 @@ const USAGE: &str =
   --start             show the start screen
   --recent PATH       a file for the start screen's recent list, once for each (for screenshots)
   --popup MENU        show a toolbar menu open: color, font, or size
+  --dark              use the dark look, whatever the settings say
+  --hover LABEL       show the tip of the toolbar button labeled LABEL (B, Font, Save, ...)
   --keys KEYS         keys to press before the screenshot, after the mode is set: text as typed,
-                      plus <Esc> <CR> <BS> <Del> <Left> <Right> <Up> <Down> <C-x> and <lt>";
+                      plus <Esc> <CR> <BS> <Del> <Left> <Right> <Up> <Down> <F1> <C-x> and <lt>";
 
 /// What the command line asks for.
 #[derive(Debug, Clone, PartialEq)]
@@ -35,6 +37,10 @@ pub struct Args {
     pub folder: Option<PathBuf>,
     /// A toolbar menu to show open in a screenshot.
     pub popup: Option<Menu>,
+    /// Use the dark look, whatever the settings say.
+    pub dark: bool,
+    /// The label of a toolbar button to show the tip of in a screenshot.
+    pub hover: Option<String>,
     /// Show the start screen even with a file, for screenshots.
     pub start: bool,
     /// Turn auto-save on, whatever the settings say.
@@ -56,6 +62,8 @@ impl Default for Args {
             tree: false,
             folder: None,
             popup: None,
+            dark: false,
+            hover: None,
             start: false,
             autosave: false,
             export: None,
@@ -92,6 +100,8 @@ impl Args {
                 "--folder" => parsed.folder = Some(value("--folder")?.into()),
                 "--start" => parsed.start = true,
                 "--autosave" => parsed.autosave = true,
+                "--dark" => parsed.dark = true,
+                "--hover" => parsed.hover = Some(value("--hover")?),
                 "--export" => {
                     let path = PathBuf::from(value("--export")?);
                     match path.extension().and_then(|e| e.to_str()) {
@@ -151,6 +161,7 @@ pub fn parse_keys(notation: &str) -> Result<Vec<Key>, String> {
             "Right" => Key::Right,
             "Up" => Key::Up,
             "Down" => Key::Down,
+            "F1" => Key::Help,
             "lt" => Key::Char('<'),
             _ => match name
                 .strip_prefix("C-")

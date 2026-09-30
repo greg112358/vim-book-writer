@@ -4,9 +4,14 @@ use std::ops::Range;
 
 /// 0 for whitespace, 1 for word chars, 2 for punctuation. `w`, `b`, and `e` stop where it changes.
 fn class(c: char) -> u8 {
+    class_by(c, false)
+}
+
+/// Like `class`, but with `big` (for `W`, `B`, `E`) every non-blank char is one class.
+fn class_by(c: char, big: bool) -> u8 {
     if c.is_whitespace() {
         0
-    } else if c.is_alphanumeric() || c == '_' {
+    } else if big || c.is_alphanumeric() || c == '_' {
         1
     } else {
         2
@@ -47,13 +52,20 @@ pub fn nth_line_start(text: &str, n: usize) -> usize {
 
 /// `w`: the start of the next word. An empty line counts as a word.
 pub fn word_forward(text: &str, pos: usize) -> usize {
+    word_forward_by(text, pos, false)
+}
+
+pub fn word_forward_by(text: &str, pos: usize, big: bool) -> usize {
     let mut chars = text[pos..].char_indices().peekable();
     let Some(&(_, first)) = chars.peek() else {
         return text.len();
     };
-    let start_class = class(first);
+    let start_class = class_by(first, big);
     if start_class != 0 {
-        while chars.next_if(|&(_, c)| class(c) == start_class).is_some() {}
+        while chars
+            .next_if(|&(_, c)| class_by(c, big) == start_class)
+            .is_some()
+        {}
     }
     for (offset, c) in chars {
         let i = pos + offset;
@@ -70,13 +82,17 @@ pub fn word_forward(text: &str, pos: usize) -> usize {
 /// `b`: the start of this word if inside one, else of the previous word. An empty line counts
 /// as a word.
 pub fn word_back(text: &str, pos: usize) -> usize {
+    word_back_by(text, pos, false)
+}
+
+pub fn word_back_by(text: &str, pos: usize, big: bool) -> usize {
     let mut i = pos;
     let word_class = loop {
         let Some(c) = text[..i].chars().next_back() else {
             return 0;
         };
         if !c.is_whitespace() {
-            break class(c);
+            break class_by(c, big);
         }
         i -= c.len_utf8();
         if c == '\n' && (i == 0 || text.as_bytes()[i - 1] == b'\n') {
@@ -86,7 +102,7 @@ pub fn word_back(text: &str, pos: usize) -> usize {
     while let Some(c) = text[..i]
         .chars()
         .next_back()
-        .filter(|&c| class(c) == word_class)
+        .filter(|&c| class_by(c, big) == word_class)
     {
         i -= c.len_utf8();
     }
@@ -95,13 +111,17 @@ pub fn word_back(text: &str, pos: usize) -> usize {
 
 /// The last char of the run of same-class chars that holds `pos`.
 pub fn word_run_end(text: &str, pos: usize) -> usize {
+    word_run_end_by(text, pos, false)
+}
+
+pub fn word_run_end_by(text: &str, pos: usize, big: bool) -> usize {
     let Some(first) = text[pos..].chars().next() else {
         return pos;
     };
-    let run_class = class(first);
+    let run_class = class_by(first, big);
     let mut end = pos;
     for (offset, c) in text[pos..].char_indices() {
-        if class(c) != run_class {
+        if class_by(c, big) != run_class {
             break;
         }
         end = pos + offset;
@@ -112,6 +132,10 @@ pub fn word_run_end(text: &str, pos: usize) -> usize {
 /// `e`: the last char of this word, or if already there, of the next one. Stays put if there
 /// is no next word.
 pub fn word_end(text: &str, pos: usize) -> usize {
+    word_end_by(text, pos, false)
+}
+
+pub fn word_end_by(text: &str, pos: usize, big: bool) -> usize {
     let mut chars = text[pos..]
         .char_indices()
         .skip(1)
@@ -119,15 +143,92 @@ pub fn word_end(text: &str, pos: usize) -> usize {
     let Some((offset, first)) = chars.next() else {
         return pos;
     };
-    let word_class = class(first);
+    let word_class = class_by(first, big);
     let mut end = pos + offset;
     for (offset, c) in chars {
-        if class(c) != word_class {
+        if class_by(c, big) != word_class {
             break;
         }
         end = pos + offset;
     }
     end
+}
+
+/// True if the line starting at `start` is empty or only blanks.
+fn blank_line(text: &str, start: usize) -> bool {
+    text[start..line_end(text, start)].trim().is_empty()
+}
+
+/// `}`: the start of the next blank line after the paragraph the cursor is in, or the end of the
+/// text if there is none.
+pub fn paragraph_forward(text: &str, pos: usize) -> usize {
+    let mut at = line_start(text, pos);
+    for want_blank in [false, true] {
+        while blank_line(text, at) != want_blank {
+            let end = line_end(text, at);
+            if end == text.len() {
+                return text.len();
+            }
+            at = end + 1;
+        }
+    }
+    at
+}
+
+/// `{`: the start of the blank line before the paragraph the cursor is in, or the start of the
+/// text if there is none.
+pub fn paragraph_back(text: &str, pos: usize) -> usize {
+    let mut at = line_start(text, pos);
+    for want_blank in [true, false] {
+        while at > 0 && blank_line(text, at) == want_blank {
+            at = line_start(text, at - 1);
+        }
+    }
+    at
+}
+
+/// `f`, `F`, `t`, `T`: where the `count`th `target` char is from `pos` on the same line, going
+/// `forward` or back. With `till` it is the char before it (after it, going back). `repeat` is
+/// for `;` and `,`, which skip a `till` match right beside the cursor instead of staying put.
+pub fn find_in_line(
+    text: &str,
+    pos: usize,
+    target: char,
+    forward: bool,
+    till: bool,
+    count: usize,
+    repeat: bool,
+) -> Option<usize> {
+    let skip_beside = till && repeat;
+    let mut left = count;
+    if forward {
+        let beside = pos + text[pos..].chars().next().map_or(0, char::len_utf8);
+        let line = &text[pos..line_end(text, pos)];
+        for (i, c) in line.char_indices().skip(1) {
+            let at = pos + i;
+            if c != target || (skip_beside && at == beside) {
+                continue;
+            }
+            left -= 1;
+            if left == 0 {
+                let before = text[..at].chars().next_back().map_or(0, char::len_utf8);
+                return Some(if till { at - before } else { at });
+            }
+        }
+    } else {
+        let start = line_start(text, pos);
+        for (i, c) in text[start..pos].char_indices().rev() {
+            let at = start + i;
+            if c != target || (skip_beside && at + c.len_utf8() == pos) {
+                continue;
+            }
+            left -= 1;
+            if left == 0 {
+                return Some(if till { at + c.len_utf8() } else { at });
+            }
+        }
+    }
+    None
 }
 
 /// A space or tab. Text objects treat these as the only blanks; a newline always ends the object.
@@ -338,6 +439,48 @@ mod tests {
                 pos
             })
             .collect()
+    }
+
+    #[test]
+    fn paragraphs_are_found_by_blank_lines() {
+        let text = "one\ntwo\n\n\nthree\n  \nfour";
+        // (from, `}`, `{`): a run of blank lines counts once, and `{` stops nearest the text.
+        for (from, forward, back) in [
+            (0, 8, 0),
+            (5, 8, 0),
+            (8, 16, 0),
+            (10, 16, 9),
+            (12, 16, 9),
+            (17, 23, 9),
+            (19, 23, 16),
+        ] {
+            assert_eq!(paragraph_forward(text, from), forward, "}} from {from}");
+            assert_eq!(paragraph_back(text, from), back, "{{ from {from}");
+        }
+    }
+
+    #[test]
+    fn big_words_only_stop_at_blanks() {
+        let text = "foo.bar baz-qux  end";
+        assert_eq!(word_forward_by(text, 0, true), 8);
+        assert_eq!(word_forward(text, 0), 3);
+        assert_eq!(word_end_by(text, 0, true), 6);
+        assert_eq!(word_back_by(text, 12, true), 8);
+    }
+
+    #[test]
+    fn find_stops_on_the_line_and_till_stays_beside() {
+        let text = "a,b,c,d\nx,y";
+        assert_eq!(find_in_line(text, 0, ',', true, false, 1, false), Some(1));
+        assert_eq!(find_in_line(text, 0, ',', true, false, 3, false), Some(5));
+        assert_eq!(find_in_line(text, 0, ',', true, false, 4, false), None);
+        assert_eq!(find_in_line(text, 0, ',', true, true, 2, false), Some(2));
+        assert_eq!(find_in_line(text, 6, ',', false, false, 1, false), Some(5));
+        assert_eq!(find_in_line(text, 6, ',', false, true, 1, false), Some(6));
+        // `;` after `t,` from just before a comma jumps on to the next one.
+        assert_eq!(find_in_line(text, 0, ',', true, true, 1, false), Some(0));
+        assert_eq!(find_in_line(text, 0, ',', true, true, 1, true), Some(2));
+        assert_eq!(find_in_line("é,é", 0, ',', true, false, 1, false), Some(2));
     }
 
     #[test]

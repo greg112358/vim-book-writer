@@ -8,6 +8,9 @@ pub struct Buffer {
     cursor: usize,
     /// Column (in chars) that up/down aim for, so a short line doesn't lose the column.
     goal_col: Option<usize>,
+    /// Where each row of the window's layout starts, ascending, once the window has wrapped the
+    /// text. Empty until then, and whenever the text has changed since.
+    pub rows: Vec<usize>,
     undo: Vec<Vec<Edit>>,
     redo: Vec<Vec<Edit>>,
     /// Open `begin_group` calls. While above zero, edits join one undo step.
@@ -241,6 +244,42 @@ impl Buffer {
         self.move_to_line(end + 1, next_end);
     }
 
+    /// Moves to the wrapped row above or below at the goal column, so a long paragraph is many
+    /// rows. False if there is no such row, or none are known. Only inserting can go to the empty
+    /// line after a final newline.
+    pub fn move_row(&mut self, down: bool, inserting: bool) -> bool {
+        let at = self.cursor;
+        let i = self.rows.partition_point(|&s| s <= at).saturating_sub(1);
+        let Some(&start) = self.rows.get(i) else {
+            return false;
+        };
+        let j = if down { i + 1 } else { i.wrapping_sub(1) };
+        let Some(&to) = self.rows.get(j) else {
+            return false;
+        };
+        let text = &self.text;
+        if !inserting && to == text.len() && to > 0 && text.ends_with('\n') {
+            return false;
+        }
+        let end = self.rows.get(j + 1).copied().unwrap_or(text.len());
+        let (row, line_end) = match text[to..end].strip_suffix('\n') {
+            Some(row) => (row, true),
+            None => (&text[to..end], end == text.len()),
+        };
+        // A wrapped row ends in the blank it wrapped at, which the cursor stays off.
+        let last = row.chars().count().saturating_sub(usize::from(!line_end));
+        let col = self
+            .goal_col
+            .unwrap_or_else(|| text[start.min(at)..at].chars().count());
+        self.cursor = to
+            + row
+                .char_indices()
+                .nth(col.min(last))
+                .map_or(row.len(), |(k, _)| k);
+        self.goal_col = Some(col);
+        true
+    }
+
     fn move_to_line(&mut self, start: usize, end: usize) {
         let col = self
             .goal_col
@@ -280,6 +319,37 @@ mod tests {
         buf.move_right();
         buf.move_down();
         assert_eq!((buf.text(), buf.cursor()), ("ab", 2));
+    }
+
+    #[test]
+    fn rows_move_by_wrapped_row_and_keep_the_column() {
+        // "aaaa bbbb cc" wraps after each blank, and a second line follows.
+        let mut buf = Buffer::new("aaaa bbbb cc\nxy\n");
+        buf.rows = vec![0, 5, 10, 13, 16];
+        buf.set_cursor(2);
+        assert!(buf.move_row(true, false));
+        assert_eq!(buf.cursor(), 7);
+        assert!(buf.move_row(true, false));
+        // The last row is shorter than the column: the cursor goes to its end.
+        assert_eq!(buf.cursor(), 12);
+        assert!(buf.move_row(true, false));
+        assert_eq!(buf.cursor(), 15);
+        // The empty line after the final newline is for inserting only.
+        assert!(!buf.move_row(true, false));
+        assert!(buf.move_row(true, true));
+        assert_eq!(buf.cursor(), 16);
+        assert!(!buf.move_row(true, true));
+        buf.set_cursor(7);
+        assert!(buf.move_row(false, false));
+        assert_eq!(buf.cursor(), 2);
+        assert!(!buf.move_row(false, false));
+        // Up from past the end of a wrapped row stops on its last blank, not in the next row.
+        buf.set_cursor(9);
+        assert!(buf.move_row(false, false));
+        assert_eq!(buf.cursor(), 4);
+        // Nothing to go by: the caller falls back to whole lines.
+        buf.rows.clear();
+        assert!(!buf.move_row(true, false));
     }
 
     #[test]
