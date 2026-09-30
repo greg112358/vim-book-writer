@@ -12,19 +12,26 @@ use book_writing_app::scroll::Scroll;
 use book_writing_app::toolbar::{self, Click};
 use book_writing_app::ui::Bounds;
 use book_writing_app::vim::{Key, Mode};
+use book_writing_app::watch::FileWatcher;
 use gpu::{Frame, Gpu, Layout, WindowGpu};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::ModifiersState;
 use winit::window::{Window, WindowId};
 
 /// How much of the text to keep in view around the caret, and how far one wheel notch scrolls.
 const PADDING: f32 = 54.0;
 const WHEEL_NOTCH: f32 = 81.0;
+
+/// Something that happened outside the window, for the event loop to hear about.
+enum UserEvent {
+    /// The open file may have changed on disk.
+    FileChanged,
+}
 
 /// The window and everything that draws to it, around the app that decides what to draw.
 struct Shell {
@@ -40,6 +47,12 @@ struct Shell {
     /// The display version and cursor of the last frame, to scroll to the caret when they change.
     seen: Option<(u64, usize)>,
     last_frame: Instant,
+    /// The system clipboard, kept for as long as the app runs because on some systems the text
+    /// on it lives only while its owner does. `None` where there is no clipboard.
+    clipboard: Option<arboard::Clipboard>,
+    proxy: EventLoopProxy<UserEvent>,
+    /// The file being watched for changes from outside, and the watch.
+    watching: Option<(PathBuf, FileWatcher)>,
 }
 
 impl Shell {
@@ -139,6 +152,19 @@ impl Shell {
                         self.app.export_to(kind, &file);
                     }
                 }
+                Effect::SetClipboard(text) => {
+                    if let Some(clipboard) = &mut self.clipboard {
+                        let _ = clipboard.set_text(text);
+                    }
+                }
+                Effect::ReadClipboard(purpose) => {
+                    let text = self
+                        .clipboard
+                        .as_mut()
+                        .and_then(|clipboard| clipboard.get_text().ok())
+                        .unwrap_or_default();
+                    self.app.clipboard_text(purpose, text);
+                }
                 Effect::PickFolder => {
                     if let Some(folder) = rfd::FileDialog::new()
                         .set_title("Open a folder")
@@ -153,7 +179,7 @@ impl Shell {
     }
 }
 
-impl ApplicationHandler for Shell {
+impl ApplicationHandler<UserEvent> for Shell {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let attributes = Window::default_attributes().with_title("Book Writing App");
         let window = Arc::new(
@@ -228,9 +254,35 @@ impl ApplicationHandler for Shell {
         }
     }
 
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
+        match event {
+            UserEvent::FileChanged => {
+                if self.app.file_changed_on_disk() {
+                    self.request_redraw();
+                }
+            }
+        }
+    }
+
     /// After a batch of events, and when auto-save's wait is over: save if it is time, and sleep
     /// until the next time it could be.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Watch whichever file is open now.
+        let open = self
+            .app
+            .editor
+            .path()
+            .and_then(|path| std::fs::canonicalize(path).ok());
+        if self.watching.as_ref().map(|(path, _)| path) != open.as_ref() {
+            self.watching = open.and_then(|path| {
+                let proxy = self.proxy.clone();
+                let watcher = FileWatcher::new(&path, move || {
+                    let _ = proxy.send_event(UserEvent::FileChanged);
+                })
+                .ok()?;
+                Some((path, watcher))
+            });
+        }
         let modified = self.app.editor.buf.is_modified();
         self.app.tick(Instant::now());
         if modified != self.app.editor.buf.is_modified() {
@@ -387,7 +439,10 @@ fn main() {
         return;
     }
 
-    let event_loop = EventLoop::new().expect("failed to create event loop");
+    let event_loop = EventLoop::<UserEvent>::with_user_event()
+        .build()
+        .expect("failed to create event loop");
+    let proxy = event_loop.create_proxy();
     event_loop
         .run_app(&mut Shell {
             window: None,
@@ -399,6 +454,9 @@ fn main() {
             layout: Layout::default(),
             seen: None,
             last_frame: Instant::now(),
+            clipboard: arboard::Clipboard::new().ok(),
+            proxy,
+            watching: None,
         })
         .expect("event loop failed");
 }

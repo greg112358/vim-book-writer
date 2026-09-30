@@ -55,15 +55,28 @@ pub enum ExportKind {
     Pdf,
 }
 
+/// What the text from the system clipboard is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipboardUse {
+    /// The `"+` register, which a vim command is waiting to read.
+    Register,
+    /// Ctrl+V.
+    Paste,
+}
+
 /// Something only the window can do, which the app asks for and the window then carries out and
 /// reports back with `open_file` or `open_folder`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
     Quit,
     PickFile,
     PickFolder,
     /// Ask where to put an export; the window then calls `export_to`.
     PickExport(ExportKind),
+    /// Put this text on the system clipboard.
+    SetClipboard(String),
+    /// Read the system clipboard; the window then calls `clipboard_text` with what it holds.
+    ReadClipboard(ClipboardUse),
 }
 
 /// Everything about the running app that isn't drawing: the screen, the editor, the recent files,
@@ -536,11 +549,66 @@ impl App {
             }
             return vec![Effect::PickFile];
         }
-        if self.editor.key(key) {
-            vec![Effect::Quit]
-        } else {
-            Vec::new()
+        // The clipboard shortcuts: copy and cut act on the visual selection, paste wants the text.
+        match key {
+            Key::Ctrl('c') => {
+                return self
+                    .editor
+                    .copy_selection()
+                    .map(Effect::SetClipboard)
+                    .into_iter()
+                    .collect();
+            }
+            Key::Ctrl('x') => {
+                return self
+                    .editor
+                    .cut_selection()
+                    .map(Effect::SetClipboard)
+                    .into_iter()
+                    .collect();
+            }
+            Key::Ctrl('v') => return vec![Effect::ReadClipboard(ClipboardUse::Paste)],
+            _ => {}
         }
+        let mut effects = Vec::new();
+        if self.editor.key(key) {
+            effects.push(Effect::Quit);
+        }
+        // Yanks go out to the clipboard, and `"+` and `"*` come in from it.
+        effects.extend(
+            self.editor
+                .vim
+                .take_clipboard_write()
+                .map(Effect::SetClipboard),
+        );
+        if self.editor.vim.wants_clipboard() {
+            effects.push(Effect::ReadClipboard(ClipboardUse::Register));
+        }
+        effects
+    }
+
+    /// Hands over what the system clipboard held, as asked for by `Effect::ReadClipboard`.
+    pub fn clipboard_text(&mut self, purpose: ClipboardUse, text: String) {
+        match purpose {
+            ClipboardUse::Register => self.editor.vim.set_clipboard_register(text),
+            ClipboardUse::Paste => self.editor.paste_text(&text),
+        }
+    }
+
+    /// Call when the open file may have changed on disk. With no unsaved changes it is read again;
+    /// with some, they are kept and the status bar says how to choose. True if anything showed.
+    pub fn file_changed_on_disk(&mut self) -> bool {
+        if self.screen != Screen::Editing || !self.editor.changed_on_disk() {
+            return false;
+        }
+        let name = self.editor.file_name();
+        if self.editor.buf.is_modified() {
+            self.message = format!("{name} changed on disk; :e! reloads it, :w overwrites it");
+        } else {
+            self.editor.reload();
+            self.message = format!("Reloaded {name}, which changed on disk");
+        }
+        true
     }
 
     /// The name to offer for an export: the document's own name with the new extension, in its
@@ -1288,5 +1356,81 @@ mod tests {
         for file in [path, markdown, pdf] {
             std::fs::remove_file(file).unwrap();
         }
+    }
+
+    #[test]
+    fn clipboard_shortcuts_and_registers_ask_the_window_to_move_text() {
+        let mut app = App::new(Editor::default(), Screen::Editing, Recent::default(), None);
+        press(&mut app, "ione two three\x1b0");
+        let key = |app: &mut App, key: Key| app.key(SIZE, key);
+        // Copy and cut work on the visual selection; with none, they do nothing.
+        assert_eq!(key(&mut app, Key::Ctrl('c')), []);
+        press(&mut app, "ve");
+        assert_eq!(
+            key(&mut app, Key::Ctrl('c')),
+            [Effect::SetClipboard("one".into())]
+        );
+        assert_eq!(app.editor.buf.text(), "one two three");
+        assert_eq!(
+            key(&mut app, Key::Ctrl('x')),
+            [Effect::SetClipboard("one".into())]
+        );
+        assert_eq!(app.editor.buf.text(), " two three");
+        // Paste asks for the text and then puts it in.
+        assert_eq!(
+            key(&mut app, Key::Ctrl('v')),
+            [Effect::ReadClipboard(ClipboardUse::Paste)]
+        );
+        app.clipboard_text(ClipboardUse::Paste, "ONE".into());
+        assert_eq!(app.editor.buf.text(), " ONEtwo three");
+        // A yank goes out on its own; "+ asks for the text before its command runs.
+        let effects = app.key(SIZE, Key::Char('y'));
+        assert!(effects.is_empty());
+        assert_eq!(
+            app.key(SIZE, Key::Char('y')),
+            [Effect::SetClipboard(" ONEtwo three\n".into())]
+        );
+        assert!(app.key(SIZE, Key::Char('"')).is_empty());
+        assert_eq!(
+            app.key(SIZE, Key::Char('+')),
+            [Effect::ReadClipboard(ClipboardUse::Register)]
+        );
+        app.clipboard_text(ClipboardUse::Register, "outside".into());
+        app.key(SIZE, Key::Char('p'));
+        assert!(
+            app.editor.buf.text().contains("outside"),
+            "{}",
+            app.editor.buf.text()
+        );
+    }
+
+    #[test]
+    fn a_change_on_disk_reloads_or_warns() {
+        let path = temp_file("changed", "first");
+        let mut app = App::new(
+            Editor::open(&path).unwrap(),
+            Screen::Editing,
+            Recent::default(),
+            None,
+        );
+        // Nothing changed, nothing to do; and our own save isn't a change.
+        assert!(!app.file_changed_on_disk());
+        press(&mut app, "x:w\n");
+        assert!(!app.file_changed_on_disk());
+        // Unmodified, it reloads and says so.
+        std::fs::write(&path, "second").unwrap();
+        assert!(app.file_changed_on_disk());
+        assert_eq!(app.editor.buf.text(), "second");
+        assert!(app.message.starts_with("Reloaded "), "{}", app.message);
+        assert!(!app.file_changed_on_disk());
+        // Modified, it keeps your work and says how to choose.
+        press(&mut app, "x");
+        std::fs::write(&path, "third").unwrap();
+        assert!(app.file_changed_on_disk());
+        assert_eq!(app.editor.buf.text(), "econd");
+        assert!(app.message.contains(":e! reloads it"), "{}", app.message);
+        press(&mut app, ":e!\n");
+        assert_eq!(app.editor.buf.text(), "third");
+        std::fs::remove_file(path).unwrap();
     }
 }

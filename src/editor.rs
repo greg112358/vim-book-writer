@@ -134,6 +134,10 @@ impl Editor {
                 false
             }
             Some(Command::SaveQuit) => self.save(),
+            Some(Command::Reload) => {
+                self.reload();
+                false
+            }
             Some(Command::Quit | Command::ForceQuit) => true,
             None => false,
         };
@@ -243,6 +247,87 @@ impl Editor {
             }
         }
         self.snap_cursor(self.buf.cursor(), Key::Esc);
+    }
+
+    /// Reads the file again, replacing the text. It is one edit, so undo brings back what was
+    /// there, and the buffer counts as saved. Does nothing without a file. On failure the status
+    /// line says why and the text stays.
+    pub fn reload(&mut self) {
+        let Some(path) = self.doc.path().map(Path::to_path_buf) else {
+            self.vim.message = "E32: No file name".into();
+            return;
+        };
+        match Document::open(&path) {
+            Ok(fresh) => {
+                let len = self.buf.text().len();
+                let cursor = self.buf.cursor();
+                self.buf.replace(0..len, fresh.text());
+                self.buf.mark_saved();
+                self.doc = fresh;
+                self.buf.set_cursor(cursor);
+                self.snap_cursor(cursor, Key::Esc);
+                self.buf.clamp_to_char();
+            }
+            Err(error) => self.vim.message = format!("E484: Can't read the file: {error}"),
+        }
+    }
+
+    /// True if the file on disk no longer holds what was last read or written.
+    pub fn changed_on_disk(&self) -> bool {
+        self.doc
+            .path()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .is_some_and(|disk| disk != self.doc.text())
+    }
+
+    /// The visual selection's text, for copying, or `None` outside visual mode.
+    pub fn copy_selection(&self) -> Option<String> {
+        let range = self.vim.selection(&self.buf)?;
+        Some(self.buf.text()[range].to_string())
+    }
+
+    /// Copies the visual selection's text and deletes it.
+    pub fn cut_selection(&mut self) -> Option<String> {
+        let text = self.copy_selection()?;
+        self.key(Key::Char('d'));
+        Some(text)
+    }
+
+    /// Puts `text` into the document: at the cursor while inserting, in place of the selection in
+    /// visual mode, and after the cursor's char otherwise, as `p` does. One undo step.
+    pub fn paste_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let insert = self.vim.mode == Mode::Insert;
+        if let Some(range) = self.vim.selection(&self.buf) {
+            self.buf.begin_group();
+            self.buf.replace(range.clone(), text);
+            self.buf.end_group();
+            self.key(Key::Esc);
+            self.buf.set_cursor(range.start + text.len());
+        } else if insert {
+            self.buf.insert(text);
+        } else {
+            let after = self.buf.text()[self.buf.cursor()..]
+                .chars()
+                .next()
+                .filter(|&c| c != '\n')
+                .map_or(0, char::len_utf8);
+            let at = self.buf.cursor() + after;
+            self.buf.replace(at..at, text);
+            // Like `p`: on the last char of a one-line paste, at the start of a longer one.
+            let last = text.chars().next_back().map_or(0, char::len_utf8);
+            self.buf.set_cursor(if text.contains('\n') {
+                at
+            } else {
+                at + text.len() - last
+            });
+        }
+        if !insert {
+            self.buf.clamp_to_char();
+            self.snap_cursor(self.buf.cursor(), Key::Esc);
+        }
     }
 
     /// Writes the text to its file. This is what the Save button and `:w` both do. On failure it
@@ -572,5 +657,68 @@ mod tests {
     #[test]
     fn opening_a_missing_file_is_an_error() {
         assert!(Editor::open(Path::new("/nonexistent/dir/book.dj")).is_err());
+    }
+
+    #[test]
+    fn reload_takes_the_files_text_and_can_be_undone() {
+        let path = temp_file("reload", "one two");
+        let mut editor = Editor::open(&path).unwrap();
+        type_keys(&mut editor, "wx");
+        assert!(editor.buf.is_modified() && !editor.changed_on_disk());
+        std::fs::write(&path, "new text on disk").unwrap();
+        assert!(editor.changed_on_disk());
+        assert!(!type_keys(&mut editor, ":e!\n"));
+        assert_eq!(editor.buf.text(), "new text on disk");
+        assert!(!editor.buf.is_modified() && !editor.changed_on_disk());
+        type_keys(&mut editor, "u");
+        assert_eq!(editor.buf.text(), "one wo");
+        // Our own saves are not changes from outside.
+        type_keys(&mut editor, ":w\n");
+        assert!(!editor.changed_on_disk());
+        // With no file, or a file that has gone, it says so and keeps the text.
+        let mut nameless = Editor::default();
+        type_keys(&mut nameless, "ihi\x1b:e!\n");
+        assert_eq!(nameless.vim.message, "E32: No file name");
+        std::fs::remove_file(&path).unwrap();
+        type_keys(&mut editor, ":e!\n");
+        assert!(
+            editor.vim.message.starts_with("E484"),
+            "{}",
+            editor.vim.message
+        );
+        assert_eq!(editor.buf.text(), "one wo");
+    }
+
+    #[test]
+    fn copy_cut_and_paste_text() {
+        let mut editor = Editor::default();
+        type_keys(&mut editor, "ione two three\x1b0");
+        assert_eq!(editor.copy_selection(), None);
+        type_keys(&mut editor, "ve");
+        assert_eq!(editor.copy_selection().as_deref(), Some("one"));
+        assert_eq!(editor.cut_selection().as_deref(), Some("one"));
+        assert_eq!(editor.buf.text(), " two three");
+        assert_eq!(editor.vim.mode, Mode::Normal);
+        // Normal mode pastes after the cursor char; the cursor lands on the end of the text.
+        editor.paste_text("ONE");
+        assert_eq!(editor.buf.text(), " ONEtwo three");
+        assert_eq!(editor.buf.cursor(), 3);
+        type_keys(&mut editor, "u");
+        assert_eq!(editor.buf.text(), " two three");
+        // A selection is replaced, as one step, and insert mode pastes at the cursor.
+        type_keys(&mut editor, "wviw");
+        editor.paste_text("2");
+        assert_eq!(editor.buf.text(), " 2 three");
+        type_keys(&mut editor, "u");
+        assert_eq!(editor.buf.text(), " two three");
+        type_keys(&mut editor, "A");
+        editor.paste_text(" and four");
+        type_keys(&mut editor, "!\x1b");
+        assert_eq!(editor.buf.text(), " two three and four!");
+        // Empty text is nothing, and multi-line text is fine.
+        editor.paste_text("");
+        type_keys(&mut editor, "0");
+        editor.paste_text("a\nb");
+        assert_eq!(editor.buf.text(), " a\nbtwo three and four!");
     }
 }

@@ -28,3 +28,4 @@ pub mod toolbar;
 pub mod tree;
 pub mod ui;
 pub mod vim;
+pub mod watch;

@@ -31,6 +31,8 @@ pub enum Command {
     ForceQuit,
     /// Save, and quit if that worked.
     SaveQuit,
+    /// Read the file again, dropping changes: `:e!`.
+    Reload,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -88,6 +90,11 @@ pub struct Vim {
     registers: HashMap<char, Register>,
     /// The register the command being handled reads or writes; `None` is the unnamed one.
     register: Option<char>,
+    /// Text for the system clipboard, waiting for the app to take it.
+    clipboard_out: Option<String>,
+    /// Set to keep yanks out of the system clipboard. Normally every yank goes there too, as with
+    /// vim's `unnamedplus`.
+    pub clipboard_local_only: bool,
     /// Keys of the normal-mode command being typed, and the buffer revision when it began.
     command_keys: Vec<Key>,
     command_revision: u64,
@@ -198,7 +205,7 @@ impl Vim {
             }
             _ if p.awaiting_register => {
                 if let Key::Char(c) = key
-                    && (c.is_ascii_alphabetic() || c == '_' || c == '"')
+                    && (c.is_ascii_alphabetic() || matches!(c, '_' | '"' | '+' | '*'))
                 {
                     self.pending = Pending {
                         awaiting_register: false,
@@ -451,6 +458,12 @@ impl Vim {
             }
             "q" | "quit" => Some(Command::Quit),
             "q!" | "quit!" => Some(Command::ForceQuit),
+            "e!" | "edit!" => Some(Command::Reload),
+            "e" | "edit" if buf.is_modified() => {
+                self.message = "E37: No write since last change (add ! to override)".into();
+                None
+            }
+            "e" | "edit" => Some(Command::Reload),
             other => {
                 self.message = format!("E492: Not an editor command: {other}");
                 None
@@ -671,6 +684,9 @@ impl Vim {
             yanked.push('\n');
         }
         self.store(yanked, linewise);
+        if op == 'y' && !self.clipboard_local_only && self.register != Some('_') {
+            self.clipboard_out = self.registers.get(&'"').map(|r| r.text.clone());
+        }
         let ends_with_newline = text[..range.end].ends_with('\n');
         match op {
             'y' => buf.set_cursor(cursor),
@@ -709,6 +725,11 @@ impl Vim {
         let mut register = Register { text, linewise };
         match self.register {
             Some('_') => return,
+            // `+` and `*` are the system clipboard. The app sends this out and reads it back.
+            Some('+' | '*') => {
+                self.clipboard_out = Some(register.text.clone());
+                self.registers.insert('+', register.clone());
+            }
             Some(name) if name.is_ascii_alphabetic() => {
                 let key = name.to_ascii_lowercase();
                 if name.is_ascii_uppercase()
@@ -734,8 +755,30 @@ impl Vim {
 
     /// The register the running command reads.
     fn fetch(&self) -> Option<&Register> {
-        let name = self.register.filter(|&c| c != '"').unwrap_or('"');
-        self.registers.get(&name.to_ascii_lowercase())
+        let name = match self.register.filter(|&c| c != '"') {
+            Some('*') => '+',
+            Some(name) => name.to_ascii_lowercase(),
+            None => '"',
+        };
+        self.registers.get(&name)
+    }
+
+    /// The text that should go to the system clipboard, if a yank or `"+` store put some there
+    /// since the last call.
+    pub fn take_clipboard_write(&mut self) -> Option<String> {
+        self.clipboard_out.take()
+    }
+
+    /// True while a `"+` or `"*` is waiting for the command that reads or writes it, which is
+    /// when the app should put the clipboard's text in with `set_clipboard_register`.
+    pub fn wants_clipboard(&self) -> bool {
+        matches!(self.pending.register, Some('+' | '*'))
+    }
+
+    /// Sets what `"+` and `"*` read. Text that ends in a newline is taken as whole lines.
+    pub fn set_clipboard_register(&mut self, text: String) {
+        let linewise = text.ends_with('\n');
+        self.registers.insert('+', Register { text, linewise });
     }
 
     /// The text and whether it is whole lines, of register `name` (`"` for the unnamed one).
@@ -1673,5 +1716,64 @@ cd", 0, "9$", 4,
         assert_eq!(buf.text(), "*a*\n\n*b*");
         press(&mut vim, &mut buf, "u");
         assert_eq!(buf.text(), "a\n\nb");
+    }
+
+    #[test]
+    fn plus_and_star_are_the_system_clipboard() {
+        let mut vim = Vim::new();
+        let mut buf = Buffer::new("one\ntwo");
+        // A named yank to + is sent out, and * is the same register.
+        press(&mut vim, &mut buf, "\"+yy");
+        assert_eq!(vim.take_clipboard_write().as_deref(), Some("one\n"));
+        assert_eq!(vim.take_clipboard_write(), None);
+        press(&mut vim, &mut buf, "j\"*yw");
+        assert_eq!(vim.take_clipboard_write().as_deref(), Some("two"));
+        // The app fills the register in when a command is waiting to read it.
+        assert!(!vim.wants_clipboard());
+        press(&mut vim, &mut buf, "\"+");
+        assert!(vim.wants_clipboard());
+        vim.set_clipboard_register("from outside".into());
+        press(&mut vim, &mut buf, "p");
+        assert!(!vim.wants_clipboard());
+        assert_eq!(buf.text(), "one\ntfrom outsidewo");
+        // Whole lines from outside paste as lines.
+        vim.set_clipboard_register("new line\n".into());
+        press(&mut vim, &mut buf, "gg\"*P");
+        assert_eq!(buf.text(), "new line\none\ntfrom outsidewo");
+        // The plain register is untouched by all that.
+        assert_eq!(vim.register('"'), Some(("two", false)));
+    }
+
+    #[test]
+    fn yanks_reach_the_clipboard_but_deletes_leave_it_alone() {
+        let mut vim = Vim::new();
+        let mut buf = Buffer::new("one two three");
+        press(&mut vim, &mut buf, "yw");
+        assert_eq!(vim.take_clipboard_write().as_deref(), Some("one "));
+        press(&mut vim, &mut buf, "dw");
+        assert_eq!(vim.take_clipboard_write(), None);
+        // The black hole register writes nothing, and the option can be turned off.
+        press(&mut vim, &mut buf, "\"_yw");
+        assert_eq!(vim.take_clipboard_write(), None);
+        vim.clipboard_local_only = true;
+        press(&mut vim, &mut buf, "yw");
+        assert_eq!(vim.take_clipboard_write(), None);
+    }
+
+    #[test]
+    fn e_reloads_and_refuses_over_unsaved_changes() {
+        let (mut vim, mut buf) = (Vim::new(), Buffer::new("abc"));
+        let ex = |vim: &mut Vim, buf: &mut Buffer, line: &str| {
+            let mut result = None;
+            for c in line.chars() {
+                result = vim.handle(buf, Key::Char(c));
+            }
+            result.or(vim.handle(buf, Key::Enter))
+        };
+        assert_eq!(ex(&mut vim, &mut buf, ":e"), Some(Command::Reload));
+        press(&mut vim, &mut buf, "x");
+        assert_eq!(ex(&mut vim, &mut buf, ":e"), None);
+        assert!(vim.message.starts_with("E37"));
+        assert_eq!(ex(&mut vim, &mut buf, ":e!"), Some(Command::Reload));
     }
 }

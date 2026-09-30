@@ -123,7 +123,7 @@ buttons. Smooth scrolling and transitions. Continuous scroll layout with a fixed
 - [x] Command line (`:`) and search (`/`) prompts **[visual]**
 - [x] Auto-save toggle button **[visual]**
 - [x] Export buttons for Markdown and PDF **[visual]**
-- [ ] Clipboard via `arboard`; reload on external change via `notify`
+- [x] Clipboard via `arboard`; reload on external change via `notify`
 - [ ] Packaging with `cargo-packager` for macOS and Linux
 
 ## Later
