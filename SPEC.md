@@ -124,7 +124,7 @@ buttons. Smooth scrolling and transitions. Continuous scroll layout with a fixed
 - [x] Auto-save toggle button **[visual]**
 - [x] Export buttons for Markdown and PDF **[visual]**
 - [x] Clipboard via `arboard`; reload on external change via `notify`
-- [ ] Packaging with `cargo-packager` for macOS and Linux
+- [x] Packaging with `cargo-packager` for macOS and Linux
 
 ## Later
 Images, tables, footnotes, math, task lists, divs, macros, visual-block, `:s`, HTML export, paged layout.

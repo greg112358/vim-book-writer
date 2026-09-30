@@ -19,6 +19,7 @@ Pinned to stable lines: winit 0.30 (0.31 is beta) and notify 8 (9 is rc). Don't 
 - `cargo clippy --all-targets -- -D warnings` – lints
 - `cargo fmt --check` – formatting
 - `cargo run` – open the window
+- `cargo packager --release` – build installers for this platform into `target/packages` (deb on Linux, app and dmg on macOS); install the tool with `cargo install cargo-packager --locked`. Settings live in `[package.metadata.packager]` in `Cargo.toml`
 - `muda` is behind the `native-menu` feature (needs `gtk3-devel` on Linux); default builds skip it
 
 ## Code style

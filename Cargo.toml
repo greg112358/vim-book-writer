@@ -27,3 +27,39 @@ winit = "0.30"
 [features]
 # Native menu bar. On Linux this needs GTK3 dev packages (gtk3-devel).
 native-menu = ["dep:muda"]
+
+# Configuration for `cargo packager`. Run `cargo packager --release` on each platform to build its
+# packages: an app bundle and disk image on macOS, and deb, AppImage, and pacman packages on Linux.
+[package.metadata.packager]
+product-name = "Book Writing App"
+identifier = "com.bookwritingapp.editor"
+description = "A fast, lightweight word processor for djot, with vim controls"
+long-description = """
+Write books in djot with vim controls. Normal mode shows the finished text, and insert mode shows
+the source with its syntax dimmed. Export to Markdown or PDF."""
+authors = ["Gregory"]
+category = "Productivity"
+out-dir = "target/packages"
+binaries-dir = "target/release"
+before-packaging-command = "cargo build --release"
+icons = [
+    "packaging/icons/32x32.png",
+    "packaging/icons/128x128.png",
+    "packaging/icons/256x256.png",
+    "packaging/icons/512x512.png",
+]
+
+[[package.metadata.packager.binaries]]
+path = "book-writing-app"
+main = true
+
+[[package.metadata.packager.file-associations]]
+extensions = ["dj", "djot"]
+mime-type = "text/x-djot"
+description = "Djot document"
+
+[package.metadata.packager.deb]
+depends = ["libvulkan1"]
+
+[package.metadata.packager.macos]
+minimum-system-version = "11.0"
