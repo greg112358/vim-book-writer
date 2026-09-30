@@ -141,7 +141,7 @@ mod tests {
 
     #[test]
     fn normal_mode_shows_the_words_with_their_looks() {
-        let src = "## Title\n\n*bold* and _it_ {-x-} [red]{style=\"color:#c00\"}\n";
+        let src = "## Title\n\n*bold* and _it_ {-x-} [red]{.note}\n";
         let display = Display::normal(src);
         assert_eq!(display.text, "Title\n\nbold and it x red\n");
         // Each span is a slice of the text, and knows where in the source it came from.
@@ -158,7 +158,6 @@ mod tests {
         assert!(look("bold").0.bold && !look("bold").0.italic);
         assert!(look("it").0.italic);
         assert!(look("x").0.strike);
-        assert_eq!(look("red").0.style.color, Some([0xcc, 0, 0]));
         assert_eq!(look("red").1, "red");
         // The spans cover the whole text with no gaps.
         let mut end = 0;
@@ -173,7 +172,7 @@ mod tests {
 
     #[test]
     fn insert_mode_shows_the_source_with_the_syntax_faint() {
-        let src = "## Head\n\n**Bold Text** and [red]{style=\"color:#c00\"}\n";
+        let src = "## Head\n\n**Bold Text** and [red]{.note}\n";
         let display = Display::insert(src);
         assert_eq!(display.text, src);
         // (text, faint) for each span; neighbours that look alike were merged by `runs`.
@@ -194,7 +193,7 @@ mod tests {
                 (" and ", false),
                 ("[", true),
                 ("red", false),
-                ("]{style=\"color:#c00\"}", true),
+                ("]{.note}", true),
                 ("\n", false),
             ]
         );

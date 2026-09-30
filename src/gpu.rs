@@ -1,8 +1,5 @@
 use crate::rects::Rects;
-use crate::typeset::{self, FONT_SIZE, LINE_HEIGHT};
-use book_writing_app::display::Display;
-use book_writing_app::editor::View;
-use book_writing_app::ui::{Align, Bounds, Chrome, Label, Theme};
+use crate::typeset::{self, LINE_HEIGHT, Reading};
 use cosmic_text::fontdb;
 use glyphon::{
     Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, Style,
@@ -10,6 +7,9 @@ use glyphon::{
 };
 use std::collections::HashMap;
 use std::sync::Arc;
+use vim_book_writer::display::Display;
+use vim_book_writer::editor::View;
+use vim_book_writer::ui::{Align, Bounds, Chrome, Label, Theme};
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
@@ -39,6 +39,8 @@ pub struct Frame<'a, 'v> {
     /// The toolbar, status bar, and other parts of the window around the editor.
     pub chrome: &'a Chrome,
     pub theme: &'static Theme,
+    /// The font and size the text is read in.
+    pub reading: &'a Reading,
 }
 
 /// Format of the offscreen frame. sRGB, so a color drawn here matches one drawn to a window.
@@ -59,12 +61,21 @@ pub struct Gpu {
     buffer: Buffer,
     /// Shaped interface text, by text, size, and weight.
     labels: HashMap<LabelKey, Buffer>,
-    /// The display version, column width and theme of the text `buffer` holds.
-    shown: Option<(u64, u32, bool)>,
+    /// The display version, column width, theme and reading font of the text `buffer` holds.
+    shown: Option<(u64, u32, bool, Reading)>,
     /// Where each wrapped row of the text in `buffer` starts, as displayed offsets.
     pub rows: Vec<usize>,
+    /// The superscripts and subscripts of `buffer`, each drawn again where it belongs.
+    scripts: Vec<Script>,
     /// Where the text's top left corner was drawn, for turning clicks into text positions.
     origin: (f32, f32),
+}
+
+/// A superscript or subscript shaped on its own: where it goes from the text's top left corner.
+struct Script {
+    buffer: Buffer,
+    x: f32,
+    y: f32,
 }
 
 /// A GPU and the window surface it draws to.
@@ -223,7 +234,7 @@ impl Gpu {
         let viewport = Viewport::new(&device, &cache);
         let mut atlas = TextAtlas::new(&device, &queue, &cache, format);
         let text = TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
-        let buffer = Buffer::new(&mut fonts, Metrics::new(FONT_SIZE, FONT_SIZE * LINE_HEIGHT));
+        let buffer = Buffer::new(&mut fonts, Metrics::new(18.0, 18.0 * LINE_HEIGHT));
         let text_over =
             TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
         let rects = Rects::new(&device, format);
@@ -241,6 +252,7 @@ impl Gpu {
             labels: HashMap::new(),
             shown: None,
             rows: Vec::new(),
+            scripts: Vec::new(),
             origin: (0.0, 0.0),
         }
     }
@@ -261,11 +273,11 @@ impl Gpu {
 
     /// Lays out the view's text in a column centered in an editor `width` wide. Only shapes again
     /// if the text or the width changed. Returns the margin to the left of the column.
-    fn sync(&mut self, view: &View<'_>, width: f32, theme: &Theme) -> f32 {
+    fn sync(&mut self, view: &View<'_>, width: f32, theme: &Theme, reading: &Reading) -> f32 {
         let margin = ((width - COLUMN_WIDTH) / 2.0).max(MIN_MARGIN);
         let column = (width - 2.0 * margin).max(1.0);
-        let key = (view.version, column as u32, theme.dark);
-        let reshaped = self.shown != Some(key);
+        let key = (view.version, column as u32, theme.dark, reading.clone());
+        let reshaped = self.shown.as_ref() != Some(&key);
         if reshaped {
             // No height, so every line is laid out and the caret can be found wherever it is.
             self.buffer.set_size(Some(column), None);
@@ -274,7 +286,7 @@ impl Gpu {
                 display.spans.iter().map(|span| {
                     (
                         &display.text[span.range.clone()],
-                        typeset::attrs(&span.format, span.faint, theme),
+                        typeset::attrs(&span.format, span.faint, theme, reading),
                     )
                 }),
                 &Attrs::new().family(Family::Serif),
@@ -285,6 +297,52 @@ impl Gpu {
         }
         self.buffer.shape_until_scroll(&mut self.fonts, false);
         if reshaped {
+            self.scripts.clear();
+            for span in &view.display.spans {
+                let format = &span.format;
+                if span.faint || !(format.superscript || format.subscript) {
+                    continue;
+                }
+                let (attrs, raise) = typeset::script_attrs(format, theme, reading);
+                let size = typeset::base_size(format, reading) * 0.65;
+                let mut at = span.range.start;
+                for piece in view.display.text[span.range.clone()].split_inclusive('\n') {
+                    let start = at;
+                    at += piece.len();
+                    let text = piece.trim_end_matches('\n');
+                    let (line, index) = view.display.line_and_index(start);
+                    // The glyph the piece starts at, and the baseline of the row it is on.
+                    let found = self
+                        .buffer
+                        .layout_runs()
+                        .filter(|run| run.line_i == line)
+                        .find_map(|run| {
+                            run.glyphs
+                                .iter()
+                                .find(|g| g.start <= index && index < g.end)
+                                .map(|g| (g.x, run.line_y))
+                        });
+                    let (Some((x, baseline)), false) = (found, text.is_empty()) else {
+                        continue;
+                    };
+                    let mut buffer =
+                        Buffer::new(&mut self.fonts, Metrics::new(size, size * LINE_HEIGHT));
+                    buffer.set_size(None, None);
+                    buffer.set_rich_text(
+                        [(text, attrs.clone())],
+                        &Attrs::new().family(Family::Serif),
+                        Shaping::Advanced,
+                        None,
+                    );
+                    buffer.shape_until_scroll(&mut self.fonts, false);
+                    let own = buffer.layout_runs().next().map_or(0.0, |run| run.line_y);
+                    self.scripts.push(Script {
+                        buffer,
+                        x,
+                        y: baseline - own - raise,
+                    });
+                }
+            }
             self.rows.clear();
             self.rows.extend(self.buffer.layout_runs().map(|run| {
                 let index = run.glyphs.first().map_or(0, |g| g.start);
@@ -296,8 +354,14 @@ impl Gpu {
 
     /// Lays out the text for an editor `editor` big and says how tall it is and where the caret
     /// is, so the caller can decide how far to scroll.
-    pub fn layout(&mut self, view: &View<'_>, editor: Bounds, theme: &Theme) -> Layout {
-        let margin = self.sync(view, editor.w, theme);
+    pub fn layout(
+        &mut self,
+        view: &View<'_>,
+        editor: Bounds,
+        theme: &Theme,
+        reading: &Reading,
+    ) -> Layout {
+        let margin = self.sync(view, editor.w, theme, reading);
         let caret = typeset::caret_and_selection(
             &self.buffer,
             view,
@@ -305,6 +369,7 @@ impl Gpu {
             &mut Vec::new(),
             &mut Vec::new(),
             theme,
+            reading,
         );
         Layout {
             content_height: typeset::text_height(&self.buffer) + 2.0 * TOP_MARGIN,
@@ -322,7 +387,7 @@ impl Gpu {
         let editor = frame.editor;
         let (mut left, mut top) = (0.0, 0.0);
         if let Some(view) = frame.view {
-            let margin = self.sync(view, editor.w, frame.theme);
+            let margin = self.sync(view, editor.w, frame.theme, frame.reading);
             (left, top) = (editor.x + margin, editor.y + TOP_MARGIN - frame.scroll);
             self.origin = (left, top);
         }
@@ -349,6 +414,22 @@ impl Gpu {
                 default_color: typeset::text_color(frame.theme),
                 custom_glyphs: &[],
             });
+        }
+        if frame.view.is_some() {
+            areas.extend(self.scripts.iter().map(|script| TextArea {
+                buffer: &script.buffer,
+                left: left + script.x,
+                top: top + script.y,
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: editor.x as i32,
+                    top: editor.y as i32,
+                    right: (editor.x + editor.w) as i32,
+                    bottom: (editor.y + editor.h) as i32,
+                },
+                default_color: typeset::text_color(frame.theme),
+                custom_glyphs: &[],
+            }));
         }
         areas.extend(label_areas(&self.labels, &frame.chrome.labels));
         let over_areas = label_areas(&self.labels, &frame.chrome.over_labels);
@@ -381,6 +462,12 @@ impl Gpu {
         let mut over = Vec::new();
         if let Some(view) = frame.view {
             over = typeset::decorations(&self.buffer, left, top, frame.theme);
+            over.extend(typeset::gutter(
+                &self.buffer,
+                view,
+                (left, top),
+                frame.theme,
+            ));
             typeset::caret_and_selection(
                 &self.buffer,
                 view,
@@ -388,6 +475,7 @@ impl Gpu {
                 &mut under,
                 &mut over,
                 frame.theme,
+                frame.reading,
             );
         }
         // A thin thumb at the editor's right edge shows how far through the text the view is.
@@ -397,7 +485,7 @@ impl Gpu {
                 let thumb = (editor.h * editor.h / content).max(24.0);
                 let range = (content - editor.h).max(1.0);
                 let [r, g, b, _] = frame.theme.muted;
-                over.push(book_writing_app::ui::Rect {
+                over.push(vim_book_writer::ui::Rect {
                     x: editor.x + editor.w - 8.0,
                     y: editor.y + (frame.scroll / range).clamp(0.0, 1.0) * (editor.h - thumb),
                     w: 4.0,

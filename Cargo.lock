@@ -597,31 +597,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "book-writing-app"
-version = "0.1.0"
-dependencies = [
- "accesskit",
- "accesskit_winit",
- "arboard",
- "cosmic-text",
- "glyphon",
- "ignore",
- "jotdown",
- "muda",
- "notify",
- "nucleo",
- "png",
- "pollster",
- "printpdf",
- "rfd",
- "serde",
- "taffy",
- "toml 1.1.6+spec-1.1.0",
- "wgpu",
- "winit",
-]
-
-[[package]]
 name = "brotli-decompressor"
 version = "5.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4244,6 +4219,31 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "vim-book-writer"
+version = "0.1.0"
+dependencies = [
+ "accesskit",
+ "accesskit_winit",
+ "arboard",
+ "cosmic-text",
+ "glyphon",
+ "ignore",
+ "jotdown",
+ "muda",
+ "notify",
+ "nucleo",
+ "png",
+ "pollster",
+ "printpdf",
+ "rfd",
+ "serde",
+ "taffy",
+ "toml 1.1.6+spec-1.1.0",
+ "wgpu",
+ "winit",
+]
 
 [[package]]
 name = "walkdir"

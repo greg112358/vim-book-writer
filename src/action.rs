@@ -4,13 +4,10 @@
 pub enum Action {
     Bold,
     Italic,
-    Underline,
     Strikethrough,
+    Superscript,
+    Subscript,
     Uppercase,
-    Color([u8; 3]),
-    /// In points.
-    FontSize(f32),
-    FontFamily(String),
     /// Level 1 to 6; the same level again makes it a paragraph.
     Heading(usize),
     BulletList,

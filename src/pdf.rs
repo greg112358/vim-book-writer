@@ -1,4 +1,3 @@
-use crate::style::Style;
 use jotdown::{Container, Event, ListKind, Parser};
 use printpdf::{
     BuiltinFont, Color, Line, LinePoint, Mm, Op, PaintMode, PdfDocument, PdfFontHandle, PdfPage,
@@ -21,9 +20,18 @@ struct Piece {
     bold: bool,
     italic: bool,
     strike: bool,
+    /// Raised and smaller, or lowered and smaller.
+    script: Script,
     code: bool,
     link: bool,
-    style: Style,
+}
+
+#[derive(Clone, Copy, Default, PartialEq)]
+enum Script {
+    #[default]
+    None,
+    Super,
+    Sub,
 }
 
 enum Kind {
@@ -51,6 +59,8 @@ struct Look {
     color: [u8; 3],
     underline: bool,
     strike: bool,
+    /// How far the text is raised above the line, in points.
+    raise: f32,
 }
 
 struct Word {
@@ -147,11 +157,11 @@ fn blocks(src: &str) -> Vec<Block> {
     let mut lists: Vec<Option<u64>> = Vec::new();
     let mut pending_marker: Option<String> = None;
     let (mut bold, mut italic, mut strike, mut code, mut link) = (0, 0, 0, 0, 0);
-    let mut styles: Vec<Style> = Vec::new();
+    let mut scripts: Vec<Script> = Vec::new();
 
     for event in Parser::new(src) {
         let text: Option<String> = match event {
-            Event::Start(container, attributes) => {
+            Event::Start(container, _) => {
                 match container {
                     Container::Paragraph | Container::Heading { .. } => {
                         let level = match container {
@@ -194,13 +204,10 @@ fn blocks(src: &str) -> Vec<Block> {
                     Container::Strong => bold += 1,
                     Container::Emphasis => italic += 1,
                     Container::Delete => strike += 1,
+                    Container::Superscript => scripts.push(Script::Super),
+                    Container::Subscript => scripts.push(Script::Sub),
                     Container::Verbatim => code += 1,
                     Container::Link(..) => link += 1,
-                    Container::Span => styles.push(
-                        attributes
-                            .get_value("style")
-                            .map_or_else(Style::default, |css| Style::parse(&css.to_string())),
-                    ),
                     _ => {}
                 }
                 None
@@ -219,11 +226,11 @@ fn blocks(src: &str) -> Vec<Block> {
                     Container::Strong => bold -= 1,
                     Container::Emphasis => italic -= 1,
                     Container::Delete => strike -= 1,
+                    Container::Superscript | Container::Subscript => {
+                        scripts.pop();
+                    }
                     Container::Verbatim => code -= 1,
                     Container::Link(..) => link -= 1,
-                    Container::Span => {
-                        styles.pop();
-                    }
                     _ => {}
                 }
                 None
@@ -253,24 +260,14 @@ fn blocks(src: &str) -> Vec<Block> {
             _ => None,
         };
         if let (Some(text), Some(block)) = (text, current.as_mut()) {
-            // Inner spans win over outer ones.
-            let mut style = Style::default();
-            for s in &styles {
-                style.color = s.color.or(style.color);
-                style.size_pt = s.size_pt.or(style.size_pt);
-                if s.family.is_some() {
-                    style.family.clone_from(&s.family);
-                }
-                style.underline |= s.underline;
-            }
             block.pieces.push(Piece {
                 text,
                 bold: bold > 0,
                 italic: italic > 0,
                 strike: strike > 0,
+                script: scripts.last().copied().unwrap_or_default(),
                 code: code > 0,
                 link: link > 0,
-                style,
             });
         }
     }
@@ -280,24 +277,20 @@ fn blocks(src: &str) -> Vec<Block> {
 fn look_of(piece: &Piece, heading: u16, kind: &Kind) -> Look {
     let base = HEADING_PT[heading.min(6) as usize];
     let mono = piece.code || matches!(kind, Kind::Code);
-    let size = piece
-        .style
-        .size_pt
-        .unwrap_or(if mono { base * 0.9 } else { base });
+    let size = if mono { base * 0.9 } else { base };
+    // Superscripts and subscripts are smaller, and sit higher or lower.
+    let (size, raise) = match piece.script {
+        Script::None => (size, 0.0),
+        Script::Super => (size * 0.65, size * 0.35),
+        Script::Sub => (size * 0.65, -size * 0.12),
+    };
     Look {
-        font: pick_font(
-            piece.style.family.as_deref(),
-            mono,
-            piece.bold || heading > 0,
-            piece.italic,
-        ),
+        font: pick_font(None, mono, piece.bold || heading > 0, piece.italic),
         size,
-        color: piece
-            .style
-            .color
-            .unwrap_or(if piece.link { [0, 0, 0xee] } else { [0, 0, 0] }),
-        underline: piece.style.underline || piece.link,
+        color: if piece.link { [0, 0, 0xee] } else { [0, 0, 0] },
+        underline: piece.link,
         strike: piece.strike,
+        raise,
     }
 }
 
@@ -544,6 +537,7 @@ pub fn to_pdf(src: &str, title: &str) -> Vec<u8> {
                     color: [0, 0, 0],
                     underline: false,
                     strike: false,
+                    raise: 0.0,
                 };
                 pages
                     .ops
@@ -606,6 +600,7 @@ pub fn to_pdf(src: &str, title: &str) -> Vec<u8> {
 
 /// One text operation at a position, with its color and font.
 fn text_ops(text: &str, look: &Look, x: f32, y: f32) -> Vec<Op> {
+    let y = y + look.raise;
     vec![
         Op::StartTextSection,
         Op::SetFont {
@@ -626,6 +621,7 @@ fn text_ops(text: &str, look: &Look, x: f32, y: f32) -> Vec<Op> {
 /// A run of text, plus the line under or through it.
 fn styled_run(text: &str, look: &Look, x: f32, baseline: f32, width: f32) -> Vec<Op> {
     let mut ops = text_ops(text, look, x, baseline);
+    let baseline = baseline + look.raise;
     let thickness = (look.size / 20.0).max(0.5);
     if look.underline {
         ops.extend(stroke(
@@ -696,9 +692,7 @@ mod tests {
 
     #[test]
     fn styling_reaches_the_pdf() {
-        let ops = ops_of(
-            "# Head\n\n*b* _i_ [big red]{style=\"color:#c00;font-size:14pt\"} [sans]{style=\"font-family:Arial\"} `mono` [c]{style=\"font-family:Courier\"}",
-        );
+        let ops = ops_of("# Head\n\n*b* _i_ `mono`");
         let fonts: Vec<(BuiltinFont, f32)> = ops
             .iter()
             .filter_map(|op| match op {
@@ -713,25 +707,45 @@ mod tests {
             (BuiltinFont::TimesBold, 24.0),
             (BuiltinFont::TimesBold, 12.0),
             (BuiltinFont::TimesItalic, 12.0),
-            (BuiltinFont::TimesRoman, 14.0),
-            (BuiltinFont::Helvetica, 12.0),
             (BuiltinFont::Courier, 10.8),
-            (BuiltinFont::Courier, 12.0),
         ] {
             let found = fonts
                 .iter()
                 .any(|&(f, size)| f == want.0 && (size - want.1).abs() < 0.01);
             assert!(found, "{want:?} not in {fonts:?}");
         }
-        let reds = ops
-            .iter()
-            .filter(|op| matches!(op, Op::SetFillColor { col: Color::Rgb(c) } if c.r > 0.79 && c.r < 0.81 && c.g == 0.0))
-            .count();
-        assert_eq!(reds, 1);
     }
 
     #[test]
-    fn underline_and_strikethrough_are_drawn_as_lines() {
+    fn superscripts_and_subscripts_are_smaller_and_shifted_and_keep_their_text() {
+        let doc = parse(&to_pdf("E = mc{^2^} and H{~2~}O\n", "t"));
+        let text = text_of(&doc);
+        assert!(text.contains('2') && text.contains("mc"), "{text}");
+        assert!(
+            look_of(
+                &Piece {
+                    script: Script::Super,
+                    ..Piece::default()
+                },
+                0,
+                &Kind::Text(0)
+            )
+            .raise
+                > 0.0
+        );
+        let sub = look_of(
+            &Piece {
+                script: Script::Sub,
+                ..Piece::default()
+            },
+            0,
+            &Kind::Text(0),
+        );
+        assert!(sub.raise < 0.0 && sub.size < BODY_PT);
+    }
+
+    #[test]
+    fn links_and_strikethrough_are_drawn_with_lines() {
         let lines = |src: &str| {
             ops_of(src)
                 .iter()
@@ -740,7 +754,6 @@ mod tests {
         };
         assert_eq!(lines("plain text"), 0);
         assert_eq!(lines("{-struck-}"), 1);
-        assert_eq!(lines("[u]{style=\"text-decoration:underline\"}"), 1);
         // Links are underlined and blue.
         assert_eq!(lines("[a link](http://x.y)"), 1);
         assert_eq!(lines("***"), 1);

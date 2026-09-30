@@ -4,7 +4,6 @@ use crate::ui::Bounds;
 /// A list that opens under a toolbar button.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Menu {
-    Color,
     Font,
     Size,
 }
@@ -27,6 +26,8 @@ pub enum Click {
     Help,
     /// A file tree button: the key it stands for.
     TreeKey(char),
+    /// A file tree git button: the key after `g` that it stands for.
+    TreeGit(char),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -45,8 +46,10 @@ pub struct Toolbar {
 }
 
 const GAP: f32 = 2.0;
-const GROUP_GAP: f32 = 12.0;
-const PADDING: f32 = 8.0;
+const GROUP_GAP: f32 = 14.0;
+const PADDING: f32 = 10.0;
+/// How much wider each button is drawn than the widths written below, which suit small type.
+const SCALE: f32 = 1.1;
 
 /// Places the buttons in `bounds`, the thin strip along the top of the window.
 pub fn toolbar(bounds: Bounds) -> Toolbar {
@@ -61,19 +64,14 @@ pub fn toolbar(bounds: Bounds) -> Toolbar {
         |label, width, click, tip: &str| spec.push(Some((label, width, click, tip.to_string())));
     add("B", 26.0, Click::Do(Action::Bold), "Bold (Ctrl+B)");
     add("I", 26.0, Click::Do(Action::Italic), "Italic (Ctrl+I)");
-    add(
-        "U",
-        26.0,
-        Click::Do(Action::Underline),
-        "Underline (Ctrl+U)",
-    );
     add("S", 26.0, Click::Do(Action::Strikethrough), "Strikethrough");
-    spec.push(None);
-    let mut add =
-        |label, width, click, tip: &str| spec.push(Some((label, width, click, tip.to_string())));
-    add("Font", 52.0, Click::Open(Menu::Font), "Font name");
-    add("Size", 44.0, Click::Open(Menu::Size), "Font size");
-    add("A", 26.0, Click::Open(Menu::Color), "Font color");
+    add(
+        "x\u{b2}",
+        28.0,
+        Click::Do(Action::Superscript),
+        "Superscript",
+    );
+    add("x\u{2082}", 28.0, Click::Do(Action::Subscript), "Subscript");
     add("AA", 30.0, Click::Do(Action::Uppercase), "Make uppercase");
     spec.push(None);
     let mut add =
@@ -110,24 +108,36 @@ pub fn toolbar(bounds: Bounds) -> Toolbar {
     add("Link", 40.0, Click::Do(Action::Link), "Link");
 
     // The buttons for the file rather than the text sit at the right end.
-    let right: [(&str, f32, Click, String); 7] = [
+    let right: [(&str, f32, Click, String); 9] = [
+        (
+            "Font",
+            52.0,
+            Click::Open(Menu::Font),
+            "Reading font: how the text looks to you, not in the file".into(),
+        ),
+        (
+            "Size",
+            44.0,
+            Click::Open(Menu::Size),
+            "Reading size: how big the text looks to you, not in the file".into(),
+        ),
         (
             "Outline",
-            56.0,
+            52.0,
             Click::ToggleOutline,
-            "Show or hide the headings (Ctrl+T goes there)".into(),
+            "Show or hide the headings (Ctrl+H goes there)".into(),
         ),
-        ("Save", 44.0, Click::Save, "Save (Ctrl+S or :w)".into()),
+        ("Save", 40.0, Click::Save, "Save (Ctrl+S or :w)".into()),
         (
             "MD",
-            34.0,
+            30.0,
             Click::ExportMarkdown,
             "Export as Markdown".into(),
         ),
-        ("PDF", 38.0, Click::ExportPdf, "Export as PDF".into()),
+        ("PDF", 34.0, Click::ExportPdf, "Export as PDF".into()),
         (
             "Auto",
-            46.0,
+            40.0,
             Click::ToggleAutoSave,
             "Auto-save after you stop typing".into(),
         ),
@@ -150,39 +160,44 @@ pub fn toolbar(bounds: Bounds) -> Toolbar {
                     bounds: Bounds {
                         x,
                         y,
-                        w: width,
+                        w: width * SCALE,
                         h: height,
                     },
                     label: label.to_string(),
                     tip: tip.replace("Ctrl", cmd),
                     click,
                 });
-                x += width + GAP;
+                x += width * SCALE + GAP;
             }
             None => x += GROUP_GAP - GAP,
         }
     }
-    let right_width: f32 = right.iter().map(|(_, w, _, _)| w + GAP).sum::<f32>() - GAP;
+    let right_width: f32 = right
+        .iter()
+        .map(|(_, w, _, _)| w * SCALE + GAP)
+        .sum::<f32>()
+        - GAP;
     let mut x = (bounds.x + bounds.w - PADDING - right_width).max(x + GROUP_GAP - GAP);
     for (label, width, click, tip) in right {
         buttons.push(Button {
             bounds: Bounds {
                 x,
                 y,
-                w: width,
+                w: width * SCALE,
                 h: height,
             },
             label: label.to_string(),
             tip: tip.replace("Ctrl", cmd),
             click,
         });
-        x += width + GAP;
+        x += width * SCALE + GAP;
     }
     Toolbar { buttons }
 }
 
-/// The buttons under the file tree's header, in two rows, for the panel `panel`.
-pub fn tree_buttons(panel: Bounds) -> Toolbar {
+/// The buttons under the file tree's header for the panel `panel`: two rows for files, and for a
+/// repository two more for git under the branch line.
+pub fn tree_buttons(panel: Bounds, git: bool) -> Toolbar {
     const ROWS: [&[(&str, f32, char, &str)]; 2] = [
         &[
             ("+File", 42.0, 'a', "New file (a)"),
@@ -197,23 +212,54 @@ pub fn tree_buttons(panel: Bounds) -> Toolbar {
             ("Paste", 42.0, 'p', "Paste a copy of what was yanked (p)"),
         ],
     ];
+    const GIT_ROWS: [&[(&str, f32, char, &str)]; 2] = [
+        &[
+            ("Stage", 42.0, 'a', "Stage the selected file or folder (ga)"),
+            ("Unstage", 52.0, 'u', "Unstage it (gu)"),
+            (
+                "Discard",
+                50.0,
+                'r',
+                "Throw away its changes, after asking (gr)",
+            ),
+            ("Commit", 48.0, 'c', "Commit what is staged (gc)"),
+        ],
+        &[
+            ("Stage all", 62.0, 'A', "Stage every change (gA)"),
+            ("Push", 38.0, 'p', "Push the branch (gp)"),
+            ("Pull", 38.0, 'l', "Pull the branch (gl)"),
+        ],
+    ];
     let mut buttons = Vec::new();
-    for (row, entries) in ROWS.iter().enumerate() {
-        let mut x = panel.x + 10.0;
-        for &(label, w, key, tip) in *entries {
-            buttons.push(Button {
-                bounds: Bounds {
-                    x,
-                    y: panel.y + crate::ui::TREE_HEADER + row as f32 * 26.0,
-                    w,
-                    h: 22.0,
-                },
-                label: label.into(),
-                tip: tip.into(),
-                click: Click::TreeKey(key),
-            });
-            x += w + 4.0;
+    let mut place = |rows: &[&[(&str, f32, char, &str)]], top: f32, git: bool| {
+        for (row, entries) in rows.iter().enumerate() {
+            let mut x = panel.x + 10.0;
+            for &(label, w, key, tip) in *entries {
+                // Drawn a little wider than the widths above, which suit smaller type.
+                let w = w * 1.15;
+                buttons.push(Button {
+                    bounds: Bounds {
+                        x,
+                        y: panel.y + top + row as f32 * crate::ui::TREE_BUTTON_ROW,
+                        w,
+                        h: 26.0,
+                    },
+                    label: label.into(),
+                    tip: tip.into(),
+                    click: if git {
+                        Click::TreeGit(key)
+                    } else {
+                        Click::TreeKey(key)
+                    },
+                });
+                x += w + 4.0;
+            }
         }
+    };
+    place(&ROWS, crate::ui::TREE_HEADER, false);
+    if git {
+        let top = crate::ui::TREE_HEADER + 2.0 * crate::ui::TREE_BUTTON_ROW + crate::ui::GIT_LINE;
+        place(&GIT_ROWS, top, true);
     }
     Toolbar { buttons }
 }
@@ -225,13 +271,18 @@ impl Toolbar {
     }
 }
 
+/// What choosing an item in a menu sets: the font the text is read in, or its size in points.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Choice {
+    Font(String),
+    Size(f32),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct PopupItem {
     pub bounds: Bounds,
     pub label: String,
-    /// A color to show as a square instead of text.
-    pub swatch: Option<[u8; 3]>,
-    pub action: Action,
+    pub choice: Choice,
     /// The choice that is in force now, shown marked.
     pub selected: bool,
 }
@@ -244,26 +295,6 @@ pub struct Popup {
     pub items: Vec<PopupItem>,
 }
 
-pub const COLORS: [[u8; 3]; 18] = [
-    [0x00, 0x00, 0x00],
-    [0x55, 0x55, 0x55],
-    [0x99, 0x99, 0x99],
-    [0xcc, 0x00, 0x00],
-    [0xe0, 0x6c, 0x00],
-    [0xc9, 0x9a, 0x00],
-    [0x2e, 0x8b, 0x57],
-    [0x00, 0x8b, 0x8b],
-    [0x1a, 0x5f, 0xb4],
-    [0x3f, 0x3f, 0xbf],
-    [0x8a, 0x2b, 0xe2],
-    [0xc2, 0x18, 0x5b],
-    [0x8b, 0x45, 0x13],
-    [0x6b, 0x8e, 0x23],
-    [0x00, 0x00, 0x80],
-    [0x80, 0x00, 0x00],
-    [0xe7, 0x54, 0x80],
-    [0xff, 0xff, 0xff],
-];
 pub const FONTS: [&str; 7] = [
     "Serif",
     "Sans",
@@ -279,67 +310,41 @@ pub const SIZES: [f32; 11] = [
 
 /// Lays out the list for `menu` under `anchor`, kept inside a window `window` big.
 pub fn popup(menu: Menu, anchor: Bounds, window: (f32, f32)) -> Popup {
-    const PAD: f32 = 6.0;
+    const PAD: f32 = 8.0;
     let mut items = Vec::new();
     // Choices are placed from (0, 0); the whole list is moved into place below.
-    let size = match menu {
-        Menu::Color => {
-            let (cell, gap, columns) = (22.0, 3.0, 6);
-            for (i, color) in COLORS.iter().enumerate() {
-                let (col, row) = ((i % columns) as f32, (i / columns) as f32);
-                items.push(PopupItem {
-                    bounds: Bounds {
-                        x: PAD + col * (cell + gap),
-                        y: PAD + row * (cell + gap),
-                        w: cell,
-                        h: cell,
-                    },
-                    label: String::new(),
-                    swatch: Some(*color),
-                    action: Action::Color(*color),
-                    selected: false,
-                });
-            }
-            let rows = COLORS.len().div_ceil(columns) as f32;
-            (
-                2.0 * PAD + columns as f32 * (cell + gap) - gap,
-                2.0 * PAD + rows * (cell + gap) - gap,
-            )
+    let size = {
+        let (width, row) = if menu == Menu::Font {
+            (210.0, 32.0)
+        } else {
+            (84.0, 30.0)
+        };
+        let labels: Vec<(String, Choice)> = if menu == Menu::Font {
+            FONTS
+                .iter()
+                .map(|f| (f.to_string(), Choice::Font(f.to_string())))
+                .collect()
+        } else {
+            SIZES
+                .iter()
+                .map(|&pt| (format!("{pt}"), Choice::Size(pt)))
+                .collect()
+        };
+        let count = labels.len() as f32;
+        for (i, (label, choice)) in labels.into_iter().enumerate() {
+            items.push(PopupItem {
+                bounds: Bounds {
+                    x: PAD,
+                    y: PAD + i as f32 * row,
+                    w: width - 2.0 * PAD,
+                    h: row,
+                },
+                label,
+                choice,
+                selected: false,
+            });
         }
-        Menu::Font | Menu::Size => {
-            let (width, row) = if menu == Menu::Font {
-                (170.0, 26.0)
-            } else {
-                (64.0, 24.0)
-            };
-            let labels: Vec<(String, Action)> = if menu == Menu::Font {
-                FONTS
-                    .iter()
-                    .map(|f| (f.to_string(), Action::FontFamily(f.to_string())))
-                    .collect()
-            } else {
-                SIZES
-                    .iter()
-                    .map(|&pt| (format!("{pt}"), Action::FontSize(pt)))
-                    .collect()
-            };
-            let count = labels.len() as f32;
-            for (i, (label, action)) in labels.into_iter().enumerate() {
-                items.push(PopupItem {
-                    bounds: Bounds {
-                        x: PAD,
-                        y: PAD + i as f32 * row,
-                        w: width - 2.0 * PAD,
-                        h: row,
-                    },
-                    label,
-                    swatch: None,
-                    action,
-                    selected: false,
-                });
-            }
-            (width, 2.0 * PAD + count * row)
-        }
+        (width, 2.0 * PAD + count * row)
     };
     let x = anchor.x.min(window.0 - size.0).max(0.0);
     let y = anchor.y + anchor.h + 2.0;
@@ -393,8 +398,28 @@ mod tests {
         assert_eq!(
             labels,
             [
-                "B", "I", "U", "S", "Font", "Size", "A", "AA", "H1", "H2", "H3", "\u{2022}", "1.",
-                "\"", "Link", "Outline", "Save", "MD", "PDF", "Auto", "\u{263e}", "?"
+                "B",
+                "I",
+                "S",
+                "x\u{b2}",
+                "x\u{2082}",
+                "AA",
+                "H1",
+                "H2",
+                "H3",
+                "\u{2022}",
+                "1.",
+                "\"",
+                "Link",
+                "Font",
+                "Size",
+                "Outline",
+                "Save",
+                "MD",
+                "PDF",
+                "Auto",
+                "\u{263e}",
+                "?"
             ]
         );
         let strip = strip();
@@ -407,7 +432,7 @@ mod tests {
         }
         // The file buttons are at the right end, clear of the text buttons.
         let last = toolbar.buttons.last().unwrap().bounds;
-        assert_eq!(last.x + last.w, strip.w - PADDING);
+        assert!((last.x + last.w - (strip.w - PADDING)).abs() < 0.01);
         assert_eq!(toolbar.buttons[15].click, Click::ToggleOutline);
         assert_eq!(toolbar.buttons[16].click, Click::Save);
         assert_eq!(toolbar.buttons[17].click, Click::ExportMarkdown);
@@ -423,7 +448,7 @@ mod tests {
                 - toolbar.buttons[i].bounds.x
                 - toolbar.buttons[i].bounds.w
         };
-        assert!(gap(3) > gap(0) && gap(0) == GAP);
+        assert!(gap(5) > gap(0) && (gap(0) - GAP).abs() < 0.01);
     }
 
     #[test]
@@ -436,21 +461,24 @@ mod tests {
         let (x, y) = center(0);
         let i = toolbar.hit(x, y).unwrap();
         assert_eq!(toolbar.buttons[i].click, Click::Do(Action::Bold));
-        let (x, y) = center(4);
+        let (x, y) = center(13);
         assert_eq!(
             toolbar.buttons[toolbar.hit(x, y).unwrap()].click,
             Click::Open(Menu::Font)
         );
         // Between groups and outside the strip hit nothing.
-        let b = toolbar.buttons[3].bounds;
+        let b = toolbar.buttons[5].bounds;
         assert_eq!(toolbar.hit(b.x + b.w + GROUP_GAP / 2.0, 17.0), None);
-        assert_eq!(toolbar.hit(700.0, 17.0), None);
+        let link = toolbar.buttons[12].bounds;
+        assert_eq!(toolbar.hit(link.x + link.w + 2.0, 17.0), None);
+        assert_eq!(toolbar.hit(strip().w + 5.0, 17.0), None);
         // Every formatting action has a button.
         for want in [
             Action::Bold,
             Action::Italic,
-            Action::Underline,
             Action::Strikethrough,
+            Action::Superscript,
+            Action::Subscript,
             Action::Uppercase,
             Action::Heading(1),
             Action::Heading(2),
@@ -473,7 +501,7 @@ mod tests {
     #[test]
     fn menus_open_under_their_button_and_stay_in_the_window() {
         let toolbar = toolbar(strip());
-        for (menu, index) in [(Menu::Font, 4), (Menu::Size, 5), (Menu::Color, 6)] {
+        for (menu, index) in [(Menu::Font, 13), (Menu::Size, 14)] {
             let anchor = toolbar.buttons[index].bounds;
             let popup = popup(menu, anchor, (1000.0, 700.0));
             assert_eq!(popup.bounds.y, anchor.y + anchor.h + 2.0);
@@ -501,33 +529,30 @@ mod tests {
     }
 
     #[test]
-    fn choosing_an_item_gives_its_action() {
+    fn choosing_an_item_gives_its_setting() {
         let anchor = Bounds {
             x: 100.0,
             y: 4.0,
             w: 26.0,
             h: 26.0,
         };
-        let colors = popup(Menu::Color, anchor, (1000.0, 700.0));
-        assert_eq!(colors.items.len(), 18);
-        let red = colors
-            .items
-            .iter()
-            .find(|i| i.swatch == Some([0xcc, 0, 0]))
-            .unwrap();
-        let (x, y) = (red.bounds.x + 5.0, red.bounds.y + 5.0);
-        assert_eq!(
-            colors.hit(x, y).unwrap().action,
-            Action::Color([0xcc, 0, 0])
-        );
-        assert!(colors.hit(0.0, 0.0).is_none());
         let sizes = popup(Menu::Size, anchor, (1000.0, 700.0));
         assert_eq!(sizes.items[5].label, "14");
-        assert_eq!(sizes.items[5].action, Action::FontSize(14.0));
-        let fonts = popup(Menu::Font, anchor, (1000.0, 700.0));
-        assert_eq!(fonts.items[3].action, Action::FontFamily("Georgia".into()));
+        assert_eq!(sizes.items[5].choice, Choice::Size(14.0));
+        let mut fonts = popup(Menu::Font, anchor, (1000.0, 700.0));
+        assert_eq!(fonts.items[3].choice, Choice::Font("Georgia".into()));
+        // The one in force is marked, whatever the case it was written in.
+        fonts.mark("georgia");
+        let marked: Vec<&str> = fonts
+            .items
+            .iter()
+            .filter(|i| i.selected)
+            .map(|i| i.label.as_str())
+            .collect();
+        assert_eq!(marked, ["Georgia"]);
+        assert!(fonts.hit(0.0, 0.0).is_none());
         // No two choices overlap: each point picks at most one.
-        for popup in [&colors, &sizes, &fonts] {
+        for popup in [&sizes, &fonts] {
             for item in &popup.items {
                 let (x, y) = (
                     item.bounds.x + item.bounds.w / 2.0,

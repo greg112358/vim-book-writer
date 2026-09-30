@@ -1,5 +1,4 @@
 use crate::djot::{Span, SpanKind};
-use crate::style::Style;
 use std::ops::Range;
 
 /// How a run of source text is drawn.
@@ -14,11 +13,11 @@ pub struct Format {
     pub bold: bool,
     pub italic: bool,
     pub strike: bool,
+    pub superscript: bool,
+    pub subscript: bool,
     /// Inline code.
     pub code: bool,
     pub link: bool,
-    /// Merged from every enclosing span's style attribute; the innermost value wins.
-    pub style: Style,
 }
 
 /// A stretch of source text drawn one way.
@@ -26,7 +25,7 @@ pub struct Format {
 pub struct Run {
     pub range: Range<usize>,
     /// Syntax the writer typed rather than text a reader sees: `**`, `## `, `> `, code fences,
-    /// and the `](url)` or `]{style="..."}` after a link or span. List markers count as text.
+    /// and the `](url)` or `]{.class}` after a link or span. List markers count as text.
     /// Insert mode draws markup faint; normal mode hides it.
     pub markup: bool,
     /// From every span whose range holds the run, delimiters included, so `**` is drawn bold.
@@ -67,16 +66,12 @@ pub fn runs(src: &str, spans: &[Span]) -> Vec<Run> {
                     SpanKind::Strong => format.bold = true,
                     SpanKind::Emphasis => format.italic = true,
                     SpanKind::Strikethrough => format.strike = true,
+                    SpanKind::Superscript => format.superscript = true,
+                    SpanKind::Subscript => format.subscript = true,
                     SpanKind::Code => format.code = true,
                     SpanKind::Link => format.link = true,
                     SpanKind::ListItem | SpanKind::BlockquoteMarker | SpanKind::Span => {}
                 }
-                format.style.color = span.style.color.or(format.style.color);
-                format.style.size_pt = span.style.size_pt.or(format.style.size_pt);
-                if span.style.family.is_some() {
-                    format.style.family.clone_from(&span.style.family);
-                }
-                format.style.underline |= span.style.underline;
             }
             let markup = in_markup > 0;
             match out.last_mut() {
@@ -170,21 +165,18 @@ mod tests {
     }
 
     #[test]
-    fn style_attribute_block_is_markup_and_style_applies_to_content() {
-        let src = r#"x [text]{style="color:#c00"} y"#;
+    fn an_attribute_block_is_markup_and_the_text_is_not() {
+        let src = r#"x [text]{.note} y"#;
         assert_eq!(
             view(src),
             [
                 (false, "x "),
                 (true, "["),
                 (false, "text"),
-                (true, r#"]{style="color:#c00"}"#),
+                (true, "]{.note}"),
                 (false, " y"),
             ]
         );
-        let runs = runs(src, &parse(src));
-        assert_eq!(runs[0].format.style.color, None);
-        assert_eq!(runs[2].format.style.color, Some([0xcc, 0, 0]));
     }
 
     #[test]

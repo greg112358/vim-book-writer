@@ -13,14 +13,26 @@ pub fn dir() -> Option<PathBuf> {
             .filter(|p| p.is_absolute())
             .unwrap_or_else(|| home.join(".config"))
     };
-    Some(base.join("book-writing-app"))
+    Some(base.join("vim-book-writer"))
+}
+
+/// The app was once called `book-writing-app`. Moves its settings and recent files to the folder
+/// for the new name, once, so nothing is lost by the rename.
+pub fn migrate() {
+    let Some(new) = dir() else { return };
+    let old = new.with_file_name("book-writing-app");
+    if !new.exists() && old.is_dir() {
+        let _ = std::fs::rename(old, new);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    pub font_family: String,
-    pub font_size: f32,
+    /// The font the text is read in. This is how it looks to you, not part of the document.
+    pub font: String,
+    /// The size the text is read in, in points.
+    pub size: f32,
     pub vim_mode: bool,
     /// Save the file by itself once edits stop.
     pub auto_save: bool,
@@ -33,8 +45,8 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            font_family: "serif".into(),
-            font_size: 16.0,
+            font: "Serif".into(),
+            size: 14.0,
             vim_mode: false,
             auto_save: false,
             dark: false,
@@ -77,9 +89,12 @@ mod tests {
 
     #[test]
     fn missing_fields_fall_back_to_defaults() {
-        let config = Config::from_toml("font_size = 20.0").unwrap();
-        assert_eq!(config.font_size, 20.0);
-        assert_eq!(config.font_family, "serif");
+        let config = Config::from_toml("size = 20.0").unwrap();
+        assert_eq!(config.size, 20.0);
+        assert_eq!(config.font, "Serif");
+        // Settings from before the reading font was one are ignored, not an error.
+        let old = Config::from_toml("font_family = \"serif\"\nfont_size = 16.0").unwrap();
+        assert_eq!((old.font.as_str(), old.size), ("Serif", 14.0));
         assert!(!config.vim_mode);
     }
 
@@ -103,7 +118,7 @@ mod tests {
         assert_eq!(Config::load(&path), Config::default());
         let config = Config {
             auto_save: true,
-            font_size: 20.0,
+            size: 20.0,
             ..Config::default()
         };
         config.save(&path).unwrap();
@@ -115,6 +130,6 @@ mod tests {
 
     #[test]
     fn rejects_wrong_types() {
-        assert!(Config::from_toml("font_size = \"big\"").is_err());
+        assert!(Config::from_toml("size = \"big\"").is_err());
     }
 }

@@ -18,17 +18,18 @@ commit message. If the image looks wrong, fix it and re-render before checking t
   color, so the source stays readable while it's obvious what it will become.
 - Visual mode selects text; the same formatting commands apply to the selection.
 
-**Formatting.** Toolbar buttons and traditional shortcuts (Ctrl/Cmd+B, I, U, etc.) act on the current selection, or on the
+**Formatting.** Toolbar buttons and traditional shortcuts (Ctrl/Cmd+B, I) act on the current selection, or on the
 word under the cursor if there is no selection.
 
-**Toolbar.** Compact, dense, one thin row. Only things djot can express:
-bold, italic, underline, strikethrough, font color, font name, font size, uppercase, headings, lists, quote, link,
-save, export (Markdown/PDF), auto-save toggle.
+**Toolbar.** Compact, dense, one thin row. Only things djot has by default: bold, italic, strikethrough, superscript,
+subscript, uppercase, headings, lists, quote, link. On the right are the file buttons (save, export Markdown/PDF,
+auto-save) and the window settings, like the light/dark look.
 
-**Font name, size and color** have no native djot syntax, so they use attributes on a span:
-`[text]{style="color:#c00;font-size:14pt;font-family:Georgia"}`. Underline is
-`[text]{style="text-decoration:underline"}`. Using `style` means HTML output works with no translation.
-The **uppercase** button converts the selected characters to uppercase (an edit, not a style), so it survives export.
+**The text is just the text.** Nothing that djot doesn't have by default goes into a document: no colors, sizes, fonts,
+underline or `style` attributes. That keeps the difference between normal mode (rendered) and insert mode (source) down
+to the small djot delimiters. The **Font** and **Size** buttons on the right of the top bar are a reading setting, kept
+in the settings file like the light/dark look: they change how the text looks to you, never the document or its exports.
+The **uppercase** button converts the selected characters to uppercase (an edit, not a style).
 
 **Files.** Start screen shows "Open recent", "Open folder" and "Open file". `:w` and the Save button do the same thing.
 An auto-save toggle saves after edits stop. Recent files and settings live in the OS config directory as TOML.
@@ -50,10 +51,13 @@ buttons. Smooth scrolling and transitions. Continuous scroll layout with a fixed
 - Vim depth: solid core. Motions, operators, text objects (`ciw`, `di"`, `ap`), visual and visual-line, registers,
   dot-repeat, undo/redo, search (`/`, `n`, `N`), `:w` `:q` `:wq`. No macros, marks, visual-block, or `:s`/`:g`.
 - Vim extras added after the core: `{ } W B E`, `f F t T ; ,`, `r ~ J`, visual `o p u U ~ J`, `Ctrl-d/u/f/b` and `zz zt zb`
-  (smooth scrolling; in normal mode Ctrl-b and Ctrl-u scroll instead of formatting), `:N`, and insert `Ctrl-w` / `Ctrl-h`.
-- Panels: the outline (left) and the file tree (right) both take the keyboard: `Ctrl-E` for the tree, `Ctrl-T` for
+  (smooth scrolling; in normal mode Ctrl-b and Ctrl-u scroll instead of formatting), `:N`, and insert `Ctrl-w`.
+- Panels: the outline (left) and the file tree (right) both take the keyboard: `Ctrl-L` for the tree, `Ctrl-H` for
   the outline, `j`/`k` to move, Enter to open or fold. The tree also has buttons for new file/folder, rename, delete
   (asks first in a dialog), copy, move, yank and paste. `F1` or `:help` lists every key.
+- Git, like VS Code's, by way of the `git` program: names in the file tree are colored with a letter (M, A, U, D, C),
+  the status bar and the tree show the branch, bars in the margin mark lines changed since the last commit, and the
+  tree has stage, unstage, discard (asks first), commit, push and pull (`ga gu gA gr gc gp gl`, or its buttons).
 - Djot scope for v1: headings, paragraphs, emphasis/strong, strikethrough, links, lists, blockquotes, code,
   thematic break, attributes. No images, tables, footnotes, math, definition lists, task lists, or divs yet.
 - Export: Markdown and PDF only.
@@ -75,17 +79,13 @@ buttons. Smooth scrolling and transitions. Continuous scroll layout with a fixed
 ### Djot model
 - [x] Add `jotdown`. Parse a document into styled spans that keep source byte ranges; tests for headings, lists,
       blockquote, code, links, emphasis, strong, strikethrough, and nested emphasis
-- [x] Parse `{style="..."}` attributes into structured style (color, font-size, font-family, underline); tests include
-      malformed values, which must be ignored without panicking
 - [x] Insert-mode styling map: for a source range, produce which characters are content and which are markup
-      delimiters (so the renderer can draw delimiters faint); tests for `**bold**`, `_italic_`, `[text]{style="..."}`
+      delimiters (so the renderer can draw delimiters faint); tests for `**bold**`, `_italic_`, `{^sup^}`
 - [x] Normal-mode rendering map: same input, but with delimiters and attribute blocks hidden; tests confirm the visible
       text of `**bold** and _it_` is `bold and it`
 
 ### Formatting commands
 - [x] Toggle bold/italic/strikethrough over a selection: wraps with the delimiters, and removes them if already applied
-- [x] Toggle underline via a style span
-- [x] Apply font color, size, and name via a style span; merge into an existing span instead of nesting a new one
 - [x] Uppercase the selection
 - [x] With no selection, formatting applies to the word under the cursor
 - [x] Each formatting command is one undo step
@@ -106,7 +106,7 @@ buttons. Smooth scrolling and transitions. Continuous scroll layout with a fixed
 - [x] Auto-save state machine: saves after N ms of no edits, not while nothing changed; tested with a fake clock
 - [x] File tree model with Neo-tree operations (add, delete, rename, copy, move, yank path, paste, toggle hidden);
       tests use a temp directory
-- [x] Export djot to Markdown; tests confirm color/size/font/underline are dropped and text is kept
+- [x] Export djot to Markdown; tests confirm text is kept and characters CommonMark would read as markup are escaped
 - [x] Export djot to PDF with `printpdf`; tests confirm a valid PDF is produced and text appears in it
 
 ## Milestone 2: Window and rendering

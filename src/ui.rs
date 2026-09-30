@@ -1,17 +1,46 @@
-use crate::toolbar::{Click, Menu, Popup, Toolbar};
+use crate::diff::Change;
+use crate::git::Tone;
+use crate::toolbar::{Click, Popup, Toolbar};
 use crate::vim::Mode;
 use taffy::prelude::*;
 
-/// Body text size in pixels, and the line height as a multiple of it.
-pub const FONT_SIZE: f32 = 18.0;
+/// The line height of the text, as a multiple of its size.
 pub const LINE_HEIGHT: f32 = 1.5;
-/// The height of a row of body text, which page scrolls count in.
-pub const BODY_ROW: f32 = FONT_SIZE * LINE_HEIGHT;
 
-pub const TOOLBAR_HEIGHT: f32 = 34.0;
+/// How the text is read: the font and size it is drawn in. This is a setting of the window, like
+/// the light or dark look, and is not part of the document.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Reading {
+    pub family: String,
+    /// In points.
+    pub size_pt: f32,
+}
+
+impl Reading {
+    /// The size of body text in pixels.
+    pub fn size(&self) -> f32 {
+        self.size_pt * 96.0 / 72.0
+    }
+
+    /// The height of a row of body text, which page scrolls count in.
+    pub fn row(&self) -> f32 {
+        self.size() * LINE_HEIGHT
+    }
+}
+
+impl Default for Reading {
+    fn default() -> Self {
+        Self {
+            family: "Serif".into(),
+            size_pt: 14.0,
+        }
+    }
+}
+
+pub const TOOLBAR_HEIGHT: f32 = 42.0;
 pub const STATUS_HEIGHT: f32 = 24.0;
-pub const TREE_WIDTH: f32 = 260.0;
-pub const OUTLINE_WIDTH: f32 = 220.0;
+pub const TREE_WIDTH: f32 = 300.0;
+pub const OUTLINE_WIDTH: f32 = 240.0;
 
 /// A rectangle of the window, in pixels from its top left.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -188,10 +217,23 @@ pub struct Chrome {
 
 pub const TREE_HEADER: f32 = 34.0;
 pub const TREE_ROW: f32 = 22.0;
-/// The two rows of buttons under the file tree's header.
-pub const TREE_BUTTONS: f32 = 56.0;
-/// Where the file tree's rows start, from the top of its panel.
-pub const TREE_TOP: f32 = TREE_HEADER + TREE_BUTTONS;
+/// The room for a row of buttons in the file tree, and the line of git news over the git ones.
+pub const TREE_BUTTON_ROW: f32 = 30.0;
+pub const GIT_LINE: f32 = 20.0;
+/// Where the file tree's rows start, from the top of its panel: under two rows of file buttons,
+/// and for a repository the branch line and two rows of git buttons.
+pub const fn tree_top(git: bool) -> f32 {
+    TREE_HEADER
+        + 2.0 * TREE_BUTTON_ROW
+        + 4.0
+        + if git {
+            GIT_LINE + 2.0 * TREE_BUTTON_ROW
+        } else {
+            0.0
+        }
+}
+/// Where the file tree's rows start in a folder that is not a repository.
+pub const TREE_TOP: f32 = tree_top(false);
 
 /// The room a panel keeps at the bottom for its hint.
 const FOOTER: f32 = 36.0;
@@ -216,6 +258,18 @@ pub struct TreeRow {
     pub is_dir: bool,
     pub expanded: bool,
     pub selected: bool,
+    /// What git says about it: how to color it, and the letter for a file.
+    pub git: Option<(Tone, Option<char>)>,
+}
+
+/// What the file tree says about the repository it is in.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GitInfo {
+    pub branch: String,
+    pub ahead: usize,
+    pub behind: usize,
+    pub changes: usize,
+    pub staged: usize,
 }
 
 /// The file tree as it is now: the folder's name, the rows that fit from the first one showing,
@@ -225,6 +279,7 @@ pub struct TreeView {
     pub header: String,
     pub rows: Vec<TreeRow>,
     pub focused: bool,
+    pub git: Option<GitInfo>,
 }
 
 /// One heading in the outline.
@@ -299,8 +354,8 @@ pub const HELP: [HelpGroup; 5] = [
     (
         "Panels",
         &[
-            ("Ctrl-E", "file tree: go there, again to come back"),
-            ("Ctrl-T", "outline: go there, again to come back"),
+            ("Ctrl-L", "file tree: go there, again to come back"),
+            ("Ctrl-H", "outline: go there, again to come back"),
             ("j  k", "move up and down in a panel"),
             ("Enter", "open a file, fold a folder, go to a heading"),
             ("o  Tab", "the same, but stay in the panel"),
@@ -312,6 +367,10 @@ pub const HELP: [HelpGroup; 5] = [
         "File tree",
         &[
             ("a  A", "new file, new folder"),
+            ("g a  g u", "git: stage, unstage (g A: all)"),
+            ("g r", "git: discard changes (asks first)"),
+            ("g c", "git: commit"),
+            ("g p  g l", "git: push, pull"),
             ("r", "rename"),
             ("d", "delete (asks first)"),
             ("c  m", "copy or move to a path you type"),
@@ -351,7 +410,10 @@ pub const HELP: [HelpGroup; 5] = [
         &[
             ("Ctrl-S  :w", "save (:q  :wq  :q!  :e!)"),
             ("Ctrl-O", "open a file"),
-            ("Ctrl-B I U", "bold, italic, underline a selection"),
+            (
+                "Ctrl-B  I",
+                "bold, italic (Ctrl-B is page up in normal mode)",
+            ),
             ("Ctrl-C X V", "copy, cut, paste"),
             ("F1  :help", "this list"),
         ],
@@ -364,8 +426,6 @@ pub struct Interface<'a> {
     /// The button the mouse is over.
     pub hover: Option<usize>,
     pub popup: Option<&'a Popup>,
-    /// The color last chosen, shown under the color button.
-    pub color: [u8; 3],
     pub tree: Option<&'a TreeView>,
     pub outline: Option<&'a OutlineView>,
     /// The file tree's buttons, and the one the mouse is over.
@@ -397,7 +457,6 @@ pub struct Theme {
     pub shadow: [u8; 4],
     /// A toggle button that is on.
     pub pressed: [u8; 4],
-    pub swatch_border: [u8; 4],
     pub tree_focused: [u8; 4],
     pub tree_unfocused: [u8; 4],
     pub tree_file: [u8; 4],
@@ -411,6 +470,15 @@ pub struct Theme {
     pub link: [u8; 4],
     pub quote: [u8; 4],
     pub selection: [u8; 4],
+    /// Names in the file tree by what git says, and the bars in the margin by how a line changed.
+    pub git_untracked: [u8; 4],
+    pub git_added: [u8; 4],
+    pub git_modified: [u8; 4],
+    pub git_deleted: [u8; 4],
+    pub git_conflict: [u8; 4],
+    pub gutter_added: [u8; 4],
+    pub gutter_modified: [u8; 4],
+    pub gutter_deleted: [u8; 4],
     /// Searched-for text, and the match the cursor is on.
     pub found: [u8; 4],
     pub found_here: [u8; 4],
@@ -430,7 +498,6 @@ const LIGHT: Theme = Theme {
     menu: [0xfc, 0xf9, 0xf2, 0xff],
     shadow: [0, 0, 0, 0x28],
     pressed: [0xd2, 0xc8, 0xac, 0xff],
-    swatch_border: [0x99, 0x92, 0x84, 0xff],
     tree_focused: [0xd9, 0xcf, 0xb4, 0xff],
     tree_unfocused: [0xe6, 0xdf, 0xcd, 0xff],
     tree_file: [0x44, 0x40, 0x38, 0xff],
@@ -443,6 +510,14 @@ const LIGHT: Theme = Theme {
     link: [0x1a, 0x5f, 0xb4, 0xff],
     quote: [0x5a, 0x5a, 0x5a, 0xff],
     selection: [0x7f, 0xae, 0xe6, 0x80],
+    git_untracked: [0x58, 0x7c, 0x0c, 0xff],
+    git_added: [0x38, 0x7a, 0x3c, 0xff],
+    git_modified: [0x89, 0x55, 0x03, 0xff],
+    git_deleted: [0xad, 0x07, 0x07, 0xff],
+    git_conflict: [0xc0, 0x20, 0x30, 0xff],
+    gutter_added: [0x2e, 0xa0, 0x43, 0xff],
+    gutter_modified: [0x1b, 0x81, 0xa8, 0xff],
+    gutter_deleted: [0xe0, 0x40, 0x40, 0xff],
     found: [0xf2, 0xd0, 0x5a, 0x90],
     found_here: [0xf0, 0x9a, 0x2c, 0xc0],
     block: [0x2b, 0x5c, 0xb8, 0x66],
@@ -461,7 +536,6 @@ const DARK: Theme = Theme {
     menu: [0x2b, 0x29, 0x25, 0xff],
     shadow: [0, 0, 0, 0x60],
     pressed: [0x48, 0x43, 0x3b, 0xff],
-    swatch_border: [0x6b, 0x66, 0x5b, 0xff],
     tree_focused: [0x4a, 0x44, 0x38, 0xff],
     tree_unfocused: [0x36, 0x33, 0x2e, 0xff],
     tree_file: [0xcf, 0xc9, 0xbb, 0xff],
@@ -474,6 +548,14 @@ const DARK: Theme = Theme {
     link: [0x7f, 0xb0, 0xee, 0xff],
     quote: [0xb0, 0xaa, 0x9e, 0xff],
     selection: [0x3a, 0x5f, 0x94, 0xa0],
+    git_untracked: [0x73, 0xc9, 0x91, 0xff],
+    git_added: [0x81, 0xb8, 0x8b, 0xff],
+    git_modified: [0xe2, 0xc0, 0x8d, 0xff],
+    git_deleted: [0xc7, 0x4e, 0x39, 0xff],
+    git_conflict: [0xe4, 0x67, 0x6b, 0xff],
+    gutter_added: [0x58, 0xa6, 0x5d, 0xff],
+    gutter_modified: [0x3f, 0x9c, 0xc4, 0xff],
+    gutter_deleted: [0xd0, 0x50, 0x50, 0xff],
     found: [0x8a, 0x6d, 0x1c, 0x90],
     found_here: [0xc2, 0x84, 0x22, 0xc0],
     block: [0x7f, 0xae, 0xe6, 0x80],
@@ -484,10 +566,30 @@ impl Theme {
     pub fn new(dark: bool) -> &'static Theme {
         if dark { &DARK } else { &LIGHT }
     }
+
+    /// The color of a name in the file tree that git has something to say about.
+    pub fn tone(&self, tone: Tone) -> [u8; 4] {
+        match tone {
+            Tone::Untracked => self.git_untracked,
+            Tone::Added => self.git_added,
+            Tone::Modified => self.git_modified,
+            Tone::Deleted => self.git_deleted,
+            Tone::Conflict => self.git_conflict,
+        }
+    }
+
+    /// The color of the bar in the margin beside a changed line.
+    pub fn gutter(&self, change: Change) -> [u8; 4] {
+        match change {
+            Change::Added => self.gutter_added,
+            Change::Modified => self.gutter_modified,
+            Change::Removed => self.gutter_deleted,
+        }
+    }
 }
 
 const LABEL_SIZE: f32 = 12.0;
-const BUTTON_SIZE: f32 = 13.0;
+const BUTTON_SIZE: f32 = 15.0;
 
 /// What the status bar says.
 #[derive(Debug, Clone, PartialEq)]
@@ -496,6 +598,8 @@ pub struct Status {
     pub file: String,
     pub modified: bool,
     pub words: usize,
+    /// The git branch and whether it has changes, when the file is in a repository.
+    pub branch: Option<String>,
     /// Where the cursor is among them, or how many are selected.
     pub spot: Spot,
     /// A note from the editor, like a failed search, shown in place of the file.
@@ -581,7 +685,6 @@ pub fn chrome(regions: &Regions, status: &Status, ui: &Interface<'_>) -> Chrome 
         } else if ui.hover == Some(i) || open {
             chrome.rects.push(Rect::new(b, t.hover));
         }
-        let is_color = button.click == Click::Open(Menu::Color);
         chrome.labels.push(Label {
             // The theme button shows the look a click switches to.
             text: match button.click {
@@ -589,24 +692,13 @@ pub fn chrome(regions: &Regions, status: &Status, ui: &Interface<'_>) -> Chrome 
                 _ => button.label.clone(),
             },
             x: b.x + b.w / 2.0,
-            // The color button's letter sits higher, to leave room for the swatch under it.
-            y: b.y + (b.h - BUTTON_SIZE * 1.3) / 2.0 - if is_color { 2.0 } else { 0.0 },
+            y: b.y + (b.h - BUTTON_SIZE * 1.3) / 2.0,
             size: BUTTON_SIZE,
             color: t.ink,
             bold: matches!(button.label.as_str(), "B" | "H1" | "H2" | "H3") || on,
             italic: button.label == "I",
             align: Align::Center,
         });
-        if is_color {
-            let [r, g, blue] = ui.color;
-            chrome.rects.push(Rect {
-                x: b.x + 6.0,
-                y: b.y + b.h - 8.0,
-                w: b.w - 12.0,
-                h: 3.0,
-                color: [r, g, blue, 0xff],
-            });
-        }
     }
     if let Some(popup) = ui.popup {
         let p = popup.bounds;
@@ -630,29 +722,16 @@ pub fn chrome(regions: &Regions, status: &Status, ui: &Interface<'_>) -> Chrome 
             if item.selected {
                 chrome.over_rects.push(Rect::new(b, t.pressed));
             }
-            if let Some([r, g, blue]) = item.swatch {
-                chrome.over_rects.push(Rect::new(b, t.swatch_border));
-                chrome.over_rects.push(Rect::new(
-                    Bounds {
-                        x: b.x + 1.0,
-                        y: b.y + 1.0,
-                        w: b.w - 2.0,
-                        h: b.h - 2.0,
-                    },
-                    [r, g, blue, 0xff],
-                ));
-            } else {
-                chrome.over_labels.push(Label {
-                    text: item.label.clone(),
-                    x: b.x + 6.0,
-                    y: b.y + (b.h - BUTTON_SIZE * 1.3) / 2.0,
-                    size: BUTTON_SIZE,
-                    color: t.ink,
-                    bold: item.selected,
-                    italic: false,
-                    align: Align::Left,
-                });
-            }
+            chrome.over_labels.push(Label {
+                text: item.label.clone(),
+                x: b.x + 6.0,
+                y: b.y + (b.h - BUTTON_SIZE * 1.3) / 2.0,
+                size: BUTTON_SIZE,
+                color: t.ink,
+                bold: item.selected,
+                italic: false,
+                align: Align::Left,
+            });
         }
     }
     // The hovered button's tip goes under it, unless a menu is open there.
@@ -749,7 +828,7 @@ pub fn chrome(regions: &Regions, status: &Status, ui: &Interface<'_>) -> Chrome 
                 "Esc back to the text   F1 help",
             ]
         } else {
-            ["Ctrl-T to move around here", "F1 lists every key"]
+            ["Ctrl-H to move around here", "F1 lists every key"]
         };
         for (i, line) in hint.into_iter().enumerate() {
             let mut label = text(
@@ -795,7 +874,9 @@ pub fn chrome(regions: &Regions, status: &Status, ui: &Interface<'_>) -> Chrome 
                 ..line(tree)
             });
             for (i, row) in view.rows.iter().enumerate() {
-                let y = tree.y + TREE_TOP + i as f32 * TREE_ROW;
+                let y = tree.y
+                    + tree_top(ui.tree.is_some_and(|v| v.git.is_some()))
+                    + i as f32 * TREE_ROW;
                 if row.selected {
                     let fill = if view.focused {
                         t.tree_focused
@@ -815,7 +896,21 @@ pub fn chrome(regions: &Regions, status: &Status, ui: &Interface<'_>) -> Chrome 
                     (true, false) => "\u{25b8} ",
                     _ => "   ",
                 };
-                let color = if row.is_dir { t.ink } else { t.tree_file };
+                let mut color = if row.is_dir { t.ink } else { t.tree_file };
+                if let Some((tone, letter)) = row.git {
+                    color = t.tone(tone);
+                    // A file gets its letter at the right; a folder a dot, since it holds changes.
+                    chrome.labels.push(Label {
+                        align: Align::Right,
+                        ..text(
+                            letter.unwrap_or('\u{2022}').to_string(),
+                            tree.x + tree.w - 12.0,
+                            y + 3.0,
+                            true,
+                            color,
+                        )
+                    });
+                }
                 chrome.labels.push(text(
                     format!("{marker}{}", row.name),
                     tree.x + 10.0 + row.depth as f32 * 14.0,
@@ -824,6 +919,31 @@ pub fn chrome(regions: &Regions, status: &Status, ui: &Interface<'_>) -> Chrome 
                     color,
                 ));
             }
+        }
+        // The branch, and how far it is from its upstream, over the git buttons.
+        if let Some(git) = ui.tree.and_then(|v| v.git.as_ref()) {
+            let mut news = git.branch.clone();
+            if git.ahead > 0 {
+                news.push_str(&format!(" \u{2191}{}", git.ahead));
+            }
+            if git.behind > 0 {
+                news.push_str(&format!(" \u{2193}{}", git.behind));
+            }
+            news.push_str(&match (git.changes, git.staged) {
+                (0, _) => " \u{b7} clean".to_string(),
+                (n, 0) => format!(" \u{b7} {n} changed"),
+                (n, s) => format!(" \u{b7} {n} changed, {s} staged"),
+            });
+            chrome.labels.push(Label {
+                text: news,
+                x: tree.x + 12.0,
+                y: tree.y + TREE_HEADER + 2.0 * TREE_BUTTON_ROW + 2.0,
+                size: 11.0,
+                color: t.muted,
+                bold: false,
+                italic: false,
+                align: Align::Left,
+            });
         }
         if let Some(buttons) = ui.tree_buttons {
             for (i, button) in buttons.buttons.iter().enumerate() {
@@ -839,8 +959,8 @@ pub fn chrome(regions: &Regions, status: &Status, ui: &Interface<'_>) -> Chrome 
                 chrome.labels.push(Label {
                     text: button.label.clone(),
                     x: b.x + b.w / 2.0,
-                    y: b.y + (b.h - LABEL_SIZE * 1.3) / 2.0,
-                    size: LABEL_SIZE,
+                    y: b.y + (b.h - 13.0 * 1.3) / 2.0,
+                    size: 13.0,
                     color: t.ink,
                     bold: false,
                     italic: false,
@@ -855,7 +975,7 @@ pub fn chrome(regions: &Regions, status: &Status, ui: &Interface<'_>) -> Chrome 
                 "a A new   r rename   d delete",
             ]
         } else {
-            ["Ctrl-E to move around here", "F1 lists every key"]
+            ["Ctrl-L to move around here", "F1 lists every key"]
         };
         for (i, line) in hint.into_iter().enumerate() {
             chrome.labels.push(Label {
@@ -1080,6 +1200,10 @@ pub fn chrome(regions: &Regions, status: &Status, ui: &Interface<'_>) -> Chrome 
         Spot::Word(n) if n > 0 => format!("word {n} \u{b7} {total}"),
         _ => total,
     };
+    let words = match &status.branch {
+        Some(branch) => format!("{branch} \u{b7} {words}"),
+        None => words,
+    };
     chrome.labels.push(label(
         words,
         bar.x + bar.w - 12.0,
@@ -1204,6 +1328,7 @@ mod tests {
             is_dir,
             expanded,
             selected,
+            git: None,
         };
         let view = TreeView {
             header: "novel".into(),
@@ -1213,12 +1338,14 @@ mod tests {
                 row("notes", 0, true, false, false),
             ],
             focused: true,
+            git: None,
         };
         let status = Status {
             mode: Mode::Normal,
             file: "f".into(),
             modified: false,
             words: 0,
+            branch: None,
             spot: Spot::Word(0),
             message: String::new(),
         };
@@ -1226,7 +1353,6 @@ mod tests {
             toolbar: &toolbar,
             hover: None,
             popup: None,
-            color: [0; 3],
             tree: Some(&view),
             autosave: false,
             theme: Theme::new(false),
@@ -1278,6 +1404,7 @@ mod tests {
             file: "book.dj".into(),
             modified,
             words,
+            branch: None,
             spot: Spot::Word(0),
             message: message.into(),
         };
@@ -1288,7 +1415,6 @@ mod tests {
             toolbar: &toolbar,
             hover: None,
             popup: None,
-            color: [0, 0, 0],
             tree: None,
             autosave: false,
             theme: Theme::new(false),
@@ -1340,7 +1466,6 @@ mod tests {
             toolbar: &toolbar,
             hover: None,
             popup: None,
-            color: [0, 0, 0],
             tree: None,
             autosave: false,
             theme: Theme::new(false),

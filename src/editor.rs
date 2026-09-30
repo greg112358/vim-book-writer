@@ -1,12 +1,10 @@
 use crate::action::Action;
 use crate::blocks::{set_heading, toggle_list, toggle_quote};
 use crate::buffer::Buffer;
+use crate::diff::{self, Change};
 use crate::display::Display;
 use crate::document::Document;
-use crate::format::{
-    Mark, set_color, set_font_family, set_font_size, toggle, toggle_link, toggle_underline,
-    uppercase,
-};
+use crate::format::{Mark, toggle, toggle_link, uppercase};
 use crate::motion::{word_back, word_end};
 use crate::outline::{self, Heading};
 use crate::ui::Spot;
@@ -30,6 +28,8 @@ pub struct View<'a> {
     pub selection: Option<Range<usize>>,
     /// Where the searched-for text is, as offsets in `display.text`, in order.
     pub found: &'a [Range<usize>],
+    /// The display lines that differ from the base text, for bars in the margin.
+    pub changes: &'a [(usize, Change)],
 }
 
 /// What the window shows while a `:s` is being typed: the text with it done.
@@ -70,6 +70,15 @@ pub struct Editor {
     /// The text a `:s` being typed would make, and the revision and command it was made for.
     preview: Option<Preview>,
     preview_for: (u64, String),
+    /// The text to compare with for the marks in the margin, such as the last commit's, and how
+    /// many times it has been set.
+    base: Option<String>,
+    base_version: u64,
+    /// The display lines that differ from `base`, and what they were made for.
+    changes: Vec<(usize, Change)>,
+    changes_for: (u64, u64, u64),
+    /// Counts the times the text was written to its file.
+    pub saves: u64,
     /// The headings, and the buffer revision they were read at.
     headings: Option<(u64, Vec<Heading>)>,
 }
@@ -93,6 +102,11 @@ impl Editor {
             found_for: (0, String::new()),
             preview: None,
             preview_for: (0, String::new()),
+            base: None,
+            base_version: 0,
+            changes: Vec::new(),
+            changes_for: (u64::MAX, 0, 0),
+            saves: 0,
             headings: None,
         };
         // A file that starts with hidden syntax, like `# `, opens with the cursor on the text.
@@ -148,33 +162,6 @@ impl Editor {
             slot => *slot = Some((revision, outline::headings(self.buf.text()))),
         }
         &self.headings.as_ref().unwrap().1
-    }
-
-    /// The font family of the selection, or of the text under the cursor: `None` if the selection
-    /// holds more than one. Text with no family of its own is in the body font, `Serif`.
-    pub fn current_font(&mut self) -> Option<String> {
-        let cursor = self.buf.cursor();
-        let selection = self.vim.selection(&self.buf);
-        let (display, _) = self.display();
-        let families = |range: Range<usize>| -> Vec<Option<&str>> {
-            let mut found: Vec<Option<&str>> = display
-                .spans
-                .iter()
-                .filter(|s| !s.faint && s.source.start < range.end && s.source.end > range.start)
-                .map(|s| s.format.style.family.as_deref())
-                .collect();
-            found.dedup();
-            found
-        };
-        // With no selection, the char under the cursor, or the one before it at the end.
-        let mut found = families(selection.unwrap_or(cursor..cursor + 1));
-        if found.is_empty() {
-            found = families(cursor.saturating_sub(1)..cursor);
-        }
-        match found.as_slice() {
-            [family] => Some(family.unwrap_or("Serif").to_string()),
-            _ => None,
-        }
     }
 
     /// Puts the cursor at source offset `offset`, moved off any hidden syntax there.
@@ -279,12 +266,11 @@ impl Editor {
                 self.save();
                 return false;
             }
-            // In normal mode Ctrl-b and Ctrl-u scroll instead.
-            Key::Ctrl(c @ ('b' | 'i' | 'u')) if c == 'i' || self.vim.mode != Mode::Normal => {
+            // In normal mode Ctrl-b scrolls instead.
+            Key::Ctrl(c @ ('b' | 'i')) if c == 'i' || self.vim.mode != Mode::Normal => {
                 self.apply(&match c {
                     'b' => Action::Bold,
-                    'i' => Action::Italic,
-                    _ => Action::Underline,
+                    _ => Action::Italic,
                 });
                 return false;
             }
@@ -409,9 +395,27 @@ impl Editor {
                 cursor: preview.cursor,
                 selection: None,
                 found: &preview.found,
+                changes: &[],
             };
         }
         let display = &self.display;
+        let key = (revision, self.base_version, version);
+        if self.changes_for != key {
+            self.changes_for = key;
+            self.changes.clear();
+            if let Some(base) = &self.base {
+                let text = self.buf.text();
+                let mut starts = vec![0];
+                starts.extend(text.match_indices('\n').map(|(i, _)| i + 1));
+                for (line, change) in diff::marks(base, text) {
+                    let at = starts.get(line).copied().unwrap_or(text.len());
+                    let shown = display.line_and_index(display.to_display(at)).0;
+                    if self.changes.last().is_none_or(|&(last, _)| last != shown) {
+                        self.changes.push((shown, change));
+                    }
+                }
+            }
+        }
         let pattern = self.vim.highlight_pattern();
         let pattern = pattern.as_deref().unwrap_or("");
         if self.found_for.0 != version || self.found_for.1 != pattern {
@@ -436,7 +440,14 @@ impl Editor {
             cursor: display.to_display(cursor),
             selection: selection.map(|r| display.to_display(r.start)..display.to_display(r.end)),
             found: &self.found,
+            changes: &self.changes,
         }
+    }
+
+    /// Sets the text the margin marks compare with, or `None` for no marks.
+    pub fn set_base(&mut self, base: Option<String>) {
+        self.base = base;
+        self.base_version += 1;
     }
 
     /// Carries out a toolbar or shortcut action on the visual selection, or the word or line at the
@@ -452,14 +463,13 @@ impl Editor {
                 self.vim
                     .apply_format(buf, |b, r| toggle(b, r, Mark::Strikethrough));
             }
-            Action::Underline => self.vim.apply_format(buf, toggle_underline),
+            Action::Superscript => self
+                .vim
+                .apply_format(buf, |b, r| toggle(b, r, Mark::Superscript)),
+            Action::Subscript => self
+                .vim
+                .apply_format(buf, |b, r| toggle(b, r, Mark::Subscript)),
             Action::Uppercase => self.vim.apply_format(buf, uppercase),
-            Action::Color(color) => self.vim.apply_format(buf, |b, r| set_color(b, r, *color)),
-            Action::FontSize(pt) => self.vim.apply_format(buf, |b, r| set_font_size(b, r, *pt)),
-            Action::FontFamily(name) => {
-                self.vim
-                    .apply_format(buf, |b, r| set_font_family(b, r, name));
-            }
             Action::Heading(level) => self.vim.apply_format(buf, |b, r| set_heading(b, r, *level)),
             Action::BulletList => self.vim.apply_format(buf, |b, r| toggle_list(b, r, false)),
             Action::NumberedList => self.vim.apply_format(buf, |b, r| toggle_list(b, r, true)),
@@ -567,6 +577,7 @@ impl Editor {
         match self.doc.save() {
             Ok(()) => {
                 self.buf.mark_saved();
+                self.saves += 1;
                 true
             }
             Err(error) => {
@@ -805,22 +816,6 @@ mod tests {
     }
 
     #[test]
-    fn the_current_font_is_the_one_at_the_cursor_or_shared_by_the_selection() {
-        let mut editor = Editor::default();
-        type_keys(&mut editor, "ione two three\x1b0w");
-        assert_eq!(editor.current_font().as_deref(), Some("Serif"));
-        editor.apply(&Action::FontFamily("Georgia".into()));
-        assert_eq!(editor.current_font().as_deref(), Some("Georgia"));
-        // On another word it is the body font again; across both it is none.
-        type_keys(&mut editor, "w");
-        assert_eq!(editor.current_font().as_deref(), Some("Serif"));
-        type_keys(&mut editor, "bvee");
-        assert_eq!(editor.current_font(), None);
-        type_keys(&mut editor, "\x1b0wve");
-        assert_eq!(editor.current_font().as_deref(), Some("Georgia"));
-    }
-
-    #[test]
     fn a_substitute_being_typed_shows_its_result_in_the_view() {
         let mut editor = Editor::default();
         type_keys(&mut editor, "ione two one\x1b0");
@@ -912,23 +907,14 @@ mod tests {
         assert_eq!(editor.buf.text(), "one two three");
         // A selection, and the visual mode ends.
         type_keys(&mut editor, "ve");
-        editor.apply(&Action::Color([0xcc, 0, 0]));
-        assert_eq!(
-            editor.buf.text(),
-            "one [two]{style=\"color:#cc0000\"} three"
-        );
+        editor.apply(&Action::Superscript);
+        assert_eq!(editor.buf.text(), "one {^two^} three");
         assert_eq!(editor.vim.mode, Mode::Normal);
         // Undo takes back one action at a time.
         editor.apply(&Action::Uppercase);
-        assert_eq!(
-            editor.buf.text(),
-            "one [TWO]{style=\"color:#cc0000\"} three"
-        );
+        assert_eq!(editor.buf.text(), "one {^TWO^} three");
         type_keys(&mut editor, "u");
-        assert_eq!(
-            editor.buf.text(),
-            "one [two]{style=\"color:#cc0000\"} three"
-        );
+        assert_eq!(editor.buf.text(), "one {^two^} three");
     }
 
     #[test]
@@ -983,12 +969,6 @@ mod tests {
         ctrl(&mut editor, 'i');
         assert_eq!(editor.buf.text(), "one *two* _three_");
         assert_eq!(editor.vim.mode, Mode::Normal);
-        type_keys(&mut editor, "0viw");
-        ctrl(&mut editor, 'u');
-        assert_eq!(
-            editor.buf.text(),
-            "[one]{style=\"text-decoration:underline\"} *two* _three_"
-        );
         // While inserting, and Ctrl+S without leaving insert mode.
         type_keys(&mut editor, "A!");
         ctrl(&mut editor, 's');

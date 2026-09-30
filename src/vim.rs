@@ -1,5 +1,5 @@
 use crate::buffer::Buffer;
-use crate::format::{Mark, toggle, toggle_underline};
+use crate::format::{Mark, toggle};
 use crate::motion::{
     find_in_line, first_non_blank, line_end, line_start, nth_line_start, paragraph_back,
     paragraph_forward, text_object, word_back, word_back_by, word_end_by, word_forward_by,
@@ -202,7 +202,7 @@ impl Vim {
                         buf.move_down();
                     }
                 }
-                Key::Ctrl(c @ ('b' | 'i' | 'u')) => self.shortcut(buf, c),
+                Key::Ctrl(c @ ('b' | 'i')) => self.shortcut(buf, c),
                 // Delete the word before the cursor, or join to the line above from its start.
                 Key::Ctrl('w') => {
                     let (at, start) = (buf.cursor(), buf.line_start());
@@ -214,7 +214,6 @@ impl Vim {
                         buf.set_cursor(to);
                     }
                 }
-                Key::Ctrl('h') => buf.delete_back(),
                 Key::Ctrl(_) | Key::Help => {}
             }
             return;
@@ -226,8 +225,8 @@ impl Vim {
             }
             self.command_keys.push(key);
         }
-        // In normal mode Ctrl-b and Ctrl-u scroll, as in vim; elsewhere they format.
-        if let Key::Ctrl(c @ ('b' | 'i' | 'u')) = key
+        // In normal mode Ctrl-b scrolls, as in vim; elsewhere it makes bold.
+        if let Key::Ctrl(c @ ('b' | 'i')) = key
             && (c == 'i' || self.mode != Mode::Normal)
         {
             self.pending = Pending::default();
@@ -543,12 +542,11 @@ impl Vim {
         }
     }
 
-    /// Ctrl+B, Ctrl+I, Ctrl+U.
+    /// Ctrl+B and Ctrl+I.
     fn shortcut(&mut self, buf: &mut Buffer, key: char) {
         self.apply_format(buf, |buf, range| match key {
             'b' => toggle(buf, range, Mark::Bold),
-            'i' => toggle(buf, range, Mark::Italic),
-            _ => toggle_underline(buf, range),
+            _ => toggle(buf, range, Mark::Italic),
         });
     }
 
@@ -2105,7 +2103,7 @@ cd", 0, "9$", 4,
         assert_eq!(vim.handle(&mut buf, Key::Char('z')), by(ViewMove::Center));
         assert_eq!(vim.handle(&mut buf, Key::Char('z')), None);
         assert_eq!(vim.handle(&mut buf, Key::Char('t')), by(ViewMove::Top));
-        // Where Ctrl-u and Ctrl-b format, they still do: in visual mode there is a selection.
+        // Where Ctrl-b makes bold, it still does: in visual mode there is a selection.
         press(&mut vim, &mut buf, "v");
         assert_eq!(vim.handle(&mut buf, Key::Ctrl('b')), None);
         assert_eq!(buf.text(), "*a*bc");
@@ -2238,13 +2236,6 @@ cd", 0, "9$", 4,
         for (text, cursor, keys, want, at) in [
             ("one two three", 4, "viw\x02", "one *two* three", 5),
             ("one two three", 4, "viw\x09", "one _two_ three", 5),
-            (
-                "one two",
-                4,
-                "viw\x15",
-                "one [two]{style=\"text-decoration:underline\"}",
-                5,
-            ),
             ("one *two* three", 5, "viw\x02", "one two three", 4),
             ("one two three", 4, "viw\x02viw\x02", "one two three", 4),
             ("hello world", 3, "V\x02", "*hello world*", 1),

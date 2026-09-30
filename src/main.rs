@@ -2,21 +2,21 @@ mod gpu;
 mod rects;
 mod typeset;
 
-use book_writing_app::app::{App, Effect, ExportKind, Screen};
-use book_writing_app::cli::Args;
-use book_writing_app::config::{self, Config};
-use book_writing_app::editor::Editor;
-use book_writing_app::input;
-use book_writing_app::recent::Recent;
-use book_writing_app::scroll::Scroll;
-use book_writing_app::toolbar::{self, Click};
-use book_writing_app::ui::{BODY_ROW, Bounds};
-use book_writing_app::vim::{Key, Mode, ViewMove};
-use book_writing_app::watch::FileWatcher;
 use gpu::{Frame, Gpu, Layout, WindowGpu};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
+use vim_book_writer::app::{App, Effect, ExportKind, Screen};
+use vim_book_writer::cli::Args;
+use vim_book_writer::config::{self, Config};
+use vim_book_writer::editor::Editor;
+use vim_book_writer::input;
+use vim_book_writer::recent::Recent;
+use vim_book_writer::scroll::Scroll;
+use vim_book_writer::toolbar::{self, Click};
+use vim_book_writer::ui::Bounds;
+use vim_book_writer::vim::{Key, Mode, ViewMove};
+use vim_book_writer::watch::FileWatcher;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
@@ -82,6 +82,7 @@ impl Shell {
         };
         let chrome = self.app.chrome(size);
         let theme = self.app.theme();
+        let reading = &self.app.reading;
         if self.app.screen != Screen::Editing {
             gpu.draw(&Frame {
                 view: None,
@@ -89,6 +90,7 @@ impl Shell {
                 scroll: 0.0,
                 chrome: &chrome,
                 theme,
+                reading,
             });
             return;
         }
@@ -99,7 +101,7 @@ impl Shell {
         }
         let regions = self.app.regions(size);
         let view = self.app.editor.view();
-        self.layout = gpu.gpu.layout(&view, regions.editor, theme);
+        self.layout = gpu.gpu.layout(&view, regions.editor, theme, reading);
         let seen = (view.version, view.cursor);
         let viewport = regions.editor.h;
         if let Some(by) = self.align.take() {
@@ -133,6 +135,7 @@ impl Shell {
             scroll: self.scroll.offset(),
             chrome: &chrome,
             theme,
+            reading,
         });
         // Up and down follow the rows this frame wrapped the text into.
         self.app.editor.set_rows(&gpu.gpu.rows);
@@ -191,8 +194,11 @@ impl Shell {
                 }
                 Effect::ScrollRows(rows) => {
                     let viewport = self.app.regions(self.size()).editor.h;
-                    self.scroll
-                        .by(rows as f32 * BODY_ROW, self.layout.content_height, viewport);
+                    self.scroll.by(
+                        rows as f32 * self.app.reading.row(),
+                        self.layout.content_height,
+                        viewport,
+                    );
                 }
                 // The cursor may have moved, so wait for the next layout to know where it is.
                 Effect::Align(by) => self.align = Some(by),
@@ -212,7 +218,20 @@ impl Shell {
 
 impl ApplicationHandler<UserEvent> for Shell {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        let attributes = Window::default_attributes().with_title("Book Writing App");
+        let attributes = Window::default_attributes()
+            .with_title("Vim Book Writer")
+            .with_window_icon(window_icon());
+        // The app id is how Wayland finds the icon and X11 the window class, through the
+        // `.desktop` file that `desktop::install` wrote.
+        #[cfg(target_os = "linux")]
+        let attributes = {
+            use winit::platform::{
+                wayland::WindowAttributesExtWayland, x11::WindowAttributesExtX11,
+            };
+            let id = vim_book_writer::desktop::APP_ID;
+            let attributes = WindowAttributesExtWayland::with_name(attributes, id, id);
+            WindowAttributesExtX11::with_name(attributes, id, id)
+        };
         let window = Arc::new(
             event_loop
                 .create_window(attributes)
@@ -280,6 +299,10 @@ impl ApplicationHandler<UserEvent> for Shell {
                     .collect();
                 self.carry_out(event_loop, effects);
             }
+            WindowEvent::Focused(true) => {
+                self.app.focus_gained();
+                self.request_redraw();
+            }
             WindowEvent::RedrawRequested => self.redraw(),
             _ => {}
         }
@@ -315,9 +338,7 @@ impl ApplicationHandler<UserEvent> for Shell {
             });
         }
         let modified = self.app.editor.buf.is_modified();
-        let tip = self.app.tip_shown;
-        self.app.tick(Instant::now());
-        if modified != self.app.editor.buf.is_modified() || tip != self.app.tip_shown {
+        if self.app.tick(Instant::now()) || modified != self.app.editor.buf.is_modified() {
             self.request_redraw();
         }
         event_loop.set_control_flow(match self.app.next_wake() {
@@ -325,6 +346,18 @@ impl ApplicationHandler<UserEvent> for Shell {
             None => ControlFlow::Wait,
         });
     }
+}
+
+/// The logo, as the icon for the window's title bar and task switcher.
+fn window_icon() -> Option<winit::window::Icon> {
+    let bytes = include_bytes!("../packaging/icons/256x256.png");
+    let mut reader = png::Decoder::new(std::io::Cursor::new(&bytes[..]))
+        .read_info()
+        .ok()?;
+    let mut pixels = vec![0; reader.output_buffer_size()?];
+    let frame = reader.next_frame(&mut pixels).ok()?;
+    pixels.truncate(frame.buffer_size());
+    winit::window::Icon::from_rgba(pixels, frame.width, frame.height).ok()
 }
 
 /// Writes RGBA pixels to a PNG file.
@@ -349,6 +382,7 @@ fn main() {
         }
     };
 
+    config::migrate();
     let editor = match &args.file {
         Some(path) => Editor::open(path).unwrap_or_else(|error| {
             eprintln!("can't open {}: {error}", path.display());
@@ -388,8 +422,13 @@ fn main() {
     };
     config.auto_save |= args.autosave;
     config.dark |= args.dark;
+    if let Some(font) = &args.font {
+        config.font.clone_from(font);
+    }
+    config.size = args.pt.unwrap_or(config.size);
     app.set_config(config, config_path.filter(|_| !screenshot));
     app.tree_visible = args.tree;
+    app.refresh_git();
     if let Some(folder) = &args.folder {
         app.open_folder(folder);
     }
@@ -441,11 +480,12 @@ fn main() {
         }
         let chrome = app.chrome(size);
         let theme = app.theme();
+        let reading = &app.reading;
         let mut gpu = Gpu::headless();
         let pixels = if app.screen == Screen::Editing {
             let view = app.editor.view();
             // Scroll to the caret as the window would, but arrive at once.
-            let layout = gpu.layout(&view, regions.editor, theme);
+            let layout = gpu.layout(&view, regions.editor, theme, reading);
             let mut scroll = Scroll::default();
             if let Some((top, bottom)) = layout.caret {
                 let content = layout.content_height;
@@ -461,6 +501,7 @@ fn main() {
                     scroll: scroll.offset(),
                     chrome: &chrome,
                     theme,
+                    reading,
                 },
             )
         } else {
@@ -473,12 +514,17 @@ fn main() {
                     scroll: 0.0,
                     chrome: &chrome,
                     theme,
+                    reading,
                 },
             )
         };
         write_png(path, args.size, &pixels);
         return;
     }
+
+    // Give the window its icon and a menu entry, where the desktop wants them from a file.
+    #[cfg(target_os = "linux")]
+    let _ = vim_book_writer::desktop::install_for_user();
 
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()

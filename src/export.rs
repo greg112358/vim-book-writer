@@ -135,10 +135,9 @@ fn escape(s: &str, so_far: &str) -> String {
     out
 }
 
-/// Converts djot to Markdown. It is lossy: color, size, font, and underline have no CommonMark
-/// form, so the styled text comes out plain. Everything else in the v1 scope maps across,
-/// strikethrough as `~~`. Djot's typographic quotes, dashes, and ellipsis come out as the
-/// characters they stand for.
+/// Converts djot to Markdown. Everything in the v1 scope maps across, strikethrough as `~~` and
+/// superscript and subscript as `<sup>` and `<sub>`. Attribute spans come out as their text.
+/// Djot's typographic quotes, dashes, and ellipsis come out as the characters they stand for.
 pub fn to_markdown(src: &str) -> String {
     let mut w = Writer {
         line_start: true,
@@ -194,6 +193,8 @@ pub fn to_markdown(src: &str) -> String {
                 Container::Strong => w.text("**"),
                 Container::Emphasis => w.text("*"),
                 Container::Delete => w.text("~~"),
+                Container::Superscript => w.text("<sup>"),
+                Container::Subscript => w.text("<sub>"),
                 Container::Link(url, LinkType::AutoLink | LinkType::Email) => {
                     w.text(&format!("<{url}>"));
                     w.skip_text += 1;
@@ -256,6 +257,8 @@ pub fn to_markdown(src: &str) -> String {
                 Container::Strong => w.text("**"),
                 Container::Emphasis => w.text("*"),
                 Container::Delete => w.text("~~"),
+                Container::Superscript => w.text("</sup>"),
+                Container::Subscript => w.text("</sub>"),
                 Container::Link(_, LinkType::AutoLink | LinkType::Email) => w.skip_text -= 1,
                 Container::Link(url, _) | Container::Image(url, _) => {
                     let url = if url.contains([' ', '(', ')']) {
@@ -313,7 +316,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn color_size_font_and_underline_are_dropped_and_the_text_is_kept() {
+    fn superscript_and_subscript_become_html_tags() {
+        assert_eq!(
+            to_markdown("E = mc{^2^} and H{~2~}O\n"),
+            "E = mc<sup>2</sup> and H<sub>2</sub>O\n"
+        );
+    }
+
+    #[test]
+    fn attribute_spans_come_out_as_their_text() {
         let src = r##"[red]{style="color:#c00"} and [big]{style="font-size:24pt"} and [serif]{style="font-family:Georgia"} and [under]{style="text-decoration:underline"} and [all]{style="color:#00f;font-size:9pt;font-family:'Fira Code';text-decoration:underline"}."##;
         assert_eq!(
             to_markdown(src),

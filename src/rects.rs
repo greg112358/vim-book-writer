@@ -1,4 +1,4 @@
-use book_writing_app::ui::Rect;
+use vim_book_writer::ui::Rect;
 use wgpu::util::DeviceExt;
 
 const SHADER: &str = "

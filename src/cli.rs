@@ -3,7 +3,7 @@ use crate::vim::{Key, Mode};
 use std::path::PathBuf;
 
 const USAGE: &str =
-    "usage: book-writing-app [FILE] [--file FILE] [--screenshot PNG [--mode MODE] [--size WxH]]
+    "usage: vim-book-writer [FILE] [--file FILE] [--screenshot PNG [--mode MODE] [--size WxH]]
 
   FILE, --file FILE   the djot document to open
   --screenshot PNG    draw one frame offscreen to PNG and exit
@@ -15,8 +15,10 @@ const USAGE: &str =
   --autosave          turn auto-save on
   --start             show the start screen
   --recent PATH       a file for the start screen's recent list, once for each (for screenshots)
-  --popup MENU        show a toolbar menu open: color, font, or size
+  --popup MENU        show a toolbar menu open: font or size
   --dark              use the dark look, whatever the settings say
+  --font NAME         read in this font, whatever the settings say (Serif, Sans, Mono, Georgia, ...)
+  --pt SIZE           read at this size in points, whatever the settings say
   --hover LABEL       show the tip of the toolbar button labeled LABEL (B, Font, Save, ...)
   --keys KEYS         keys to press before the screenshot, after the mode is set: text as typed,
                       plus <Esc> <CR> <BS> <Del> <Left> <Right> <Up> <Down> <F1> <C-x> and <lt>";
@@ -39,6 +41,9 @@ pub struct Args {
     pub popup: Option<Menu>,
     /// Use the dark look, whatever the settings say.
     pub dark: bool,
+    /// The font and size to read in, whatever the settings say.
+    pub font: Option<String>,
+    pub pt: Option<f32>,
     /// The label of a toolbar button to show the tip of in a screenshot.
     pub hover: Option<String>,
     /// Show the start screen even with a file, for screenshots.
@@ -63,6 +68,8 @@ impl Default for Args {
             folder: None,
             popup: None,
             dark: false,
+            font: None,
+            pt: None,
             hover: None,
             start: false,
             autosave: false,
@@ -101,6 +108,18 @@ impl Args {
                 "--start" => parsed.start = true,
                 "--autosave" => parsed.autosave = true,
                 "--dark" => parsed.dark = true,
+                "--font" => parsed.font = Some(value("--font")?),
+                "--pt" => {
+                    let pt = value("--pt")?;
+                    parsed.pt = Some(
+                        pt.parse::<f32>()
+                            .ok()
+                            .filter(|pt| (4.0..=200.0).contains(pt))
+                            .ok_or_else(|| {
+                                format!("bad size {pt:?}, expected points\n\n{USAGE}")
+                            })?,
+                    );
+                }
                 "--hover" => parsed.hover = Some(value("--hover")?),
                 "--export" => {
                     let path = PathBuf::from(value("--export")?);
@@ -112,7 +131,6 @@ impl Args {
                 "--recent" => parsed.recent.push(value("--recent")?.into()),
                 "--popup" => {
                     parsed.popup = Some(match value("--popup")?.as_str() {
-                        "color" => Menu::Color,
                         "font" => Menu::Font,
                         "size" => Menu::Size,
                         other => return Err(format!("unknown menu {other:?}\n\n{USAGE}")),

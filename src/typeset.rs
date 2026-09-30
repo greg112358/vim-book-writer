@@ -1,10 +1,11 @@
-use book_writing_app::editor::View;
-use book_writing_app::runs::Format;
-use book_writing_app::ui::{Rect, Theme};
-use book_writing_app::vim::Mode;
 use glyphon::{Attrs, Buffer, Color, Cursor, Family, Metrics, Style, Weight};
+use vim_book_writer::diff::Change;
+use vim_book_writer::editor::View;
+use vim_book_writer::runs::Format;
+use vim_book_writer::ui::{Rect, Theme};
+use vim_book_writer::vim::Mode;
 
-pub use book_writing_app::ui::{FONT_SIZE, LINE_HEIGHT};
+pub use vim_book_writer::ui::{LINE_HEIGHT, Reading};
 
 fn color([r, g, b, a]: [u8; 4]) -> Color {
     Color::rgba(r, g, b, a)
@@ -16,28 +17,56 @@ pub fn text_color(theme: &Theme) -> Color {
 
 /// How a span of text looks: family, size, weight, slant, color, and decorations. `faint` is
 /// syntax shown dimmed, in a color that reads as part of the page but not part of the text.
-pub fn attrs<'a>(format: &'a Format, faint: bool, theme: &Theme) -> Attrs<'a> {
+/// The family and size are how the text is being read, not something the document says.
+pub fn attrs<'a>(format: &Format, faint: bool, theme: &Theme, reading: &'a Reading) -> Attrs<'a> {
+    let mut attrs = look(format, faint, theme, reading);
+    // Superscripts and subscripts are drawn again, raised or lowered, by `Gpu`; here they only
+    // hold their room in the line, so they aren't drawn.
+    if !faint && (format.superscript || format.subscript) {
+        attrs = attrs.color(Color::rgba(0, 0, 0, 0));
+    }
+    attrs
+}
+
+/// The size of the text of `format` before it is made smaller for a superscript or subscript.
+pub fn base_size(format: &Format, reading: &Reading) -> f32 {
     let scale = [1.0, 2.0, 1.6, 1.3, 1.15, 1.05, 1.0][format.heading.min(6) as usize];
-    let mut size = FONT_SIZE * scale;
-    // Syntax stays at the size and family of the text around it, however the span is styled.
-    if let Some(pt) = format.style.size_pt.filter(|_| !faint) {
-        size = pt * 96.0 / 72.0;
+    let size = reading.size() * scale;
+    if format.code || format.code_block {
+        size * 0.9
+    } else {
+        size
+    }
+}
+
+/// How a superscript or subscript looks when it is drawn: the smaller size, and `raise`, how far
+/// above the line it goes, which is negative below it.
+pub fn script_attrs<'a>(format: &Format, theme: &Theme, reading: &'a Reading) -> (Attrs<'a>, f32) {
+    let base = base_size(format, reading);
+    let raise = if format.superscript {
+        0.36 * base
+    } else {
+        -0.14 * base
+    };
+    (look(format, false, theme, reading), raise)
+}
+
+fn look<'a>(format: &Format, faint: bool, theme: &Theme, reading: &'a Reading) -> Attrs<'a> {
+    let mut size = base_size(format, reading);
+    if !faint && (format.superscript || format.subscript) {
+        size *= 0.65;
     }
     let mono = format.code || format.code_block;
-    if mono {
-        size *= 0.9;
-    }
-    let family = match &format.style.family {
-        Some(name) if !faint => family(name),
-        _ if mono => Family::Monospace,
-        _ => Family::Serif,
+    let family = if mono {
+        Family::Monospace
+    } else {
+        family(&reading.family)
     };
-    let color = match format.style.color {
+    let color = match () {
         _ if faint => color(theme.faint),
-        Some([r, g, b]) => Color::rgb(r, g, b),
-        None if format.link => color(theme.link),
-        None if format.quote => color(theme.quote),
-        None => color(theme.text),
+        _ if format.link => color(theme.link),
+        _ if format.quote => color(theme.quote),
+        _ => color(theme.text),
     };
     let mut attrs = Attrs::new()
         .family(family)
@@ -52,8 +81,7 @@ pub fn attrs<'a>(format: &'a Format, faint: bool, theme: &Theme) -> Attrs<'a> {
     // glyphon doesn't draw underlines or strikethroughs, and cosmic-text joins the decorated
     // stretches on either side of a gap, so mark the glyphs and draw the lines in `decorations`.
     if !faint {
-        attrs.metadata =
-            usize::from(format.style.underline || format.link) | usize::from(format.strike) << 1;
+        attrs.metadata = usize::from(format.link) | usize::from(format.strike) << 1;
     }
     attrs
 }
@@ -61,7 +89,7 @@ pub fn attrs<'a>(format: &'a Format, faint: bool, theme: &Theme) -> Attrs<'a> {
 const UNDERLINE: usize = 1;
 const STRIKE: usize = 2;
 
-/// The font family for a name from a style attribute. The three generic names mean whichever font
+/// The font family for the name of a reading font. The three generic names mean whichever font
 /// of that kind is installed.
 fn family(name: &str) -> Family<'_> {
     match name.to_ascii_lowercase().as_str() {
@@ -110,6 +138,7 @@ pub fn caret_and_selection(
     under: &mut Vec<Rect>,
     over: &mut Vec<Rect>,
     theme: &Theme,
+    reading: &Reading,
 ) -> Option<(f32, f32)> {
     let display = view.display;
     let cursor_at = |offset: usize| {
@@ -169,7 +198,7 @@ pub fn caret_and_selection(
                 under.push(Rect {
                     x: left,
                     y,
-                    w: FONT_SIZE * 0.5,
+                    w: reading.size() * 0.5,
                     h: height,
                     color: theme.selection,
                 });
@@ -186,7 +215,7 @@ pub fn caret_and_selection(
                     || run.glyphs.last().is_some_and(|g| g.end <= cursor_index) =>
                 {
                     let x = run.glyphs.last().map_or(0.0, |g| g.x + g.w);
-                    caret = Some((left + x, FONT_SIZE * 0.5, y, height));
+                    caret = Some((left + x, reading.size() * 0.5, y, height));
                 }
                 None => {}
             }
@@ -211,6 +240,41 @@ pub fn caret_and_selection(
         });
     }
     caret.map(|(_, _, y, h)| (y - top, y - top + h))
+}
+
+/// The bars in the margin beside lines that differ from the last commit, for text laid out in
+/// `buffer` and drawn at (`left`, `top`). A wrapped line has its bar on every row.
+pub fn gutter(
+    buffer: &Buffer,
+    view: &View<'_>,
+    (left, top): (f32, f32),
+    theme: &Theme,
+) -> Vec<Rect> {
+    let mut bars = Vec::new();
+    for run in buffer.layout_runs() {
+        let Ok(at) = view
+            .changes
+            .binary_search_by_key(&run.line_i, |&(line, _)| line)
+        else {
+            continue;
+        };
+        let change = view.changes[at].1;
+        let (y, h) = (top + run.line_top, run.line_height);
+        // Lines taken out are a notch at the top of the line that follows.
+        let (w, h) = if change == Change::Removed {
+            (10.0, 2.0)
+        } else {
+            (3.0, h)
+        };
+        bars.push(Rect {
+            x: left - 14.0,
+            y,
+            w,
+            h,
+            color: theme.gutter(change),
+        });
+    }
+    bars
 }
 
 /// The bottom of the last line of text in `buffer`.

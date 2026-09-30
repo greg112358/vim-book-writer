@@ -2,17 +2,19 @@ use crate::autosave::AutoSave;
 use crate::config::Config;
 use crate::display::Display;
 use crate::editor::Editor;
+use crate::git::{Repo, Status as GitStatus};
 use crate::outline;
 use crate::recent::Recent;
 use crate::start::{self, StartAction, StartItem};
-use crate::toolbar::{self, Click, Popup};
+use crate::toolbar::{self, Choice, Click, Popup};
 use crate::tree::Tree;
 use crate::ui::{
-    self, Chrome, Dialog, Interface, OutlineRow, OutlineView, Regions, Status, Theme, TreeRow,
-    TreeView,
+    self, Chrome, Dialog, GitInfo, Interface, OutlineRow, OutlineView, Reading, Regions, Status,
+    Theme, TreeRow, TreeView,
 };
 use crate::vim::{Key, ViewMove};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 /// Which page of the app is showing.
@@ -46,6 +48,33 @@ enum PromptKind {
     Copy,
     Move,
     ConfirmDelete,
+    /// Throw away the changes git shows in a file or folder.
+    ConfirmDiscard,
+    /// The message for a commit.
+    Commit,
+}
+
+impl PromptKind {
+    /// Asks a question to answer yes or no, rather than a name to type.
+    fn confirms(self) -> bool {
+        matches!(self, Self::ConfirmDelete | Self::ConfirmDiscard)
+    }
+}
+
+/// What git says about the folder in the tree, or the folder of the open file.
+#[derive(Debug)]
+struct GitState {
+    repo: Repo,
+    status: GitStatus,
+    /// The folder this was worked out for, as a full path: names in the tree are from it.
+    folder: PathBuf,
+}
+
+/// A git command running in the background, and what it is doing.
+#[derive(Debug)]
+struct Job {
+    label: &'static str,
+    done: Receiver<Result<String, String>>,
 }
 
 /// A name the tree asks you to type, or a question to answer, in a dialog.
@@ -106,9 +135,9 @@ pub struct App {
     pub popup: Option<Popup>,
     /// The toolbar button, or on the start screen the item, the mouse is over.
     pub hover: Option<usize>,
-    /// The color last chosen, shown on the color button.
-    pub color: [u8; 3],
     pub focus: Focus,
+    /// The font and size the text is read in, from the settings.
+    pub reading: Reading,
     pub prompt: Option<Prompt>,
     /// A note from the app, like why a file couldn't be moved, shown on the status bar.
     pub message: String,
@@ -132,6 +161,12 @@ pub struct App {
     pub help: bool,
     /// The file tree button the mouse is over.
     tree_hover: Option<usize>,
+    git: Option<GitState>,
+    /// A `g` was typed in the tree and the next key says which git command.
+    tree_g: bool,
+    job: Option<Job>,
+    /// The editor's count of saves as of the last look at git.
+    saves_seen: u64,
 }
 
 impl App {
@@ -151,8 +186,8 @@ impl App {
             tree_visible: false,
             popup: None,
             hover: None,
-            color: [0xcc, 0, 0],
             focus: Focus::Editor,
+            reading: Reading::default(),
             prompt: None,
             message: String::new(),
             tree_first: 0,
@@ -167,26 +202,56 @@ impl App {
             outline_sel: 0,
             help: false,
             tree_hover: None,
+            git: None,
+            tree_g: false,
+            job: None,
+            saves_seen: 0,
         }
     }
 
     /// Applies the saved settings, and keeps the file to save them to when one changes.
     pub fn set_config(&mut self, config: Config, path: Option<PathBuf>) {
         self.autosave.enabled = config.auto_save;
+        self.reading = Reading {
+            family: config.font.clone(),
+            size_pt: config.size,
+        };
         self.config = config;
         self.config_path = path;
     }
 
     /// Call after input and when `next_wake` comes: saves the file if auto-save is on and the text
     /// has been still for long enough.
-    pub fn tick(&mut self, now: Instant) {
+    pub fn tick(&mut self, now: Instant) -> bool {
+        let mut changed = false;
         if self.hovering() && !self.tip_shown && now >= self.hover_since + TIP_DELAY {
             self.tip_shown = true;
+            changed = true;
         }
         let due = self.autosave.poll(now, &self.editor.buf);
         if due && self.screen == Screen::Editing && self.editor.path().is_some() {
             self.editor.save();
         }
+        // A push or pull that has finished says how it went.
+        if let Some(job) = &self.job {
+            let result = match job.done.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => Some(Err("git stopped".into())),
+            };
+            if let Some(result) = result {
+                let label = job.label;
+                self.job = None;
+                self.message = match result {
+                    Ok(said) => format!("{label} done: {said}"),
+                    Err(error) => format!("{label} failed: {error}"),
+                };
+                self.refresh_git();
+                changed = true;
+            }
+        }
+        self.look_after_save();
+        changed
     }
 
     fn hovering(&self) -> bool {
@@ -197,7 +262,11 @@ impl App {
     pub fn next_wake(&self) -> Option<Instant> {
         let tip = (self.hovering() && !self.tip_shown && self.screen == Screen::Editing)
             .then(|| self.hover_since + TIP_DELAY);
-        [self.autosave.next_deadline(), tip]
+        let job = self
+            .job
+            .as_ref()
+            .map(|_| Instant::now() + Duration::from_millis(200));
+        [self.autosave.next_deadline(), tip, job]
             .into_iter()
             .flatten()
             .min()
@@ -245,7 +314,20 @@ impl App {
                     None if !self.message.is_empty() => self.message.clone(),
                     None => self.editor.vim.message.clone(),
                 };
+                let branch = self.git.as_ref().map(|git| {
+                    let s = &git.status;
+                    let mut branch = s.branch.clone();
+                    branch.push_str(if s.files.is_empty() { "" } else { "*" });
+                    if s.ahead > 0 {
+                        branch.push_str(&format!(" \u{2191}{}", s.ahead));
+                    }
+                    if s.behind > 0 {
+                        branch.push_str(&format!(" \u{2193}{}", s.behind));
+                    }
+                    branch
+                });
                 let status = Status {
+                    branch,
                     mode: self.editor.vim.mode,
                     file: self.editor.file_name(),
                     modified: self.editor.buf.is_modified(),
@@ -255,13 +337,31 @@ impl App {
                 };
                 let tree = self.tree_view(regions.tree);
                 let outline = self.outline_view(regions.outline);
-                let tree_buttons = regions.tree.map(toolbar::tree_buttons);
+                let in_repo = self.git.is_some();
+                let tree_buttons = regions.tree.map(|p| toolbar::tree_buttons(p, in_repo));
+                let staged = self.git.as_ref().map_or(0, |g| g.status.staged());
                 let dialog = self.prompt.as_ref().map(|prompt| match prompt.kind {
                     PromptKind::ConfirmDelete => Dialog {
                         title: prompt.label.clone(),
                         input: None,
                         buttons: Some(("Delete (y)", "Keep it (n)")),
                         hint: "This can't be undone.",
+                    },
+                    PromptKind::ConfirmDiscard => Dialog {
+                        title: prompt.label.clone(),
+                        input: None,
+                        buttons: Some(("Discard (y)", "Keep changes (n)")),
+                        hint: "This can't be undone.",
+                    },
+                    PromptKind::Commit => Dialog {
+                        title: prompt.label.trim_end().to_string(),
+                        input: Some(prompt.text.clone()),
+                        buttons: None,
+                        hint: if staged > 0 {
+                            "Enter to commit what is staged   Esc to cancel"
+                        } else {
+                            "Nothing is staged, so Enter commits every change   Esc to cancel"
+                        },
                     },
                     _ => Dialog {
                         title: prompt.label.trim_end().to_string(),
@@ -279,7 +379,6 @@ impl App {
                     toolbar: &toolbar,
                     hover: self.hover,
                     popup: self.popup.as_ref(),
-                    color: self.color,
                     tree: tree.as_ref(),
                     autosave: self.autosave.enabled,
                     theme: self.theme(),
@@ -292,6 +391,7 @@ impl App {
 
     /// Moves the mouse to (`x`, `y`). True if what is under it changed, so it needs a redraw.
     pub fn hover_at(&mut self, size: (f32, f32), x: f32, y: f32) -> bool {
+        let in_repo = self.git.is_some();
         let (hover, tree_hover) = match self.screen {
             Screen::Start { .. } => (start::hit(&self.start_items(size), x, y), None),
             Screen::Editing => {
@@ -300,7 +400,7 @@ impl App {
                     toolbar::toolbar(regions.toolbar).hit(x, y),
                     regions
                         .tree
-                        .and_then(|p| toolbar::tree_buttons(p).hit(x, y)),
+                        .and_then(|p| toolbar::tree_buttons(p, in_repo).hit(x, y)),
                 )
             }
         };
@@ -319,6 +419,17 @@ impl App {
     pub fn click(
         &mut self,
         size: (f32, f32),
+        at: (f32, f32),
+        text_offset: impl FnOnce(&Display, bool) -> Option<usize>,
+    ) -> Vec<Effect> {
+        let effects = self.clicked(size, at, text_offset);
+        self.look_after_save();
+        effects
+    }
+
+    fn clicked(
+        &mut self,
+        size: (f32, f32),
         (x, y): (f32, f32),
         text_offset: impl FnOnce(&Display, bool) -> Option<usize>,
     ) -> Vec<Effect> {
@@ -333,7 +444,7 @@ impl App {
         self.editor.vim.close_command_line();
         // A dialog or the list of keys is in the way of everything else.
         if let Some(prompt) = &self.prompt {
-            if prompt.kind == PromptKind::ConfirmDelete {
+            if prompt.kind.confirms() {
                 let dialog = ui::dialog_bounds(size);
                 let (yes, no) = ui::dialog_buttons(dialog);
                 if yes.contains(x, y) {
@@ -351,10 +462,7 @@ impl App {
         // An open menu takes the click: a choice applies, and anywhere else just closes it.
         if let Some(popup) = self.popup.take() {
             if let Some(item) = popup.hit(x, y) {
-                if let Some(color) = item.swatch {
-                    self.color = color;
-                }
-                self.editor.apply(&item.action);
+                self.choose(&item.choice);
             }
             return Vec::new();
         }
@@ -374,11 +482,14 @@ impl App {
             }
         } else if let Some(panel) = regions.tree.filter(|p| p.contains(x, y)) {
             self.focus = Focus::Tree;
-            let row = ui::tree_row_at(panel, ui::TREE_TOP, self.tree_first, x, y);
-            let buttons = toolbar::tree_buttons(panel);
-            if let Some(Click::TreeKey(key)) =
-                buttons.hit(x, y).map(|i| buttons.buttons[i].click.clone())
-            {
+            let git = self.git.is_some();
+            let row = ui::tree_row_at(panel, ui::tree_top(git), self.tree_first, x, y);
+            let buttons = toolbar::tree_buttons(panel, git);
+            let button = buttons.hit(x, y).map(|i| buttons.buttons[i].click.clone());
+            if let Some(Click::TreeKey(key)) = button {
+                self.tree_key(Key::Char(key));
+            } else if let Some(Click::TreeGit(key)) = button {
+                self.tree_key(Key::Char('g'));
                 self.tree_key(Key::Char(key));
             } else if let (Some(row), Some(tree)) = (row, &mut self.tree) {
                 tree.select(row);
@@ -397,7 +508,7 @@ impl App {
                     self.toggle_setting(&click)
                 }
                 Click::Help => self.help = true,
-                Click::TreeKey(_) => {}
+                Click::TreeKey(_) | Click::TreeGit(_) => {}
             }
         } else if regions.editor.contains(x, y) {
             self.focus = Focus::Editor;
@@ -410,15 +521,31 @@ impl App {
         Vec::new()
     }
 
-    /// Opens the list under a toolbar button, with the font in force marked in the font list.
+    /// Opens the list under a toolbar button, with what is in force marked.
     pub fn open_menu(&mut self, menu: toolbar::Menu, anchor: ui::Bounds, size: (f32, f32)) {
         let mut popup = toolbar::popup(menu, anchor, size);
-        if menu == toolbar::Menu::Font
-            && let Some(font) = self.editor.current_font()
-        {
-            popup.mark(&font);
-        }
+        popup.mark(&match menu {
+            toolbar::Menu::Font => self.config.font.clone(),
+            toolbar::Menu::Size => format!("{}", self.config.size),
+        });
         self.popup = Some(popup);
+    }
+
+    /// Reads the text in the font or size chosen from a menu, and remembers it in the settings
+    /// file. The document itself is not touched.
+    fn choose(&mut self, choice: &Choice) {
+        match choice {
+            Choice::Font(name) => self.config.font.clone_from(name),
+            Choice::Size(pt) => self.config.size = *pt,
+        }
+        self.reading = Reading {
+            family: self.config.font.clone(),
+            size_pt: self.config.size,
+        };
+        if let Some(path) = &self.config_path {
+            // A setting that won't save still works until the app closes.
+            let _ = self.config.save(path);
+        }
     }
 
     /// Flips a setting the toolbar has a button for, and remembers it in the settings file.
@@ -479,7 +606,7 @@ impl App {
     /// enough to keep the selection in view.
     fn tree_view(&mut self, panel: Option<ui::Bounds>) -> Option<TreeView> {
         let (tree, panel) = (self.tree.as_ref()?, panel?);
-        let capacity = ui::tree_capacity(panel, ui::TREE_TOP).max(1);
+        let capacity = ui::tree_capacity(panel, ui::tree_top(self.git.is_some())).max(1);
         let selected = tree.selected_index();
         if selected < self.tree_first {
             self.tree_first = selected;
@@ -501,6 +628,18 @@ impl App {
                 is_dir: row.is_dir,
                 expanded: row.expanded,
                 selected: i == selected,
+                git: self.git.as_ref().and_then(|git| {
+                    // Names in the tree are from the folder as given; the status is from the real one.
+                    let path = git.folder.join(row.path.strip_prefix(tree.root()).ok()?);
+                    if row.is_dir {
+                        git.status.dirs.get(&path).map(|&tone| (tone, None))
+                    } else {
+                        git.status
+                            .files
+                            .get(&path)
+                            .map(|e| (e.tone(), Some(e.letter())))
+                    }
+                }),
             })
             .collect();
         let name = tree.root().file_name().map_or_else(
@@ -511,6 +650,13 @@ impl App {
             header: format!("{name}/"),
             rows,
             focused: self.focus == Focus::Tree,
+            git: self.git.as_ref().map(|git| GitInfo {
+                branch: git.status.branch.clone(),
+                ahead: git.status.ahead,
+                behind: git.status.behind,
+                changes: git.status.files.len(),
+                staged: git.status.staged(),
+            }),
         })
     }
 
@@ -562,6 +708,8 @@ impl App {
             PromptKind::Copy => ("Copy to: ".into(), tree.relative(&row.path)),
             PromptKind::Move => ("Move to: ".into(), tree.relative(&row.path)),
             PromptKind::ConfirmDelete => (format!("Delete \u{201c}{name}\u{201d}?"), String::new()),
+            // Only the git commands start these two, which know what to put in them.
+            PromptKind::ConfirmDiscard | PromptKind::Commit => return,
         };
         self.prompt = Some(Prompt { label, text, kind });
     }
@@ -571,11 +719,11 @@ impl App {
         let Some(prompt) = &mut self.prompt else {
             return;
         };
-        if prompt.kind == PromptKind::ConfirmDelete {
+        if prompt.kind.confirms() {
             let confirmed = matches!(key, Key::Char('y' | 'Y'));
-            self.prompt = None;
+            let Prompt { kind, text, .. } = self.prompt.take().unwrap();
             if confirmed {
-                self.finish_prompt(PromptKind::ConfirmDelete, String::new());
+                self.finish_prompt(kind, text);
             }
             return;
         }
@@ -594,6 +742,11 @@ impl App {
     }
 
     fn finish_prompt(&mut self, kind: PromptKind, text: String) {
+        match kind {
+            PromptKind::Commit => return self.git_commit(&text),
+            PromptKind::ConfirmDiscard => return self.git_discard(&PathBuf::from(text)),
+            _ => {}
+        }
         let Some(tree) = &mut self.tree else { return };
         let selected = tree.selected().map(|row| row.path.clone());
         let open_path = self
@@ -612,10 +765,12 @@ impl App {
             PromptKind::ConfirmDelete => {
                 tree.delete().map(|()| selected.clone().unwrap_or_default())
             }
+            PromptKind::ConfirmDiscard | PromptKind::Commit => return,
         };
         match result {
             Ok(path) => {
                 self.message.clear();
+                self.refresh_git();
                 match kind {
                     PromptKind::Add if path.is_file() => {
                         self.open_from_tree(&path);
@@ -637,11 +792,16 @@ impl App {
     /// `r` rename, `c` copy, `m` move, `y` yank, `p` paste, `H` hidden files, `R` refresh, Enter
     /// opens, Tab or `o` opens or expands without leaving the tree, and `q` closes it.
     fn tree_key(&mut self, key: Key) {
+        if std::mem::take(&mut self.tree_g) {
+            return self.tree_git_key(key);
+        }
         let Some(tree) = &mut self.tree else {
             self.focus = Focus::Editor;
             return;
         };
         match key {
+            Key::Char('g') => self.tree_g = true,
+            Key::Char('G') => tree.move_selection(isize::MAX),
             Key::Char('j') | Key::Down => tree.move_selection(1),
             Key::Char('k') | Key::Up => tree.move_selection(-1),
             Key::Char('a') => self.start_prompt(PromptKind::Add),
@@ -661,7 +821,10 @@ impl App {
                 Err(error) => self.message = format!("{error}"),
             },
             Key::Char('H') => tree.toggle_hidden(),
-            Key::Char('R') => tree.refresh(),
+            Key::Char('R') => {
+                tree.refresh();
+                self.refresh_git();
+            }
             Key::Enter | Key::Char('\t' | 'o') => {
                 let leave = key == Key::Enter;
                 if let Some(path) = tree.activate()
@@ -711,6 +874,174 @@ impl App {
         Vec::new()
     }
 
+    /// Looks at git again: which repository holds the folder in the tree (or else the open file),
+    /// what it says has changed, and the last commit's text of the open file for the margin.
+    pub fn refresh_git(&mut self) {
+        let folder = match (&self.tree, self.editor.path()) {
+            (Some(tree), _) => Some(tree.root().to_path_buf()),
+            (None, Some(path)) => path.parent().map(Path::to_path_buf),
+            _ => None,
+        }
+        .map(|dir| {
+            if dir.as_os_str().is_empty() {
+                PathBuf::from(".")
+            } else {
+                dir
+            }
+        })
+        .and_then(|dir| std::fs::canonicalize(dir).ok());
+        self.git = folder.and_then(|folder| {
+            let repo = match &self.git {
+                Some(git) if git.folder == folder => git.repo.clone(),
+                _ => Repo::discover(&folder)?,
+            };
+            let status = repo.status()?;
+            Some(GitState {
+                repo,
+                status,
+                folder,
+            })
+        });
+        self.saves_seen = self.editor.saves;
+        // Compare the open file with the last commit: a file that isn't in it yet is all new.
+        let base = self.git.as_ref().and_then(|git| {
+            let file = std::fs::canonicalize(self.editor.path()?).ok()?;
+            match git.repo.head_text(&file) {
+                Some(text) => Some(text),
+                None => git.status.files.contains_key(&file).then(String::new),
+            }
+        });
+        self.editor.set_base(base);
+    }
+
+    /// Looks at git again if the file has been saved since it last was looked at.
+    fn look_after_save(&mut self) {
+        if self.editor.saves != self.saves_seen && self.screen == Screen::Editing {
+            self.refresh_git();
+        }
+    }
+
+    /// Call when the window gets the focus back, since git may have changed in the meantime.
+    pub fn focus_gained(&mut self) {
+        if self.screen == Screen::Editing {
+            self.refresh_git();
+        }
+    }
+
+    /// The full path in the repository of the row selected in the tree.
+    fn selected_in_repo(&self) -> Option<PathBuf> {
+        let (git, tree) = (self.git.as_ref()?, self.tree.as_ref()?);
+        let row = tree.selected()?;
+        Some(git.folder.join(row.path.strip_prefix(tree.root()).ok()?))
+    }
+
+    /// The key after `g` in the tree: `a` stages, `u` unstages, `A` stages everything, `r`
+    /// discards changes, `c` commits, `p` pushes, `l` pulls, and `g` goes to the top.
+    fn tree_git_key(&mut self, key: Key) {
+        if key == Key::Char('g') {
+            if let Some(tree) = &mut self.tree {
+                tree.move_selection(isize::MIN);
+            }
+            return;
+        }
+        let Some(git) = &self.git else {
+            self.message = "Not a git repository".into();
+            return;
+        };
+        let (repo, path) = (git.repo.clone(), self.selected_in_repo());
+        let done = match (key, path) {
+            (Key::Char('a'), Some(path)) => Some(repo.stage(&[path])),
+            (Key::Char('u'), Some(path)) => Some(repo.unstage(&[path])),
+            (Key::Char('A'), _) => Some(repo.stage_all()),
+            (Key::Char('r'), Some(path)) => {
+                match git.status.tone(&path) {
+                    Some(_) => {
+                        let name = path
+                            .file_name()
+                            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+                        self.prompt = Some(Prompt {
+                            label: format!("Discard changes to \u{201c}{name}\u{201d}?"),
+                            text: path.to_string_lossy().into_owned(),
+                            kind: PromptKind::ConfirmDiscard,
+                        });
+                    }
+                    None => self.message = "No changes to discard".into(),
+                }
+                None
+            }
+            (Key::Char('c'), _) => {
+                if git.status.files.is_empty() {
+                    self.message = "Nothing to commit".into();
+                } else {
+                    self.prompt = Some(Prompt {
+                        label: "Commit message: ".into(),
+                        text: String::new(),
+                        kind: PromptKind::Commit,
+                    });
+                }
+                None
+            }
+            (Key::Char('p'), _) => {
+                self.start_job("Push", &["push"]);
+                None
+            }
+            (Key::Char('l'), _) => {
+                self.start_job("Pull", &["pull", "--ff-only"]);
+                None
+            }
+            _ => None,
+        };
+        if let Some(result) = done {
+            self.message = result.err().unwrap_or_default();
+            self.refresh_git();
+        }
+    }
+
+    /// Commits what is staged, or everything if nothing is.
+    fn git_commit(&mut self, message: &str) {
+        let Some(git) = &self.git else { return };
+        if git.status.staged() == 0
+            && let Err(error) = git.repo.stage_all()
+        {
+            self.message = error;
+            return;
+        }
+        self.message = match git.repo.commit(message) {
+            Ok(summary) => summary,
+            Err(error) => error,
+        };
+        self.refresh_git();
+    }
+
+    /// Throws away the changes under `path`.
+    fn git_discard(&mut self, path: &Path) {
+        let Some(git) = &self.git else { return };
+        self.message = match git.repo.discard(&git.status, path) {
+            Ok(()) => "Changes discarded".into(),
+            Err(error) => error,
+        };
+        self.refresh_git();
+        // The file on disk is what it was, so the open one follows unless it has edits.
+        if !self.editor.buf.is_modified() && self.editor.path().is_some() {
+            self.editor.reload();
+        }
+    }
+
+    /// Runs `git` with `args` in the background, which the window keeps polling with `tick`.
+    fn start_job(&mut self, label: &'static str, args: &[&str]) {
+        if self.job.is_some() {
+            self.message = "Git is still busy".into();
+            return;
+        }
+        if let Some(git) = &self.git {
+            self.job = Some(Job {
+                label,
+                done: git.repo.spawn(args),
+            });
+            self.message = format!("{label}\u{2026}");
+        }
+    }
+
     fn start_action(&mut self, action: StartAction) -> Vec<Effect> {
         match action {
             StartAction::OpenFile => vec![Effect::PickFile],
@@ -728,6 +1059,12 @@ impl App {
 
     /// A key press.
     pub fn key(&mut self, size: (f32, f32), key: Key) -> Vec<Effect> {
+        let effects = self.key_pressed(size, key);
+        self.look_after_save();
+        effects
+    }
+
+    fn key_pressed(&mut self, size: (f32, f32), key: Key) -> Vec<Effect> {
         if let Screen::Start { .. } = self.screen {
             return match key {
                 Key::Ctrl('o') => vec![Effect::PickFile],
@@ -755,9 +1092,9 @@ impl App {
         if key == Key::Esc && self.popup.take().is_some() {
             return Vec::new();
         }
-        // Ctrl-E goes to the file tree and Ctrl-T to the outline, showing them if hidden; the
+        // Ctrl-L goes to the file tree and Ctrl-H to the outline, showing them if hidden; the
         // same key again goes back to the text.
-        if key == Key::Ctrl('e') {
+        if key == Key::Ctrl('l') {
             if self.focus != Focus::Tree {
                 self.ensure_tree();
                 self.focus = Focus::Tree;
@@ -766,7 +1103,7 @@ impl App {
             }
             return Vec::new();
         }
-        if key == Key::Ctrl('t') {
+        if key == Key::Ctrl('h') {
             if self.focus != Focus::Outline {
                 if !self.config.outline {
                     self.toggle_setting(&Click::ToggleOutline);
@@ -820,7 +1157,7 @@ impl App {
         }
         self.help |= std::mem::take(&mut self.editor.help);
         if let Some(by) = self.editor.scroll.take() {
-            let rows = (self.regions(size).editor.h / ui::BODY_ROW) as usize;
+            let rows = (self.regions(size).editor.h / self.reading.row()) as usize;
             let (down, n) = match by {
                 ViewMove::HalfDown => (true, rows / 2),
                 ViewMove::HalfUp => (false, rows / 2),
@@ -892,7 +1229,6 @@ impl App {
     }
 
     /// Writes the document to `path` as Markdown or PDF, and says on the status bar how it went.
-    /// Markdown drops color, size, font, and underline; PDF keeps them.
     pub fn export_to(&mut self, kind: ExportKind, path: &Path) {
         let text = self.editor.buf.text();
         let bytes = match kind {
@@ -921,6 +1257,7 @@ impl App {
                 self.popup = None;
                 self.hover = None;
                 self.remember(path);
+                self.refresh_git();
             }
             Err(error) => {
                 let message = format!("Can't open {}: {error}", path.display());
@@ -947,6 +1284,7 @@ impl App {
     pub fn open_folder(&mut self, folder: &Path) {
         self.remember(folder);
         self.tree = Some(Tree::new(folder));
+        self.refresh_git();
         self.tree_visible = true;
         if let Screen::Start { .. } = self.screen {
             self.screen = Screen::Editing;
@@ -1109,26 +1447,26 @@ mod tests {
         // Bold: the word at the cursor.
         assert!(app.click(SIZE, button("B"), |_, _| None).is_empty());
         assert_eq!(app.editor.buf.text(), "one *two* three");
-        // The color button opens a palette, which a choice applies and closes.
-        app.click(SIZE, button("A"), |_, _| None);
+        // The font button opens a list, whose choice sets how the text is read and leaves the text
+        // itself alone. It is remembered in the settings.
+        assert_eq!(app.reading.family, "Serif");
+        app.click(SIZE, button("Font"), |_, _| None);
         let popup = app.popup.clone().unwrap();
-        let green = popup
-            .items
-            .iter()
-            .find(|i| i.swatch == Some([0x2e, 0x8b, 0x57]))
-            .unwrap();
+        assert!(popup.items.iter().any(|i| i.selected && i.label == "Serif"));
+        let georgia = popup.items.iter().find(|i| i.label == "Georgia").unwrap();
         app.click(
             SIZE,
-            (green.bounds.x + 3.0, green.bounds.y + 3.0),
+            (georgia.bounds.x + 3.0, georgia.bounds.y + 3.0),
             |_, _| None,
         );
         assert!(app.popup.is_none());
-        assert_eq!(app.color, [0x2e, 0x8b, 0x57]);
-        assert!(
-            app.editor.buf.text().contains("color:#2e8b57"),
-            "{}",
-            app.editor.buf.text()
-        );
+        assert_eq!(app.reading.family, "Georgia");
+        app.click(SIZE, button("Size"), |_, _| None);
+        let popup = app.popup.clone().unwrap();
+        let big = popup.items.iter().find(|i| i.label == "24").unwrap();
+        app.click(SIZE, (big.bounds.x + 3.0, big.bounds.y + 3.0), |_, _| None);
+        assert_eq!(app.reading.size_pt, 24.0);
+        assert_eq!(app.editor.buf.text(), "one *two* three");
         // Esc closes a menu without touching the editor; clicking away closes it and does nothing.
         app.click(SIZE, button("Font"), |_, _| None);
         assert!(app.popup.is_some());
@@ -1201,7 +1539,7 @@ mod tests {
         )
     }
 
-    /// Types `keys`: `\n` is Enter, `\x1b` Esc, `\x08` Backspace, `\x05` Ctrl+E, and `\t` Tab.
+    /// Types `keys`: `\n` is Enter, `\x1b` Esc, `\x08` Backspace, `\x05` Ctrl+L, and `\t` Tab.
     fn press(app: &mut App, keys: &str) {
         for c in keys.chars() {
             app.key(
@@ -1210,7 +1548,7 @@ mod tests {
                     '\n' => Key::Enter,
                     '\x1b' => Key::Esc,
                     '\x08' => Key::Backspace,
-                    '\x05' => Key::Ctrl('e'),
+                    '\x05' => Key::Ctrl('l'),
                     c => Key::Char(c),
                 },
             );
@@ -1542,6 +1880,123 @@ mod tests {
     }
 
     #[test]
+    fn git_marks_files_in_the_tree_and_stages_commits_and_discards_from_it() {
+        use crate::diff::Change;
+        use crate::git::Tone;
+        use std::process::Command;
+        let dir = std::env::temp_dir().join("bwa_app_git");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        if !git(&["init", "-q", "-b", "main"]) {
+            return;
+        }
+        git(&["config", "user.name", "T"]);
+        git(&["config", "user.email", "t@example.com"]);
+        std::fs::write(dir.join("a.dj"), "one\ntwo\nthree\n").unwrap();
+        std::fs::write(dir.join("b.dj"), "b\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "start"]);
+        // An edit, a new file, and a new file in a folder.
+        std::fs::write(dir.join("a.dj"), "one\nTWO\nthree\n").unwrap();
+        std::fs::write(dir.join("c.dj"), "c\n").unwrap();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/d.dj"), "d\n").unwrap();
+
+        let mut app = start_app(Recent::default());
+        app.open_folder(&dir);
+        let tone = |app: &mut App, name: &str| {
+            let panel = app.regions(SIZE).tree;
+            let view = app.tree_view(panel).unwrap();
+            view.rows
+                .into_iter()
+                .find(|r| r.name == name)
+                .and_then(|r| r.git)
+        };
+        assert_eq!(tone(&mut app, "a.dj"), Some((Tone::Modified, Some('M'))));
+        assert_eq!(tone(&mut app, "c.dj"), Some((Tone::Untracked, Some('U'))));
+        assert_eq!(tone(&mut app, "sub"), Some((Tone::Untracked, None)));
+        assert_eq!(tone(&mut app, "b.dj"), None);
+        let panel = app.regions(SIZE).tree;
+        let info = app.tree_view(panel).unwrap().git.unwrap();
+        assert_eq!(
+            (info.branch.as_str(), info.changes, info.staged),
+            ("main", 3, 0)
+        );
+        assert!(
+            app.chrome(SIZE)
+                .labels
+                .iter()
+                .any(|l| l.text.starts_with("main*"))
+        );
+
+        // Opening the edited file marks the line that changed against the last commit.
+        app.open_file(&dir.join("a.dj"));
+        assert_eq!(app.editor.view().changes, [(1, Change::Modified)]);
+        // Stage it with `ga` on the tree, then commit with `gc` and a message.
+        press(&mut app, "\x05");
+        while rows(&app)[app.tree.as_ref().unwrap().selected_index()] != "a.dj*" {
+            press(&mut app, "j");
+        }
+        press(&mut app, "ga");
+        assert!(
+            app.git.as_ref().unwrap().status.files[&dir.canonicalize().unwrap().join("a.dj")]
+                .staged()
+        );
+        press(&mut app, "gc");
+        let ask = app.chrome(SIZE).over_labels;
+        assert!(ask.iter().any(|l| l.text == "Commit message:"));
+        assert!(
+            ask.iter()
+                .any(|l| l.text.starts_with("Enter to commit what is staged"))
+        );
+        press(&mut app, "edit two\n");
+        assert!(app.message.contains("edit two"), "{}", app.message);
+        assert!(tone(&mut app, "a.dj").is_none());
+        // The margin now compares with the new commit.
+        assert!(app.editor.view().changes.is_empty());
+        // Discarding asks first and puts the committed text back.
+        std::fs::write(dir.join("b.dj"), "changed\n").unwrap();
+        press(&mut app, "R");
+        while rows(&app)[app.tree.as_ref().unwrap().selected_index()] != "b.dj*" {
+            press(&mut app, "j");
+        }
+        press(&mut app, "gr");
+        assert!(
+            app.chrome(SIZE)
+                .over_labels
+                .iter()
+                .any(|l| l.text.starts_with("Discard changes to"))
+        );
+        press(&mut app, "n");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("b.dj")).unwrap(),
+            "changed\n"
+        );
+        press(&mut app, "gry");
+        assert_eq!(std::fs::read_to_string(dir.join("b.dj")).unwrap(), "b\n");
+        assert!(tone(&mut app, "b.dj").is_none());
+        // A folder outside any repository has no git at all.
+        let plain = std::env::temp_dir().join("bwa_app_no_git");
+        let _ = std::fs::remove_dir_all(&plain);
+        std::fs::create_dir_all(&plain).unwrap();
+        app.open_folder(&plain);
+        assert!(app.git.is_none());
+        press(&mut app, "ga");
+        assert_eq!(app.message, "Not a git repository");
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(plain).unwrap();
+    }
+
+    #[test]
     fn the_outline_lists_headings_marks_the_current_one_and_jumps_on_click() {
         let path = temp_file("outline", "# One\n\ntext\n\n## Two\n\nmore\n\n## Three\n");
         let mut app = App::new(
@@ -1586,9 +2041,9 @@ mod tests {
             "# One\n\ntext\n\n## Two\n\nmore\n\n## ".len()
         );
         assert_eq!(rows(&mut app)[2], ("Three".into(), true));
-        // Ctrl-T gives the outline the keyboard, on the current heading; j and k move, and Enter
+        // Ctrl-H gives the outline the keyboard, on the current heading; j and k move, and Enter
         // goes there and back to the text.
-        assert_eq!(app.key(SIZE, Key::Ctrl('t')), []);
+        assert_eq!(app.key(SIZE, Key::Ctrl('h')), []);
         assert_eq!(app.focus, Focus::Outline);
         app.key(SIZE, Key::Char('k'));
         let selected = |app: &mut App| {
@@ -1605,13 +2060,13 @@ mod tests {
         assert_eq!(app.editor.buf.cursor(), 2);
         // `q` in the outline hides it and the editor takes its room; the choice is remembered.
         let width = app.regions(SIZE).editor.w;
-        app.key(SIZE, Key::Ctrl('t'));
+        app.key(SIZE, Key::Ctrl('h'));
         app.key(SIZE, Key::Char('q'));
         assert!(app.regions(SIZE).outline.is_none() && app.focus == Focus::Editor);
         assert_eq!(app.regions(SIZE).editor.w, width + ui::OUTLINE_WIDTH);
         assert!(!Config::load(&settings).outline);
-        // Ctrl-T shows it again.
-        app.key(SIZE, Key::Ctrl('t'));
+        // Ctrl-H shows it again.
+        app.key(SIZE, Key::Ctrl('h'));
         assert!(app.regions(SIZE).outline.is_some() && app.focus == Focus::Outline);
         std::fs::remove_file(&path).unwrap();
         std::fs::remove_file(&settings).unwrap();
@@ -1627,7 +2082,7 @@ mod tests {
             Recent::default(),
             None,
         );
-        let rows = (app.regions(SIZE).editor.h / ui::BODY_ROW) as usize;
+        let rows = (app.regions(SIZE).editor.h / app.reading.row()) as usize;
         let line = |app: &App| {
             app.editor.buf.text()[..app.editor.buf.cursor()]
                 .matches('\n')

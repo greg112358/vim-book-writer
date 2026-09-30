@@ -116,7 +116,7 @@ pub fn chrome(window: (f32, f32), items: &[StartItem], hover: Option<usize>, t: 
     };
     chrome
         .labels
-        .push(label("Book Writing App", x, top, 30.0, true, t.ink));
+        .push(label("Vim Book Writer", x, top, 30.0, true, t.ink));
     chrome.labels.push(label(
         "A word processor for djot, with vim keys",
         x,
@@ -295,7 +295,7 @@ mod tests {
         let chrome = chrome((1000.0, 700.0), &items, Some(3), Theme::new(false));
         let texts = texts(&chrome);
         for want in [
-            "Book Writing App",
+            "Vim Book Writer",
             "Open file",
             "Open folder",
             "Open recent",

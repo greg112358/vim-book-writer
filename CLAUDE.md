@@ -1,4 +1,4 @@
-# Book Writing App
+# Vim Book Writer
 
 A fast, lightweight word processor for writing in djot (`.dj`), with vim controls. Rust, fully custom-drawn, one codebase
 for macOS and Linux. Read `SPEC.md` for the product and the task list.
