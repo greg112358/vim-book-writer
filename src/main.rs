@@ -13,7 +13,7 @@ use vim_book_writer::editor::Editor;
 use vim_book_writer::input;
 use vim_book_writer::recent::Recent;
 use vim_book_writer::scroll::Scroll;
-use vim_book_writer::toolbar::{self, Click};
+use vim_book_writer::toolbar;
 use vim_book_writer::ui::Bounds;
 use vim_book_writer::vim::{Key, Mode, ViewMove};
 use vim_book_writer::watch::FileWatcher;
@@ -22,6 +22,10 @@ use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::ModifiersState;
 use winit::window::{Window, WindowId};
+
+/// How much bigger the window's own text and buttons are drawn than their layout, on top of what
+/// the display's scale asks for.
+const UI_SCALE: f32 = 1.3;
 
 /// How much of the text to keep in view around the caret, and how far one wheel notch scrolls.
 const PADDING: f32 = 54.0;
@@ -220,6 +224,7 @@ impl ApplicationHandler<UserEvent> for Shell {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let attributes = Window::default_attributes()
             .with_title("Vim Book Writer")
+            .with_inner_size(winit::dpi::LogicalSize::new(1360.0, 860.0))
             .with_window_icon(window_icon());
         // The app id is how Wayland finds the icon and X11 the window class, through the
         // `.desktop` file that `desktop::install` wrote.
@@ -238,6 +243,7 @@ impl ApplicationHandler<UserEvent> for Shell {
                 .expect("failed to create window"),
         );
         self.gpu = Some(WindowGpu::new(window.clone()));
+        self.app.scale = UI_SCALE * window.scale_factor() as f32;
         window.set_ime_allowed(true);
         window.request_redraw();
         self.window = Some(window);
@@ -250,6 +256,10 @@ impl ApplicationHandler<UserEvent> for Shell {
                 if let Some(gpu) = &mut self.gpu {
                     gpu.resize(size);
                 }
+                self.request_redraw();
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                self.app.scale = UI_SCALE * scale_factor as f32;
                 self.request_redraw();
             }
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
@@ -427,6 +437,7 @@ fn main() {
     }
     config.size = args.pt.unwrap_or(config.size);
     app.set_config(config, config_path.filter(|_| !screenshot));
+    app.scale = UI_SCALE;
     app.tree_visible = args.tree;
     app.refresh_git();
     if let Some(folder) = &args.folder {
@@ -465,13 +476,7 @@ fn main() {
         }
         let regions = app.regions(size);
         if let Some(menu) = args.popup {
-            let toolbar = toolbar::toolbar(regions.toolbar);
-            let anchor = toolbar
-                .buttons
-                .iter()
-                .find(|b| b.click == Click::Open(menu))
-                .map_or_else(Default::default, |b| b.bounds);
-            app.open_menu(menu, anchor, size);
+            app.show_menu(menu, size);
         }
         if let Some(label) = &args.hover {
             let toolbar = toolbar::toolbar(regions.toolbar);

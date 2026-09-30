@@ -138,6 +138,8 @@ pub struct App {
     pub focus: Focus,
     /// The font and size the text is read in, from the settings.
     pub reading: Reading,
+    /// How many times as big as its layout the window is drawn.
+    pub scale: f32,
     pub prompt: Option<Prompt>,
     /// A note from the app, like why a file couldn't be moved, shown on the status bar.
     pub message: String,
@@ -188,6 +190,7 @@ impl App {
             hover: None,
             focus: Focus::Editor,
             reading: Reading::default(),
+            scale: 1.0,
             prompt: None,
             message: String::new(),
             tree_first: 0,
@@ -277,7 +280,20 @@ impl App {
         Theme::new(self.config.dark)
     }
 
+    /// The window's parts, for a window `size` pixels big. The app lays itself out as if the
+    /// window were `scale` times smaller and draws it `scale` times bigger, so its type and
+    /// buttons are as big as they are meant to be, however many pixels the window has.
     pub fn regions(&self, size: (f32, f32)) -> Regions {
+        self.lregions(self.small(size)).scaled(self.scale)
+    }
+
+    /// A size in window pixels as the layout sees it.
+    fn small(&self, (w, h): (f32, f32)) -> (f32, f32) {
+        (w / self.scale, h / self.scale)
+    }
+
+    /// The parts of a window `size` big as the layout sees it, before it is scaled up.
+    fn lregions(&self, size: (f32, f32)) -> Regions {
         ui::regions(size.0, size.1, self.tree_visible, self.config.outline)
     }
 
@@ -287,6 +303,13 @@ impl App {
 
     /// The window around the editor, or the whole start screen, as it should be drawn now.
     pub fn chrome(&mut self, size: (f32, f32)) -> Chrome {
+        let size = self.small(size);
+        let mut chrome = self.chrome_small(size);
+        chrome.scale(self.scale);
+        chrome
+    }
+
+    fn chrome_small(&mut self, size: (f32, f32)) -> Chrome {
         match &self.screen {
             Screen::Start { message } => {
                 let items = self.start_items(size);
@@ -306,7 +329,7 @@ impl App {
                 chrome
             }
             Screen::Editing => {
-                let regions = self.regions(size);
+                let regions = self.lregions(size);
                 let toolbar = toolbar::toolbar(regions.toolbar);
                 // What is being typed comes first: the `:` and `/` line.
                 let message = match self.editor.vim.command_line() {
@@ -391,11 +414,12 @@ impl App {
 
     /// Moves the mouse to (`x`, `y`). True if what is under it changed, so it needs a redraw.
     pub fn hover_at(&mut self, size: (f32, f32), x: f32, y: f32) -> bool {
+        let (size, x, y) = (self.small(size), x / self.scale, y / self.scale);
         let in_repo = self.git.is_some();
         let (hover, tree_hover) = match self.screen {
             Screen::Start { .. } => (start::hit(&self.start_items(size), x, y), None),
             Screen::Editing => {
-                let regions = self.regions(size);
+                let regions = self.lregions(size);
                 (
                     toolbar::toolbar(regions.toolbar).hit(x, y),
                     regions
@@ -422,6 +446,7 @@ impl App {
         at: (f32, f32),
         text_offset: impl FnOnce(&Display, bool) -> Option<usize>,
     ) -> Vec<Effect> {
+        let (size, at) = (self.small(size), (at.0 / self.scale, at.1 / self.scale));
         let effects = self.clicked(size, at, text_offset);
         self.look_after_save();
         effects
@@ -469,7 +494,7 @@ impl App {
         // A click answers the tip.
         self.hover_since = Instant::now();
         self.tip_shown = false;
-        let regions = self.regions(size);
+        let regions = self.lregions(size);
         let toolbar = toolbar::toolbar(regions.toolbar);
         if let Some(panel) = regions.outline.filter(|p| p.contains(x, y)) {
             // A heading takes the cursor there and the view to it.
@@ -521,8 +546,21 @@ impl App {
         Vec::new()
     }
 
+    /// Shows the list of a toolbar menu, in a window `size` pixels big.
+    pub fn show_menu(&mut self, menu: toolbar::Menu, size: (f32, f32)) {
+        let size = self.small(size);
+        let toolbar = toolbar::toolbar(self.lregions(size).toolbar);
+        if let Some(button) = toolbar
+            .buttons
+            .iter()
+            .find(|b| b.click == Click::Open(menu))
+        {
+            self.open_menu(menu, button.bounds, size);
+        }
+    }
+
     /// Opens the list under a toolbar button, with what is in force marked.
-    pub fn open_menu(&mut self, menu: toolbar::Menu, anchor: ui::Bounds, size: (f32, f32)) {
+    fn open_menu(&mut self, menu: toolbar::Menu, anchor: ui::Bounds, size: (f32, f32)) {
         let mut popup = toolbar::popup(menu, anchor, size);
         popup.mark(&match menu {
             toolbar::Menu::Font => self.config.font.clone(),
@@ -1059,7 +1097,7 @@ impl App {
 
     /// A key press.
     pub fn key(&mut self, size: (f32, f32), key: Key) -> Vec<Effect> {
-        let effects = self.key_pressed(size, key);
+        let effects = self.key_pressed(self.small(size), key);
         self.look_after_save();
         effects
     }
@@ -1157,7 +1195,7 @@ impl App {
         }
         self.help |= std::mem::take(&mut self.editor.help);
         if let Some(by) = self.editor.scroll.take() {
-            let rows = (self.regions(size).editor.h / self.reading.row()) as usize;
+            let rows = (self.lregions(size).editor.h * self.scale / self.reading.row()) as usize;
             let (down, n) = match by {
                 ViewMove::HalfDown => (true, rows / 2),
                 ViewMove::HalfUp => (false, rows / 2),

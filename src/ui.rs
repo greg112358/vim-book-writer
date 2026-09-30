@@ -38,7 +38,7 @@ impl Default for Reading {
 }
 
 pub const TOOLBAR_HEIGHT: f32 = 42.0;
-pub const STATUS_HEIGHT: f32 = 24.0;
+pub const STATUS_HEIGHT: f32 = 28.0;
 pub const TREE_WIDTH: f32 = 300.0;
 pub const OUTLINE_WIDTH: f32 = 240.0;
 
@@ -67,6 +67,25 @@ pub struct Regions {
     pub editor: Bounds,
     pub tree: Option<Bounds>,
     pub status: Bounds,
+}
+
+impl Regions {
+    /// The same layout drawn `scale` times as big.
+    pub fn scaled(&self, scale: f32) -> Regions {
+        let big = |b: Bounds| Bounds {
+            x: b.x * scale,
+            y: b.y * scale,
+            w: b.w * scale,
+            h: b.h * scale,
+        };
+        Regions {
+            toolbar: big(self.toolbar),
+            outline: self.outline.map(big),
+            editor: big(self.editor),
+            tree: self.tree.map(big),
+            status: big(self.status),
+        }
+    }
 }
 
 /// Lays out a window `width` by `height`. The outline and tree take a fixed width and the editor
@@ -215,11 +234,28 @@ pub struct Chrome {
     pub over_labels: Vec<Label>,
 }
 
-pub const TREE_HEADER: f32 = 34.0;
-pub const TREE_ROW: f32 = 22.0;
+impl Chrome {
+    /// Everything drawn `scale` times as big: shapes, positions and type.
+    pub fn scale(&mut self, scale: f32) {
+        for rect in self.rects.iter_mut().chain(&mut self.over_rects) {
+            (rect.x, rect.y, rect.w, rect.h) = (
+                rect.x * scale,
+                rect.y * scale,
+                rect.w * scale,
+                rect.h * scale,
+            );
+        }
+        for label in self.labels.iter_mut().chain(&mut self.over_labels) {
+            (label.x, label.y, label.size) = (label.x * scale, label.y * scale, label.size * scale);
+        }
+    }
+}
+
+pub const TREE_HEADER: f32 = 38.0;
+pub const TREE_ROW: f32 = 27.0;
 /// The room for a row of buttons in the file tree, and the line of git news over the git ones.
 pub const TREE_BUTTON_ROW: f32 = 30.0;
-pub const GIT_LINE: f32 = 20.0;
+pub const GIT_LINE: f32 = 22.0;
 /// Where the file tree's rows start, from the top of its panel: under two rows of file buttons,
 /// and for a repository the branch line and two rows of git buttons.
 pub const fn tree_top(git: bool) -> f32 {
@@ -236,7 +272,7 @@ pub const fn tree_top(git: bool) -> f32 {
 pub const TREE_TOP: f32 = tree_top(false);
 
 /// The room a panel keeps at the bottom for its hint.
-const FOOTER: f32 = 36.0;
+const FOOTER: f32 = 46.0;
 
 /// How many rows fit in a panel whose rows start `top` down.
 pub fn tree_capacity(panel: Bounds, top: f32) -> usize {
@@ -588,7 +624,7 @@ impl Theme {
     }
 }
 
-const LABEL_SIZE: f32 = 12.0;
+const LABEL_SIZE: f32 = 14.0;
 const BUTTON_SIZE: f32 = 15.0;
 
 /// What the status bar says.
@@ -757,7 +793,7 @@ pub fn chrome(regions: &Regions, status: &Status, ui: &Interface<'_>) -> Chrome 
             text,
             x,
             y,
-            size: 13.0,
+            size: 15.0,
             color,
             bold,
             italic: false,
@@ -766,7 +802,7 @@ pub fn chrome(regions: &Regions, status: &Status, ui: &Interface<'_>) -> Chrome 
         chrome.labels.push(text(
             "Outline".into(),
             panel.x + 12.0,
-            panel.y + 9.0,
+            panel.y + 10.0,
             true,
             t.ink,
         ));
@@ -796,7 +832,7 @@ pub fn chrome(regions: &Regions, status: &Status, ui: &Interface<'_>) -> Chrome 
                     }
                     let x = panel.x + 12.0 + (row.level - 1) as f32 * 12.0;
                     // Text width isn't known here; cut long titles to what a row can hold.
-                    let fit = ((panel.x + panel.w - 8.0 - x) / 6.8).max(1.0) as usize;
+                    let fit = ((panel.x + panel.w - 8.0 - x) / 8.0).max(1.0) as usize;
                     let title = if row.title.chars().count() > fit {
                         let cut: String = row.title.chars().take(fit.saturating_sub(1)).collect();
                         format!("{cut}\u{2026}")
@@ -807,7 +843,7 @@ pub fn chrome(regions: &Regions, status: &Status, ui: &Interface<'_>) -> Chrome 
                     chrome.labels.push(text(
                         title,
                         x,
-                        y + 3.0,
+                        y + 4.0,
                         row.level == 1 || row.current,
                         color,
                     ));
@@ -834,11 +870,11 @@ pub fn chrome(regions: &Regions, status: &Status, ui: &Interface<'_>) -> Chrome 
             let mut label = text(
                 line.into(),
                 panel.x + 12.0,
-                panel.y + panel.h - 34.0 + i as f32 * 15.0,
+                panel.y + panel.h - 42.0 + i as f32 * 18.0,
                 false,
                 t.muted,
             );
-            label.size = 11.0;
+            label.size = 13.0;
             chrome.labels.push(label);
         }
     }
@@ -854,7 +890,7 @@ pub fn chrome(regions: &Regions, status: &Status, ui: &Interface<'_>) -> Chrome 
                 text,
                 x,
                 y,
-                size: 13.0,
+                size: 15.0,
                 color,
                 bold,
                 italic: false,
@@ -863,7 +899,7 @@ pub fn chrome(regions: &Regions, status: &Status, ui: &Interface<'_>) -> Chrome 
             chrome.labels.push(text(
                 view.header.clone(),
                 tree.x + 12.0,
-                tree.y + 9.0,
+                tree.y + 10.0,
                 true,
                 t.ink,
             ));
@@ -905,7 +941,7 @@ pub fn chrome(regions: &Regions, status: &Status, ui: &Interface<'_>) -> Chrome 
                         ..text(
                             letter.unwrap_or('\u{2022}').to_string(),
                             tree.x + tree.w - 12.0,
-                            y + 3.0,
+                            y + 4.0,
                             true,
                             color,
                         )
@@ -914,7 +950,7 @@ pub fn chrome(regions: &Regions, status: &Status, ui: &Interface<'_>) -> Chrome 
                 chrome.labels.push(text(
                     format!("{marker}{}", row.name),
                     tree.x + 10.0 + row.depth as f32 * 14.0,
-                    y + 3.0,
+                    y + 4.0,
                     row.is_dir,
                     color,
                 ));
@@ -938,7 +974,7 @@ pub fn chrome(regions: &Regions, status: &Status, ui: &Interface<'_>) -> Chrome 
                 text: news,
                 x: tree.x + 12.0,
                 y: tree.y + TREE_HEADER + 2.0 * TREE_BUTTON_ROW + 2.0,
-                size: 11.0,
+                size: 13.0,
                 color: t.muted,
                 bold: false,
                 italic: false,
@@ -981,8 +1017,8 @@ pub fn chrome(regions: &Regions, status: &Status, ui: &Interface<'_>) -> Chrome 
             chrome.labels.push(Label {
                 text: line.into(),
                 x: tree.x + 12.0,
-                y: tree.y + tree.h - 34.0 + i as f32 * 15.0,
-                size: 11.0,
+                y: tree.y + tree.h - 42.0 + i as f32 * 18.0,
+                size: 13.0,
                 color: t.muted,
                 bold: false,
                 italic: false,

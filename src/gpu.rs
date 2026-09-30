@@ -14,7 +14,7 @@ use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
 /// The width of the text column, and the least margin on either side of it.
-const COLUMN_WIDTH: f32 = 720.0;
+const COLUMN_WIDTH: f32 = 860.0;
 const MIN_MARGIN: f32 = 24.0;
 const TOP_MARGIN: f32 = 32.0;
 
