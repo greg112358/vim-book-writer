@@ -1,5 +1,6 @@
 use glyphon::{Attrs, Buffer, Color, Cursor, Family, Metrics, Style, Weight};
 use vim_book_writer::diff::Change;
+use vim_book_writer::display::Display;
 use vim_book_writer::editor::View;
 use vim_book_writer::runs::Format;
 use vim_book_writer::ui::{Rect, Theme};
@@ -30,7 +31,7 @@ pub fn attrs<'a>(format: &Format, faint: bool, theme: &Theme, reading: &'a Readi
 
 /// The size of the text of `format` before it is made smaller for a superscript or subscript.
 pub fn base_size(format: &Format, reading: &Reading) -> f32 {
-    let scale = [1.0, 2.0, 1.6, 1.3, 1.15, 1.05, 1.0][format.heading.min(6) as usize];
+    let scale = [1.0, 1.9, 1.5, 1.25, 1.1, 1.0, 1.0][format.heading.min(6) as usize];
     let size = reading.size() * scale;
     if format.code || format.code_block {
         size * 0.9
@@ -52,7 +53,14 @@ pub fn script_attrs<'a>(format: &Format, theme: &Theme, reading: &'a Reading) ->
 }
 
 fn look<'a>(format: &Format, faint: bool, theme: &Theme, reading: &'a Reading) -> Attrs<'a> {
-    let mut size = base_size(format, reading);
+    let heading = format.heading > 0;
+    // A heading's `##` is small and light, so the title stands on its own; the rest of the syntax
+    // takes the size of the text it marks, so it doesn't jog the line.
+    let mut size = if faint && heading {
+        reading.size()
+    } else {
+        base_size(format, reading)
+    };
     if !faint && (format.superscript || format.subscript) {
         size *= 0.65;
     }
@@ -64,30 +72,35 @@ fn look<'a>(format: &Format, faint: bool, theme: &Theme, reading: &'a Reading) -
     };
     let color = match () {
         _ if faint => color(theme.faint),
+        _ if format.marker => color(theme.muted),
         _ if format.link => color(theme.link),
         _ if format.quote => color(theme.quote),
         _ => color(theme.text),
     };
+    // Headings are set tighter than body text, which reads better big.
+    let line_height = if heading && !faint { 1.3 } else { LINE_HEIGHT };
     let mut attrs = Attrs::new()
         .family(family)
         .color(color)
-        .metrics(Metrics::new(size, size * LINE_HEIGHT));
-    if format.bold || format.heading > 0 {
+        .metrics(Metrics::new(size, size * line_height));
+    if format.bold || (heading && !faint) {
         attrs = attrs.weight(Weight::BOLD);
     }
     if format.italic || format.quote {
         attrs = attrs.style(Style::Italic);
     }
-    // glyphon doesn't draw underlines or strikethroughs, and cosmic-text joins the decorated
-    // stretches on either side of a gap, so mark the glyphs and draw the lines in `decorations`.
+    // glyphon draws only glyphs, so the lines and the shading go in `decorations`, along runs of
+    // glyphs marked here. The marks for code cover its backticks too, so one pill holds them.
     if !faint {
         attrs.metadata = usize::from(format.link) | usize::from(format.strike) << 1;
     }
+    attrs.metadata |= usize::from(format.code) << 2;
     attrs
 }
 
 const UNDERLINE: usize = 1;
 const STRIKE: usize = 2;
+const CODE: usize = 4;
 
 /// The font family for the name of a reading font. The three generic names mean whichever font
 /// of that kind is installed.
@@ -100,21 +113,38 @@ fn family(name: &str) -> Family<'_> {
     }
 }
 
-/// The lines for underlines and strikethroughs, for text laid out in `buffer` and drawn at
-/// (`left`, `top`). A line runs along consecutive glyphs marked for it.
-pub fn decorations(buffer: &Buffer, left: f32, top: f32, theme: &Theme) -> Vec<Rect> {
-    let mut rects = Vec::new();
+/// What goes along runs of marked glyphs, for text laid out in `buffer` and drawn at (`left`,
+/// `top`): the shading behind inline code, pushed to `under`, and the underlines and
+/// strikethroughs, pushed to `over`.
+pub fn decorations(
+    buffer: &Buffer,
+    (left, top): (f32, f32),
+    theme: &Theme,
+    under: &mut Vec<Rect>,
+    over: &mut Vec<Rect>,
+) {
     for run in buffer.layout_runs() {
-        for (flag, offset) in [(UNDERLINE, 0.12), (STRIKE, -0.3)] {
+        for flag in [CODE, UNDERLINE, STRIKE] {
             let mut glyphs = run.glyphs.iter().peekable();
             while let Some(first) = glyphs.find(|g| g.metadata & flag != 0) {
                 let mut end = first.x + first.w;
                 while let Some(next) = glyphs.next_if(|g| g.metadata & flag != 0) {
                     end = next.x + next.w;
                 }
+                if flag == CODE {
+                    under.push(Rect {
+                        x: left + first.x - 3.0,
+                        y: top + run.line_top + run.line_height * 0.1,
+                        w: end - first.x + 6.0,
+                        h: run.line_height * 0.8,
+                        color: theme.code_bg,
+                    });
+                    continue;
+                }
+                let offset = if flag == UNDERLINE { 0.12 } else { -0.3 };
                 let thickness = (first.font_size / 18.0).max(1.0);
                 let color = first.color_opt.unwrap_or_else(|| text_color(theme));
-                rects.push(Rect {
+                over.push(Rect {
                     x: left + first.x,
                     y: top + run.line_y + offset * first.font_size - thickness / 2.0,
                     w: end - first.x,
@@ -122,6 +152,73 @@ pub fn decorations(buffer: &Buffer, left: f32, top: f32, theme: &Theme) -> Vec<R
                     color: [color.r(), color.g(), color.b(), color.a()],
                 });
             }
+        }
+    }
+}
+
+/// What the block a line sits in draws behind it, for text laid out in `buffer` at (`left`,
+/// `top`): a band across the column for a code block, a bar down the left of a quote, and for a
+/// thematic break a line from after its `***` to the right edge.
+pub fn blocks(
+    buffer: &Buffer,
+    display: &Display,
+    (left, top): (f32, f32),
+    theme: &Theme,
+) -> Vec<Rect> {
+    const CODE_BLOCK: u8 = 1;
+    const QUOTE: u8 = 2;
+    const RULE: u8 = 3;
+    let mut kinds = vec![0u8; display.line_count()];
+    let mut any = false;
+    for span in &display.spans {
+        let kind = match &span.format {
+            f if f.code_block => CODE_BLOCK,
+            f if f.quote => QUOTE,
+            f if f.rule => RULE,
+            _ => continue,
+        };
+        any = true;
+        let first = display.line_and_index(span.range.start).0;
+        let last = display.line_and_index(span.range.end - 1).0;
+        for line in &mut kinds[first..=last] {
+            *line = (*line).max(kind);
+        }
+    }
+    let mut rects = Vec::new();
+    if !any {
+        return rects;
+    }
+    let (pad, width) = (14.0, buffer.size().0.unwrap_or(0.0));
+    for run in buffer.layout_runs() {
+        let (y, h) = (top + run.line_top, run.line_height);
+        match kinds.get(run.line_i).copied().unwrap_or(0) {
+            CODE_BLOCK => rects.push(Rect {
+                x: left - pad,
+                y,
+                w: width + 2.0 * pad,
+                h,
+                color: theme.code_bg,
+            }),
+            QUOTE => rects.push(Rect {
+                x: left - pad,
+                y,
+                w: 3.0,
+                h,
+                color: theme.rule,
+            }),
+            RULE => {
+                let x = left + run.line_w + 12.0;
+                if x < left + width {
+                    rects.push(Rect {
+                        x,
+                        y: y + h / 2.0,
+                        w: left + width - x,
+                        h: 1.0,
+                        color: theme.rule,
+                    });
+                }
+            }
+            _ => {}
         }
     }
     rects

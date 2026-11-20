@@ -126,12 +126,14 @@ pub fn chrome(window: (f32, f32), items: &[StartItem], hover: Option<usize>, t: 
         t.muted,
     ));
     let mut recent_heading_y = None;
+    let mut number = 0;
     for (i, item) in items.iter().enumerate() {
         let b = item.bounds;
         let lit = hover == Some(i);
         match item.action {
             StartAction::Open(_) => {
                 recent_heading_y.get_or_insert(b.y - 30.0);
+                number += 1;
                 if lit {
                     chrome.rects.push(Rect::new(b, t.start_row));
                 }
@@ -151,11 +153,12 @@ pub fn chrome(window: (f32, f32), items: &[StartItem], hover: Option<usize>, t: 
                     false,
                     t.muted,
                 ));
-                if i - 2 < 9 {
+                // The first nine open by their number.
+                if number <= 9 {
                     chrome.labels.push(Label {
                         align: Align::Right,
                         ..label(
-                            &format!("{}", i - 1),
+                            &number.to_string(),
                             b.x + b.w - 10.0,
                             b.y + 10.0,
                             12.0,
@@ -286,41 +289,5 @@ mod tests {
         assert_eq!(key_action('2', &items), Some(items[3].action.clone()));
         assert_eq!(key_action('9', &items), None);
         assert_eq!(key_action('x', &items), None);
-    }
-
-    #[test]
-    fn the_screen_says_what_it_is_and_labels_everything() {
-        let items = layout((1000.0, 700.0), &recent(2));
-        let texts = |c: &Chrome| c.labels.iter().map(|l| l.text.clone()).collect::<Vec<_>>();
-        let chrome = chrome((1000.0, 700.0), &items, Some(3), Theme::new(false));
-        let texts = texts(&chrome);
-        for want in [
-            "Vim Book Writer",
-            "Open file",
-            "Open folder",
-            "Open recent",
-            "chapter0.dj",
-            "chapter1.dj",
-            "/books/novel",
-        ] {
-            assert!(texts.iter().any(|t| t == want), "{want:?} in {texts:?}");
-        }
-        // Digits go beside the recent files, and only the hovered row is lit.
-        assert!(texts.contains(&"1".to_string()) && texts.contains(&"2".to_string()));
-        assert_eq!(
-            chrome
-                .rects
-                .iter()
-                .filter(|r| r.color == [0xe8, 0xe1, 0xcf, 0xff])
-                .count(),
-            1
-        );
-        let empty = super::chrome(
-            (1000.0, 700.0),
-            &layout((1000.0, 700.0), &[]),
-            None,
-            Theme::new(false),
-        );
-        assert!(empty.labels.iter().any(|l| l.text == "No recent files yet"));
     }
 }

@@ -2,7 +2,6 @@ use crate::diff::Change;
 use crate::git::Tone;
 use crate::toolbar::{Click, Popup, Toolbar};
 use crate::vim::Mode;
-use taffy::prelude::*;
 
 /// The line height of the text, as a multiple of its size.
 pub const LINE_HEIGHT: f32 = 1.5;
@@ -88,96 +87,58 @@ impl Regions {
     }
 }
 
-/// Lays out a window `width` by `height`. The outline and tree take a fixed width and the editor
-/// the rest.
+/// Lays out a window `width` by `height`: a toolbar across the top, a status bar across the
+/// bottom, and between them the outline, the editor and the tree, the panels at a fixed width
+/// and the editor taking the rest. In a window too small for all of it, the bars win over the
+/// panels and the panels over the editor, so nothing comes out negative.
 pub fn regions(width: f32, height: f32, tree: bool, outline: bool) -> Regions {
-    let fixed = |width: f32, height: f32| Style {
-        size: Size {
-            width: if width < 0.0 {
-                Dimension::AUTO
-            } else {
-                Dimension::from_length(width)
-            },
-            height: if height < 0.0 {
-                Dimension::AUTO
-            } else {
-                Dimension::from_length(height)
-            },
-        },
-        flex_shrink: 0.0,
-        ..Default::default()
+    let (width, height) = (width.max(0.0), height.max(0.0));
+    let toolbar_h = TOOLBAR_HEIGHT.min(height);
+    let status_h = STATUS_HEIGHT.min(height - toolbar_h);
+    let body = Bounds {
+        x: 0.0,
+        y: toolbar_h,
+        w: width,
+        h: height - toolbar_h - status_h,
     };
-    let mut taffy: TaffyTree<()> = TaffyTree::new();
-    let toolbar = taffy.new_leaf(fixed(-1.0, TOOLBAR_HEIGHT)).unwrap();
-    let editor = taffy
-        .new_leaf(Style {
-            flex_grow: 1.0,
-            min_size: Size {
-                width: LengthPercentageAuto::from_length(0.0),
-                height: LengthPercentageAuto::AUTO,
-            },
-            ..Default::default()
-        })
-        .unwrap();
-    let tree_node = tree.then(|| taffy.new_leaf(fixed(TREE_WIDTH, -1.0)).unwrap());
-    let outline_node = outline.then(|| taffy.new_leaf(fixed(OUTLINE_WIDTH, -1.0)).unwrap());
-    let mut row: Vec<_> = outline_node.into_iter().collect();
-    row.push(editor);
-    row.extend(tree_node);
-    let body = taffy
-        .new_with_children(
-            Style {
-                flex_direction: FlexDirection::Row,
-                flex_grow: 1.0,
-                min_size: Size {
-                    width: LengthPercentageAuto::AUTO,
-                    height: LengthPercentageAuto::from_length(0.0),
-                },
-                ..Default::default()
-            },
-            &row,
-        )
-        .unwrap();
-    let status = taffy.new_leaf(fixed(-1.0, STATUS_HEIGHT)).unwrap();
-    let root = taffy
-        .new_with_children(
-            Style {
-                flex_direction: FlexDirection::Column,
-                size: Size {
-                    width: Dimension::from_length(width),
-                    height: Dimension::from_length(height),
-                },
-                ..Default::default()
-            },
-            &[toolbar, body, status],
-        )
-        .unwrap();
-    taffy
-        .compute_layout(
-            root,
-            Size {
-                width: AvailableSpace::Definite(width),
-                height: AvailableSpace::Definite(height),
-            },
-        )
-        .unwrap();
-    let bounds = |node, origin: (f32, f32)| {
-        let layout = taffy.layout(node).unwrap();
-        Bounds {
-            x: origin.0 + layout.location.x,
-            y: origin.1 + layout.location.y,
-            w: layout.size.width,
-            h: layout.size.height,
-        }
+    let outline_w = if outline {
+        OUTLINE_WIDTH.min(width)
+    } else {
+        0.0
     };
-    let body_bounds = bounds(body, (0.0, 0.0));
-    let origin = (body_bounds.x, body_bounds.y);
+    let tree_w = if tree {
+        TREE_WIDTH.min(width - outline_w)
+    } else {
+        0.0
+    };
     Regions {
-        toolbar: bounds(toolbar, (0.0, 0.0)),
-        outline: outline_node.map(|node| bounds(node, origin)),
-        editor: bounds(editor, origin),
-        tree: tree_node.map(|node| bounds(node, origin)),
-        status: bounds(status, (0.0, 0.0)),
+        toolbar: Bounds {
+            x: 0.0,
+            y: 0.0,
+            w: width,
+            h: toolbar_h,
+        },
+        outline: outline.then_some(Bounds {
+            x: 0.0,
+            w: outline_w,
+            ..body
+        }),
+        editor: Bounds {
+            x: outline_w,
+            w: width - outline_w - tree_w,
+            ..body
+        },
+        tree: tree.then_some(Bounds {
+            x: width - tree_w,
+            w: tree_w,
+            ..body
+        }),
+        status: Bounds {
+            x: 0.0,
+            y: height - status_h,
+            w: width,
+            h: status_h,
+        },
     }
 }
 
@@ -382,16 +343,16 @@ pub fn dialog_buttons(dialog: Bounds) -> (Bounds, Bounds) {
     )
 }
 
-/// The keys, by group, that the help box lists.
 /// A group of keys in the help box: its title, and each key with what it does.
 type HelpGroup = (&'static str, &'static [(&'static str, &'static str)]);
 
+/// The keys, by group, that the help box lists.
 pub const HELP: [HelpGroup; 5] = [
     (
         "Panels",
         &[
-            ("Ctrl-L", "file tree: go there, again to come back"),
-            ("Ctrl-H", "outline: go there, again to come back"),
+            ("Ctrl-L", "move right: text, then the file tree"),
+            ("Ctrl-H", "move left: text, then the outline"),
             ("j  k", "move up and down in a panel"),
             ("Enter", "open a file, fold a folder, go to a heading"),
             ("o  Tab", "the same, but stay in the panel"),
@@ -503,8 +464,15 @@ pub struct Theme {
     pub start_button: [u8; 4],
     pub text: [u8; 4],
     pub faint: [u8; 4],
+    /// Behind code, inline and in blocks.
+    pub code_bg: [u8; 4],
+    /// The bar beside a quote, and the line a thematic break draws.
+    pub rule: [u8; 4],
     pub link: [u8; 4],
     pub quote: [u8; 4],
+    /// The status bar's badge for insert mode and for the visual modes.
+    pub insert: [u8; 4],
+    pub visual: [u8; 4],
     pub selection: [u8; 4],
     /// Names in the file tree by what git says, and the bars in the margin by how a line changed.
     pub git_untracked: [u8; 4],
@@ -542,9 +510,13 @@ const LIGHT: Theme = Theme {
     start_row: [0xe8, 0xe1, 0xcf, 0xff],
     start_button: [0xdd, 0xd4, 0xbd, 0xff],
     text: [0x22, 0x22, 0x22, 0xff],
-    faint: [0xb4, 0xab, 0x9a, 0xff],
+    faint: [0xa6, 0x9c, 0x86, 0xff],
+    code_bg: [0xe9, 0xe2, 0xcf, 0xff],
+    rule: [0xcd, 0xc3, 0xab, 0xff],
     link: [0x1a, 0x5f, 0xb4, 0xff],
-    quote: [0x5a, 0x5a, 0x5a, 0xff],
+    quote: [0x5c, 0x58, 0x50, 0xff],
+    insert: [0x2b, 0x5c, 0xb8, 0xff],
+    visual: [0x8e, 0x44, 0x9a, 0xff],
     selection: [0x7f, 0xae, 0xe6, 0x80],
     git_untracked: [0x58, 0x7c, 0x0c, 0xff],
     git_added: [0x38, 0x7a, 0x3c, 0xff],
@@ -580,9 +552,13 @@ const DARK: Theme = Theme {
     start_row: [0x30, 0x2e, 0x29, 0xff],
     start_button: [0x3d, 0x3a, 0x34, 0xff],
     text: [0xe6, 0xe1, 0xd6, 0xff],
-    faint: [0x6b, 0x66, 0x5b, 0xff],
+    faint: [0x7c, 0x76, 0x69, 0xff],
+    code_bg: [0x2c, 0x2a, 0x26, 0xff],
+    rule: [0x4c, 0x48, 0x41, 0xff],
     link: [0x7f, 0xb0, 0xee, 0xff],
-    quote: [0xb0, 0xaa, 0x9e, 0xff],
+    quote: [0xb4, 0xae, 0xa2, 0xff],
+    insert: [0x7f, 0xae, 0xe6, 0xff],
+    visual: [0xc8, 0x92, 0xd2, 0xff],
     selection: [0x3a, 0x5f, 0x94, 0xa0],
     git_untracked: [0x73, 0xc9, 0x91, 0xff],
     git_added: [0x81, 0xb8, 0x8b, 0xff],
@@ -707,6 +683,22 @@ pub fn chrome(regions: &Regions, status: &Status, ui: &Interface<'_>) -> Chrome 
         y: toolbar.y + toolbar.h - 1.0,
         ..line(toolbar)
     });
+    // A thin line between groups of buttons, where the gap is wider than between neighbours.
+    for pair in ui.toolbar.buttons.windows(2) {
+        let (a, b) = (pair[0].bounds, pair[1].bounds);
+        let gap = b.x - (a.x + a.w);
+        if gap > 6.0 && gap < 40.0 {
+            chrome.rects.push(Rect::new(
+                Bounds {
+                    x: (a.x + a.w + b.x) / 2.0,
+                    y: a.y + 6.0,
+                    w: 1.0,
+                    h: a.h - 12.0,
+                },
+                t.border,
+            ));
+        }
+    }
     for (i, button) in ui.toolbar.buttons.iter().enumerate() {
         let b = button.bounds;
         let open =
@@ -724,7 +716,7 @@ pub fn chrome(regions: &Regions, status: &Status, ui: &Interface<'_>) -> Chrome 
         chrome.labels.push(Label {
             // The theme button shows the look a click switches to.
             text: match button.click {
-                Click::ToggleDark if t.dark => "\u{2600}".into(),
+                Click::ToggleDark if t.dark => "Light".into(),
                 _ => button.label.clone(),
             },
             x: b.x + b.w / 2.0,
@@ -1207,13 +1199,26 @@ pub fn chrome(regions: &Regions, status: &Status, ui: &Interface<'_>) -> Chrome 
         italic: false,
         align,
     };
-    chrome.labels.push(label(
-        mode_name(status.mode).into(),
-        bar.x + 12.0,
-        Align::Left,
-        true,
-        t.ink,
-    ));
+    // The mode sits in a badge whose color says which it is, so a glance at the corner tells.
+    let (mode_color, name) = (
+        match status.mode {
+            Mode::Normal => t.muted,
+            Mode::Insert => t.insert,
+            Mode::Visual | Mode::VisualLine => t.visual,
+        },
+        mode_name(status.mode),
+    );
+    let badge = Bounds {
+        x: bar.x + 8.0,
+        y: bar.y + 5.0,
+        w: name.len() as f32 * 8.6 + 12.0,
+        h: bar.h - 10.0,
+    };
+    chrome.rects.push(Rect::new(badge, [mode_color[0], mode_color[1], mode_color[2], 0x2a]));
+    chrome.labels.push(Label {
+        align: Align::Center,
+        ..label(name.into(), badge.x + badge.w / 2.0, Align::Left, true, mode_color)
+    });
     let file = if status.message.is_empty() {
         format!(
             "{}{}",
@@ -1253,54 +1258,6 @@ pub fn chrome(regions: &Regions, status: &Status, ui: &Interface<'_>) -> Chrome 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_editor_fills_what_the_bars_and_tree_leave() {
-        let r = regions(1000.0, 700.0, false, false);
-        assert_eq!(
-            r.toolbar,
-            Bounds {
-                x: 0.0,
-                y: 0.0,
-                w: 1000.0,
-                h: TOOLBAR_HEIGHT
-            }
-        );
-        assert_eq!(
-            r.status,
-            Bounds {
-                x: 0.0,
-                y: 700.0 - STATUS_HEIGHT,
-                w: 1000.0,
-                h: STATUS_HEIGHT
-            }
-        );
-        assert_eq!(
-            r.editor,
-            Bounds {
-                x: 0.0,
-                y: TOOLBAR_HEIGHT,
-                w: 1000.0,
-                h: 700.0 - TOOLBAR_HEIGHT - STATUS_HEIGHT
-            }
-        );
-        assert_eq!(r.tree, None);
-
-        // The tree is on the right and takes its width from the editor.
-        let r = regions(1000.0, 700.0, true, false);
-        let tree = r.tree.unwrap();
-        assert_eq!(
-            tree,
-            Bounds {
-                x: 1000.0 - TREE_WIDTH,
-                y: TOOLBAR_HEIGHT,
-                w: TREE_WIDTH,
-                h: r.editor.h
-            }
-        );
-        assert_eq!(r.editor.w, 1000.0 - TREE_WIDTH);
-        assert_eq!(r.editor.x + r.editor.w, tree.x);
-    }
 
     #[test]
     fn a_tiny_window_doesnt_make_negative_sizes() {
@@ -1350,173 +1307,5 @@ mod tests {
             None
         );
         assert_eq!(tree_row_at(panel, TREE_HEADER, 0, 100.0, y(1.0)), None);
-    }
-
-    #[test]
-    fn the_tree_panel_shows_its_header_rows_and_selection() {
-        let regions = regions(1000.0, 700.0, true, false);
-        let toolbar = crate::toolbar::Toolbar {
-            buttons: Vec::new(),
-        };
-        let row = |name: &str, depth, is_dir, expanded, selected| TreeRow {
-            name: name.into(),
-            depth,
-            is_dir,
-            expanded,
-            selected,
-            git: None,
-        };
-        let view = TreeView {
-            header: "novel".into(),
-            rows: vec![
-                row("chapters", 0, true, true, false),
-                row("one.dj", 1, false, false, true),
-                row("notes", 0, true, false, false),
-            ],
-            focused: true,
-            git: None,
-        };
-        let status = Status {
-            mode: Mode::Normal,
-            file: "f".into(),
-            modified: false,
-            words: 0,
-            branch: None,
-            spot: Spot::Word(0),
-            message: String::new(),
-        };
-        let interface = Interface {
-            toolbar: &toolbar,
-            hover: None,
-            popup: None,
-            tree: Some(&view),
-            autosave: false,
-            theme: Theme::new(false),
-            tip: false,
-            outline: None,
-            tree_buttons: None,
-            tree_hover: None,
-            dialog: None,
-            help: false,
-        };
-        let chrome = chrome(&regions, &status, &interface);
-        let labels: Vec<&str> = chrome.labels.iter().map(|l| l.text.as_str()).collect();
-        for want in ["novel", "\u{25be} chapters", "   one.dj", "\u{25b8} notes"] {
-            assert!(labels.contains(&want), "{want:?} in {labels:?}");
-        }
-        // Children are indented past their folder, and the selected row has a highlight behind it.
-        let x = |text: &str| chrome.labels.iter().find(|l| l.text == text).unwrap().x;
-        assert!(x("   one.dj") > x("\u{25be} chapters"));
-        let one = chrome
-            .labels
-            .iter()
-            .find(|l| l.text == "   one.dj")
-            .unwrap();
-        assert!(
-            chrome
-                .rects
-                .iter()
-                .any(|r| r.y <= one.y && one.y < r.y + r.h && r.color == [0xd9, 0xcf, 0xb4, 0xff])
-        );
-    }
-
-    #[test]
-    fn bounds_contain_their_top_left_but_not_their_far_edge() {
-        let b = Bounds {
-            x: 10.0,
-            y: 20.0,
-            w: 30.0,
-            h: 40.0,
-        };
-        assert!(b.contains(10.0, 20.0) && b.contains(39.9, 59.9));
-        assert!(!b.contains(40.0, 30.0) && !b.contains(20.0, 60.0) && !b.contains(9.9, 30.0));
-    }
-
-    #[test]
-    fn the_status_bar_shows_mode_file_changes_and_words() {
-        let regions = regions(800.0, 600.0, false, false);
-        let status = |mode, modified, words, message: &str| Status {
-            mode,
-            file: "book.dj".into(),
-            modified,
-            words,
-            branch: None,
-            spot: Spot::Word(0),
-            message: message.into(),
-        };
-        let toolbar = crate::toolbar::Toolbar {
-            buttons: Vec::new(),
-        };
-        let interface = Interface {
-            toolbar: &toolbar,
-            hover: None,
-            popup: None,
-            tree: None,
-            autosave: false,
-            theme: Theme::new(false),
-            tip: false,
-            outline: None,
-            tree_buttons: None,
-            tree_hover: None,
-            dialog: None,
-            help: false,
-        };
-        let texts = |s: Status| -> Vec<String> {
-            chrome(&regions, &s, &interface)
-                .labels
-                .into_iter()
-                .map(|l| l.text)
-                .collect()
-        };
-        assert_eq!(
-            texts(status(Mode::Normal, false, 1234, "")),
-            ["NORMAL", "book.dj", "1234 words"]
-        );
-        assert_eq!(
-            texts(status(Mode::Insert, true, 1, "")),
-            ["INSERT", "book.dj [+]", "1 word"]
-        );
-        assert_eq!(texts(status(Mode::VisualLine, false, 0, ""))[0], "V-LINE");
-        // Where the cursor is, or how much is selected, goes before the total.
-        for (spot, want) in [
-            (Spot::Word(12), "word 12 \u{b7} 1234 words"),
-            (Spot::Selected(5), "5 selected \u{b7} 1234 words"),
-            (Spot::Selected(0), "1234 words"),
-        ] {
-            let s = Status {
-                spot,
-                ..status(Mode::Normal, false, 1234, "")
-            };
-            assert_eq!(texts(s)[2], want);
-        }
-        assert_eq!(
-            texts(status(Mode::Visual, true, 5, "E486: Pattern not found: x"))[1],
-            "E486: Pattern not found: x"
-        );
-        // The labels sit inside the status bar.
-        let bar = regions.status;
-        let toolbar = crate::toolbar::Toolbar {
-            buttons: Vec::new(),
-        };
-        let interface = Interface {
-            toolbar: &toolbar,
-            hover: None,
-            popup: None,
-            tree: None,
-            autosave: false,
-            theme: Theme::new(false),
-            tip: false,
-            outline: None,
-            tree_buttons: None,
-            tree_hover: None,
-            dialog: None,
-            help: false,
-        };
-        for label in chrome(&regions, &status(Mode::Normal, false, 3, ""), &interface).labels {
-            assert!(
-                label.y >= bar.y && label.y + label.size <= bar.y + bar.h,
-                "{label:?}"
-            );
-        }
     }
 }

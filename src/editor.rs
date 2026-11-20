@@ -1,11 +1,10 @@
 use crate::action::Action;
-use crate::blocks::{set_heading, toggle_list, toggle_quote};
+use crate::blocks::{set_heading, toggle_code_block, toggle_list, toggle_quote};
 use crate::buffer::Buffer;
 use crate::diff::{self, Change};
 use crate::display::Display;
 use crate::document::Document;
 use crate::format::{Mark, toggle, toggle_link, uppercase};
-use crate::motion::{word_back, word_end};
 use crate::outline::{self, Heading};
 use crate::ui::Spot;
 use crate::vim::{Command, Key, Mode, ViewMove, Vim};
@@ -28,7 +27,7 @@ pub struct View<'a> {
     pub selection: Option<Range<usize>>,
     /// Where the searched-for text is, as offsets in `display.text`, in order.
     pub found: &'a [Range<usize>],
-    /// The display lines that differ from the base text, for bars in the margin.
+    /// The lines that differ from the base text, for bars in the margin.
     pub changes: &'a [(usize, Change)],
 }
 
@@ -49,7 +48,7 @@ pub struct Editor {
     doc: Document,
     /// What the screen shows, and the buffer revision and mode it was made for.
     display: Display,
-    display_key: Option<(u64, bool)>,
+    display_key: Option<u64>,
     /// Differs from every earlier version, of any editor, whenever `display` is rebuilt, so a
     /// renderer can tell when it changed.
     display_version: u64,
@@ -58,7 +57,7 @@ pub struct Editor {
     /// `spot` for the buffer revision, cursor and selection it was worked out at.
     spot: Option<((u64, usize, usize, usize), Spot)>,
     /// The `display_key` that `buf.rows` were laid out for.
-    rows_key: Option<(u64, bool)>,
+    rows_key: Option<u64>,
     /// A scroll the last key asked for, for the app to carry out.
     pub scroll: Option<ViewMove>,
     /// `:help` was typed, for the app to show the list of keys.
@@ -74,11 +73,13 @@ pub struct Editor {
     /// many times it has been set.
     base: Option<String>,
     base_version: u64,
-    /// The display lines that differ from `base`, and what they were made for.
+    /// The lines that differ from `base`, and the revision and base they were worked out for.
     changes: Vec<(usize, Change)>,
-    changes_for: (u64, u64, u64),
+    changes_for: (u64, u64),
     /// Counts the times the text was written to its file.
     pub saves: u64,
+    /// A save was asked for with no file to save to, for the app to ask for a name.
+    pub needs_name: bool,
     /// The headings, and the buffer revision they were read at.
     headings: Option<(u64, Vec<Heading>)>,
 }
@@ -86,7 +87,7 @@ pub struct Editor {
 impl Editor {
     pub fn open(path: &Path) -> io::Result<Self> {
         let doc = Document::open(path)?;
-        let mut editor = Self {
+        let editor = Self {
             buf: Buffer::new(doc.text()),
             vim: Vim::new(),
             doc,
@@ -105,12 +106,11 @@ impl Editor {
             base: None,
             base_version: 0,
             changes: Vec::new(),
-            changes_for: (u64::MAX, 0, 0),
+            changes_for: (u64::MAX, 0),
             saves: 0,
+            needs_name: false,
             headings: None,
         };
-        // A file that starts with hidden syntax, like `# `, opens with the cursor on the text.
-        editor.snap_cursor(0, Key::Esc);
         Ok(editor)
     }
 
@@ -157,17 +157,23 @@ impl Editor {
     /// The headings of the text, read again only when it has changed.
     pub fn headings(&mut self) -> &[Heading] {
         let revision = self.buf.revision();
-        match &mut self.headings {
-            Some((at, _)) if *at == revision => {}
-            slot => *slot = Some((revision, outline::headings(self.buf.text()))),
+        if self.headings.as_ref().is_none_or(|(at, _)| *at != revision) {
+            self.headings = Some((revision, outline::headings(self.buf.text())));
         }
-        &self.headings.as_ref().unwrap().1
+        self.headings.as_ref().map_or(&[], |(_, h)| h.as_slice())
     }
 
-    /// Puts the cursor at source offset `offset`, moved off any hidden syntax there.
+    /// Puts the cursor at source offset `offset`, or on the title if that is a heading's `#`s.
     pub fn goto(&mut self, offset: usize) {
+        // On a heading, the cursor goes to the title rather than the `## ` before it.
+        let text = self.buf.text();
+        let marks = text[offset..].bytes().take_while(|&b| b == b'#').count();
+        let offset = if marks > 0 && text[offset + marks..].starts_with(' ') {
+            offset + marks + 1
+        } else {
+            offset
+        };
         self.buf.set_cursor(offset);
-        self.snap_cursor(0, Key::Esc);
     }
 
     /// The file being edited, if it has one.
@@ -191,17 +197,12 @@ impl Editor {
             )
     }
 
-    /// What to draw: the source with faint syntax while inserting, and the finished-looking text
-    /// otherwise. It is rebuilt only when the text or that choice has changed since the last call,
-    /// and the number that goes with it changes whenever it is.
+    /// What to draw: the text with its syntax faint. It is rebuilt only when the text has changed
+    /// since the last call, and the number that goes with it changes whenever it is.
     pub fn display(&mut self) -> (&Display, u64) {
-        let key = (self.buf.revision(), self.vim.mode == Mode::Insert);
+        let key = self.buf.revision();
         if self.display_key != Some(key) {
-            self.display = if key.1 {
-                Display::insert(self.buf.text())
-            } else {
-                Display::normal(self.buf.text())
-            };
+            self.display = Display::new(self.buf.text());
             self.display_key = Some(key);
             // Numbered across all editors, so the window never mistakes a newly opened file's
             // display for the old one's.
@@ -210,23 +211,20 @@ impl Editor {
         (&self.display, self.display_version)
     }
 
-    /// Tells the editor where the window wrapped the text it last drew, as displayed offsets of
-    /// where each row starts, so up and down move a row at a time.
+    /// Tells the editor where the window wrapped the text it last drew, as the offsets where each
+    /// row starts, so up and down move a row at a time.
     pub fn set_rows(&mut self, rows: &[usize]) {
         if self.rows_key == self.display_key {
             return;
         }
         self.buf.rows.clear();
-        self.buf
-            .rows
-            .extend(rows.iter().map(|&at| self.display.to_source(at)));
+        self.buf.rows.extend_from_slice(rows);
         self.rows_key = self.display_key;
     }
 
     /// Moves the cursor down or up `rows` rows, or as far as it can go: wrapped rows when the
     /// window has laid the text out, else whole lines.
     pub fn move_rows(&mut self, down: bool, rows: usize) {
-        let before = self.buf.cursor();
         let inserting = self.vim.mode == Mode::Insert;
         for _ in 0..rows {
             let moved = if !self.buf.rows.is_empty() {
@@ -246,17 +244,14 @@ impl Editor {
         }
         if !inserting {
             self.buf.clamp_to_char();
-            self.snap_cursor(before, Key::Char(if down { 'j' } else { 'k' }));
         }
     }
 
     /// Feeds a key to the vim engine and carries out what it asks for. True means the app
     /// should quit.
     pub fn key(&mut self, key: Key) -> bool {
-        // Rows laid out for other text, or the other mode's display, say nothing about this one.
-        if self.rows_key.is_some()
-            && self.rows_key != Some((self.buf.revision(), self.vim.mode == Mode::Insert))
-        {
+        // Rows laid out for other text say nothing about this one.
+        if self.rows_key != Some(self.buf.revision()) {
             self.buf.rows.clear();
             self.rows_key = None;
         }
@@ -276,7 +271,6 @@ impl Editor {
             }
             _ => {}
         }
-        let before = self.buf.cursor();
         let quit = match self.vim.handle(&mut self.buf, key) {
             Some(Command::Save) => {
                 self.save();
@@ -298,55 +292,13 @@ impl Editor {
             }
             None => false,
         };
-        self.snap_cursor(before, key);
         quit
     }
 
-    /// Outside insert mode the syntax is hidden, so the cursor may not rest on it. It moves on in
-    /// the direction it was going. Vim counts a hidden `**` as a word of its own, so a word motion
-    /// that lands on one goes on to the visible word: `w` steps over the blanks, `e` and `b`
-    /// finish from the char it snapped to.
-    fn snap_cursor(&mut self, before: usize, key: Key) {
-        if self.vim.mode == Mode::Insert {
-            return;
-        }
-        let cursor = self.buf.cursor();
-        let (display, _) = self.display();
-        let mut snapped = display.snap(cursor, cursor >= before);
-        if snapped != cursor {
-            let text = self.buf.text();
-            let next = text[snapped..].chars().next();
-            let blank = next.is_some_and(|c| c == ' ' || c == '\t');
-            let target = match key {
-                Key::Char('w') => {
-                    let blanks = text[snapped..]
-                        .bytes()
-                        .take_while(|b| matches!(b, b' ' | b'\t'))
-                        .count();
-                    Some((snapped + blanks, true))
-                }
-                Key::Char('e') if blank => Some((word_end(text, snapped), true)),
-                Key::Char('b') => Some((
-                    word_back(text, snapped + next.map_or(0, char::len_utf8)),
-                    false,
-                )),
-                _ => None,
-            };
-            if let Some((to, forward)) = target {
-                snapped = self.display().0.snap(to, forward);
-            }
-        }
-        if snapped != cursor {
-            self.buf.set_cursor(snapped);
-        }
-    }
-
-    /// Puts the cursor at displayed offset `display_offset`, as a click there would.
-    pub fn click(&mut self, display_offset: usize) {
-        let source = self.display().0.to_source(display_offset);
-        self.buf.set_cursor(source);
+    /// Puts the cursor at `offset`, as a click there would.
+    pub fn click(&mut self, offset: usize) {
+        self.buf.set_cursor(offset);
         if self.vim.mode != Mode::Insert {
-            self.snap_cursor(0, Key::Esc);
             self.buf.clamp_to_char();
         }
     }
@@ -364,20 +316,17 @@ impl Editor {
                 if self.preview_for.0 != revision || self.preview_for.1 != typed {
                     self.preview_for = (revision, typed.to_string());
                     self.preview = self.vim.preview_substitute(&self.buf, typed).map(|made| {
-                        let display = Display::normal(&made.text);
                         let found = made
                             .changes
                             .iter()
-                            .map(|(_, new)| {
-                                display.to_display(new.start)..display.to_display(new.end)
-                            })
+                            .map(|(_, new)| new.clone())
                             .filter(|range| !range.is_empty())
                             .collect();
                         Preview {
-                            cursor: display.to_display(made.map_cursor(cursor)),
+                            cursor: made.map_cursor(cursor),
                             found,
                             version: NEXT_VERSION.fetch_add(1, Ordering::Relaxed),
-                            display,
+                            display: Display::new(&made.text),
                         }
                     });
                 }
@@ -398,23 +347,13 @@ impl Editor {
                 changes: &[],
             };
         }
-        let display = &self.display;
-        let key = (revision, self.base_version, version);
+        let key = (revision, self.base_version);
         if self.changes_for != key {
             self.changes_for = key;
-            self.changes.clear();
-            if let Some(base) = &self.base {
-                let text = self.buf.text();
-                let mut starts = vec![0];
-                starts.extend(text.match_indices('\n').map(|(i, _)| i + 1));
-                for (line, change) in diff::marks(base, text) {
-                    let at = starts.get(line).copied().unwrap_or(text.len());
-                    let shown = display.line_and_index(display.to_display(at)).0;
-                    if self.changes.last().is_none_or(|&(last, _)| last != shown) {
-                        self.changes.push((shown, change));
-                    }
-                }
-            }
+            self.changes = match &self.base {
+                Some(base) => diff::marks(base, self.buf.text()),
+                None => Vec::new(),
+            };
         }
         let pattern = self.vim.highlight_pattern();
         let pattern = pattern.as_deref().unwrap_or("");
@@ -426,19 +365,16 @@ impl Editor {
             if !pattern.is_empty() {
                 // A few thousand is more than anyone looks at, and keeps a one-letter search cheap.
                 for (at, found) in self.buf.text().match_indices(pattern).take(20_000) {
-                    let range = display.to_display(at)..display.to_display(at + found.len());
-                    if !range.is_empty() {
-                        self.found.push(range);
-                    }
+                    self.found.push(at..at + found.len());
                 }
             }
         }
         View {
-            display,
+            display: &self.display,
             version,
             mode,
-            cursor: display.to_display(cursor),
-            selection: selection.map(|r| display.to_display(r.start)..display.to_display(r.end)),
+            cursor,
+            selection,
             found: &self.found,
             changes: &self.changes,
         }
@@ -474,6 +410,7 @@ impl Editor {
             Action::BulletList => self.vim.apply_format(buf, |b, r| toggle_list(b, r, false)),
             Action::NumberedList => self.vim.apply_format(buf, |b, r| toggle_list(b, r, true)),
             Action::Quote => self.vim.apply_format(buf, toggle_quote),
+            Action::CodeBlock => self.vim.apply_format(buf, toggle_code_block),
             Action::Link => {
                 let mut cursor = None;
                 self.vim
@@ -486,7 +423,6 @@ impl Editor {
                 }
             }
         }
-        self.snap_cursor(self.buf.cursor(), Key::Esc);
     }
 
     /// Reads the file again, replacing the text. It is one edit, so undo brings back what was
@@ -494,7 +430,7 @@ impl Editor {
     /// line says why and the text stays.
     pub fn reload(&mut self) {
         let Some(path) = self.doc.path().map(Path::to_path_buf) else {
-            self.vim.message = "E32: No file name".into();
+            self.vim.message = "E32: No file to reload from".into();
             return;
         };
         match Document::open(&path) {
@@ -505,7 +441,6 @@ impl Editor {
                 self.buf.mark_saved();
                 self.doc = fresh;
                 self.buf.set_cursor(cursor);
-                self.snap_cursor(cursor, Key::Esc);
                 self.buf.clamp_to_char();
             }
             Err(error) => self.vim.message = format!("E484: Can't read the file: {error}"),
@@ -566,7 +501,6 @@ impl Editor {
         }
         if !insert {
             self.buf.clamp_to_char();
-            self.snap_cursor(self.buf.cursor(), Key::Esc);
         }
     }
 
@@ -581,12 +515,12 @@ impl Editor {
                 true
             }
             Err(error) => {
-                self.vim.message = match error.kind() {
-                    io::ErrorKind::NotFound if self.doc.path().is_none() => {
-                        "E32: No file name".into()
-                    }
-                    _ => format!("E212: Can't write the file: {error}"),
-                };
+                if self.doc.path().is_none() {
+                    self.needs_name = true;
+                    self.vim.message = "E32: No file name".into();
+                } else {
+                    self.vim.message = format!("E212: Can't write the file: {error}");
+                }
                 false
             }
         }
@@ -679,104 +613,41 @@ mod tests {
         type_keys(&mut editor, "l");
         assert_eq!(editor.display().1, first);
         type_keys(&mut editor, "i*hi*");
-        // While inserting, the display is the source; after Esc it hides the syntax.
+        // The display is the source in every mode; leaving insert mode doesn't rebuild it.
         let (display, version) = editor.display();
         assert_eq!(display.text, "*hi*");
         assert!(version > first);
         type_keys(&mut editor, "\x1b");
-        let (display, version_after) = editor.display();
-        assert_eq!(display.text, "hi");
-        assert!(version_after > version);
-    }
-
-    #[test]
-    fn the_cursor_skips_hidden_syntax_outside_insert_mode() {
-        let mut editor = Editor::default();
-        // a0 ' '1 *2 *3 b4 *5 *6 ' '7 c8 ' '9 d10
-        type_keys(&mut editor, "ia **b** c d\x1b0");
-        let at = |editor: &mut Editor, keys: &str| {
-            type_keys(editor, keys);
-            editor.buf.cursor()
-        };
-        assert_eq!(at(&mut editor, "w"), 4);
-        // Right over the closing ** lands on the space, and left comes back to the b.
-        assert_eq!(at(&mut editor, "l"), 7);
-        assert_eq!(at(&mut editor, "h"), 4);
-        // w from the b skips the ** and the space after it, to the next word.
-        assert_eq!(at(&mut editor, "w"), 8);
-        assert_eq!(at(&mut editor, "b"), 4);
-        assert_eq!(at(&mut editor, "e"), 8);
-        assert_eq!(at(&mut editor, "$"), 10);
-        assert_eq!(at(&mut editor, "0"), 0);
-        // Inserting doesn't snap: the raw text is showing.
-        assert_eq!(at(&mut editor, "wa"), 5);
-    }
-
-    #[test]
-    fn word_motions_treat_a_hidden_delimiter_run_as_part_of_the_word_next_to_it() {
-        let mut editor = Editor::default();
-        // Visible: "one bold two"
-        type_keys(&mut editor, "ione **bold** two\x1b0");
-        for (keys, want) in [
-            ("w", 6),
-            ("w", 13),
-            ("b", 6),
-            ("b", 0),
-            ("we", 9),
-            ("e", 15),
-            ("ee", 15),
-        ] {
-            type_keys(&mut editor, keys);
-            assert_eq!(editor.buf.cursor(), want, "after {keys}");
-        }
+        assert_eq!(editor.display().1, version);
     }
 
     #[test]
     fn clicking_places_the_cursor_on_the_source_char_that_was_shown() {
         let mut editor = Editor::default();
         type_keys(&mut editor, "i## Hi\n\na **b** c\x1b");
-        // Displayed: "Hi\n\na b c"; the b is at 6 and comes from source offset 11.
-        editor.click(6);
+        editor.click(11);
         assert_eq!(editor.buf.cursor(), 11);
         // Past the end lands on the last char, not after it.
         editor.click(99);
         assert_eq!(editor.buf.cursor(), 15);
+        // The syntax can be clicked too.
         editor.click(0);
-        assert_eq!(editor.buf.cursor(), 3);
-        // While inserting, the raw text shows, so a click is a raw offset.
-        type_keys(&mut editor, "i");
-        editor.click(2);
-        assert_eq!(editor.buf.cursor(), 2);
+        assert_eq!(editor.buf.cursor(), 0);
     }
 
     #[test]
-    fn the_view_puts_the_cursor_and_selection_in_display_terms() {
+    fn the_view_puts_the_cursor_and_selection_at_source_offsets() {
         let mut editor = Editor::default();
         type_keys(&mut editor, "i**ab** cd\x1b0");
         let view = editor.view();
         assert_eq!((view.cursor, view.selection.clone()), (0, None));
-        assert_eq!(view.display.text, "ab cd");
+        assert_eq!(view.display.text, "**ab** cd");
         type_keys(&mut editor, "ve");
         let view = editor.view();
         assert_eq!(
             (view.mode, view.cursor, view.selection),
             (Mode::Visual, 1, Some(0..2))
         );
-        // Inserting shows the source, so the offsets are the source's.
-        type_keys(&mut editor, "\x1bi");
-        let view = editor.view();
-        assert_eq!(
-            (view.mode, view.cursor, view.selection),
-            (Mode::Insert, 3, None)
-        );
-    }
-
-    #[test]
-    fn a_file_opens_with_the_cursor_on_visible_text() {
-        let path = temp_file("open_cursor", "## Title\n");
-        let editor = Editor::open(&path).unwrap();
-        assert_eq!(editor.buf.cursor(), 3);
-        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
@@ -809,8 +680,7 @@ mod tests {
     fn the_view_lists_where_the_search_text_is_in_display_offsets() {
         let mut editor = Editor::default();
         type_keys(&mut editor, "ia **foo** b foo\x1b/foo\n");
-        // The `**` is hidden, so the first match is at 2, not 4.
-        assert_eq!(editor.view().found, [2..5, 8..11]);
+        assert_eq!(editor.view().found, [4..7, 12..15]);
         type_keys(&mut editor, ":noh\n");
         assert!(editor.view().found.is_empty());
     }
@@ -846,7 +716,7 @@ mod tests {
             .map(|h| (h.level, h.title.clone()))
             .collect();
         assert_eq!(found, [(1, "One".to_string()), (2, "Two".to_string())]);
-        // In normal mode the `## ` is hidden, so the cursor rests on the T.
+        // The cursor rests on the title, past the `## `.
         editor.goto(12);
         assert_eq!(editor.buf.cursor(), 14);
         editor.goto(0);
@@ -884,12 +754,15 @@ mod tests {
         // The window wrapped the first line after "two ".
         editor.view();
         editor.set_rows(&[0, 8, 14]);
-        type_keys(&mut editor, "j");
-        assert_eq!(editor.buf.cursor(), 8);
+        // `j` still goes by whole lines; `gj` and `gk` go by wrapped rows.
         type_keys(&mut editor, "j");
         assert_eq!(editor.buf.cursor(), 14);
-        // An operator still works on whole lines.
-        type_keys(&mut editor, "kdj");
+        type_keys(&mut editor, "kgj");
+        assert_eq!(editor.buf.cursor(), 8);
+        type_keys(&mut editor, "gj");
+        assert_eq!(editor.buf.cursor(), 14);
+        // An operator works on whole lines.
+        type_keys(&mut editor, "ggdj");
         assert_eq!(editor.buf.text(), "");
         // Once the text changes, the old rows say nothing about it.
         type_keys(&mut editor, "ione two three\x1b0");
@@ -950,7 +823,7 @@ mod tests {
         type_keys(&mut editor, "u");
         assert_eq!(editor.buf.text(), "see word here");
         // Applied again inside a link, it comes off, and no insert starts.
-        type_keys(&mut editor, "\x12\x120w");
+        type_keys(&mut editor, "\x12\x120wl");
         editor.apply(&Action::Link);
         assert_eq!(editor.buf.text(), "see word here");
         assert_eq!(editor.vim.mode, Mode::Normal);
@@ -965,7 +838,7 @@ mod tests {
         type_keys(&mut editor, "wviw");
         ctrl(&mut editor, 'b');
         assert_eq!(editor.buf.text(), "one *two* three");
-        type_keys(&mut editor, "wve");
+        type_keys(&mut editor, "0wwwwve");
         ctrl(&mut editor, 'i');
         assert_eq!(editor.buf.text(), "one *two* _three_");
         assert_eq!(editor.vim.mode, Mode::Normal);
@@ -976,11 +849,6 @@ mod tests {
         assert!(!editor.buf.is_modified());
         assert!(std::fs::read_to_string(&path).unwrap().ends_with("_!"));
         std::fs::remove_file(&path).unwrap();
-    }
-
-    #[test]
-    fn opening_a_missing_file_is_an_error() {
-        assert!(Editor::open(Path::new("/nonexistent/dir/book.dj")).is_err());
     }
 
     #[test]
@@ -1002,7 +870,7 @@ mod tests {
         // With no file, or a file that has gone, it says so and keeps the text.
         let mut nameless = Editor::default();
         type_keys(&mut nameless, "ihi\x1b:e!\n");
-        assert_eq!(nameless.vim.message, "E32: No file name");
+        assert_eq!(nameless.vim.message, "E32: No file to reload from");
         std::fs::remove_file(&path).unwrap();
         type_keys(&mut editor, ":e!\n");
         assert!(

@@ -13,10 +13,12 @@ commit message. If the image looks wrong, fix it and re-render before checking t
 ## Product
 
 **Modes.** Vim-style modal editing on a djot document (`.dj` files).
-- **Normal mode:** the document renders. `**bold**` shows as bold with no asterisks, headings show as headings, and so on.
-- **Insert mode:** the raw djot is visible, but styled. `**Bold Text**` shows the words in bold and the asterisks in a faint
-  color, so the source stays readable while it's obvious what it will become.
-- Visual mode selects text; the same formatting commands apply to the selection.
+- **The text is always the source, styled.** `**Bold Text**` shows the words in bold and the asterisks in a faint
+  color; headings are big and bold with their `#` small and faint; code blocks sit on a shaded band, quotes have a
+  bar down their left side. Every character is there to move onto and edit, in every mode, so what you see is what
+  the file holds, made obvious.
+- **Normal mode** has a block cursor, **insert mode** a bar, and **visual mode** selects text; the same formatting
+  commands apply to the selection.
 
 **Formatting.** Toolbar buttons and traditional shortcuts (Ctrl/Cmd+B, I) act on the current selection, or on the
 word under the cursor if there is no selection.
@@ -52,8 +54,8 @@ buttons. Smooth scrolling and transitions. Continuous scroll layout with a fixed
   dot-repeat, undo/redo, search (`/`, `n`, `N`), `:w` `:q` `:wq`. No macros, marks, visual-block, or `:s`/`:g`.
 - Vim extras added after the core: `{ } W B E`, `f F t T ; ,`, `r ~ J`, visual `o p u U ~ J`, `Ctrl-d/u/f/b` and `zz zt zb`
   (smooth scrolling; in normal mode Ctrl-b and Ctrl-u scroll instead of formatting), `:N`, and insert `Ctrl-w`.
-- Panels: the outline (left) and the file tree (right) both take the keyboard: `Ctrl-L` for the tree, `Ctrl-H` for
-  the outline, `j`/`k` to move, Enter to open or fold. The tree also has buttons for new file/folder, rename, delete
+- Panels: the outline (left) and the file tree (right) both take the keyboard; `Ctrl-H` and `Ctrl-L` move left and right between panes, like tmux:
+  outline | text | tree, `j`/`k` to move, Enter to open or fold. The tree also has buttons for new file/folder, rename, delete
   (asks first in a dialog), copy, move, yank and paste. `F1` or `:help` lists every key.
 - Git, like VS Code's, by way of the `git` program: names in the file tree are colored with a letter (M, A, U, D, C),
   the status bar and the tree show the branch, bars in the margin mark lines changed since the last commit, and the
@@ -81,8 +83,8 @@ buttons. Smooth scrolling and transitions. Continuous scroll layout with a fixed
       blockquote, code, links, emphasis, strong, strikethrough, and nested emphasis
 - [x] Insert-mode styling map: for a source range, produce which characters are content and which are markup
       delimiters (so the renderer can draw delimiters faint); tests for `**bold**`, `_italic_`, `{^sup^}`
-- [x] Normal-mode rendering map: same input, but with delimiters and attribute blocks hidden; tests confirm the visible
-      text of `**bold** and _it_` is `bold and it`
+- [x] ~~Normal-mode rendering map with delimiters hidden~~ Dropped: every mode shows the source with faint syntax,
+      so the cursor can always reach it
 
 ### Formatting commands
 - [x] Toggle bold/italic/strikethrough over a selection: wraps with the delimiters, and removes them if already applied
@@ -114,8 +116,7 @@ buttons. Smooth scrolling and transitions. Continuous scroll layout with a fixed
 - [x] wgpu surface + clear color in the winit window; `cargo build` succeeds
 - [x] Draw buffer text through glyphon **[visual]**
 - [x] Keyboard input routed into the vim engine
-- [x] Normal-mode rendering: hidden delimiters, styled headings, bold, italic, strikethrough **[visual]**
-- [x] Insert-mode rendering: styled text with faint delimiters **[visual]**
+- [x] Rendering: styled headings, bold, italic, strikethrough, code, quotes, with faint delimiters **[visual]**
 - [x] Caret, selection highlight, and mouse caret placement **[visual]**
 - [x] Smooth scrolling with a fixed-width text column **[visual]**
 

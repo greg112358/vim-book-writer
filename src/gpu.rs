@@ -1,6 +1,6 @@
 use crate::rects::Rects;
 use crate::typeset::{self, LINE_HEIGHT, Reading};
-use cosmic_text::fontdb;
+use glyphon::cosmic_text::fontdb;
 use glyphon::{
     Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, Style,
     SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Weight,
@@ -16,7 +16,7 @@ use winit::window::Window;
 /// The width of the text column, and the least margin on either side of it.
 const COLUMN_WIDTH: f32 = 860.0;
 const MIN_MARGIN: f32 = 24.0;
-const TOP_MARGIN: f32 = 32.0;
+const TOP_MARGIN: f32 = 44.0;
 
 /// Where things are in the laid-out text, in pixels from the top of the scrollable area, which
 /// starts with the top margin.
@@ -461,7 +461,8 @@ impl Gpu {
         let mut under = Vec::new();
         let mut over = Vec::new();
         if let Some(view) = frame.view {
-            over = typeset::decorations(&self.buffer, left, top, frame.theme);
+            under = typeset::blocks(&self.buffer, view.display, (left, top), frame.theme);
+            typeset::decorations(&self.buffer, (left, top), frame.theme, &mut under, &mut over);
             over.extend(typeset::gutter(
                 &self.buffer,
                 view,

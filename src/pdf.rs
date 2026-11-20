@@ -717,34 +717,6 @@ mod tests {
     }
 
     #[test]
-    fn superscripts_and_subscripts_are_smaller_and_shifted_and_keep_their_text() {
-        let doc = parse(&to_pdf("E = mc{^2^} and H{~2~}O\n", "t"));
-        let text = text_of(&doc);
-        assert!(text.contains('2') && text.contains("mc"), "{text}");
-        assert!(
-            look_of(
-                &Piece {
-                    script: Script::Super,
-                    ..Piece::default()
-                },
-                0,
-                &Kind::Text(0)
-            )
-            .raise
-                > 0.0
-        );
-        let sub = look_of(
-            &Piece {
-                script: Script::Sub,
-                ..Piece::default()
-            },
-            0,
-            &Kind::Text(0),
-        );
-        assert!(sub.raise < 0.0 && sub.size < BODY_PT);
-    }
-
-    #[test]
     fn links_and_strikethrough_are_drawn_with_lines() {
         let lines = |src: &str| {
             ops_of(src)

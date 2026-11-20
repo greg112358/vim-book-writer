@@ -13,7 +13,7 @@ use crate::ui::{
     Theme, TreeRow, TreeView,
 };
 use crate::vim::{Key, ViewMove};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
@@ -52,6 +52,8 @@ enum PromptKind {
     ConfirmDiscard,
     /// The message for a commit.
     Commit,
+    /// The name for a document that has none, to save it under.
+    SaveAs,
 }
 
 impl PromptKind {
@@ -108,6 +110,8 @@ pub enum Effect {
     Quit,
     PickFile,
     PickFolder,
+    /// Start another copy of the app, which opens on the start screen.
+    NewWindow,
     /// Ask where to put an export; the window then calls `export_to`.
     PickExport(ExportKind),
     /// Put this text on the system clipboard.
@@ -145,8 +149,6 @@ pub struct App {
     pub message: String,
     /// The first tree row showing, so the list scrolls only when the selection leaves it.
     tree_first: usize,
-    /// The row and text of the last thing yanked in the tree, for the clipboard.
-    pub yanked: Option<PathBuf>,
     pub autosave: AutoSave,
     config: Config,
     config_path: Option<PathBuf>,
@@ -194,7 +196,6 @@ impl App {
             prompt: None,
             message: String::new(),
             tree_first: 0,
-            yanked: None,
             autosave: AutoSave::new(AUTOSAVE_DELAY, Instant::now()),
             config: Config::default(),
             config_path: None,
@@ -370,6 +371,12 @@ impl App {
                         buttons: Some(("Delete (y)", "Keep it (n)")),
                         hint: "This can't be undone.",
                     },
+                    PromptKind::SaveAs => Dialog {
+                        title: prompt.label.trim_end().to_string(),
+                        input: Some(prompt.text.clone()),
+                        buttons: None,
+                        hint: "A name for the file (.dj is added)   Enter to save   Esc to cancel",
+                    },
                     PromptKind::ConfirmDiscard => Dialog {
                         title: prompt.label.clone(),
                         input: None,
@@ -448,6 +455,7 @@ impl App {
     ) -> Vec<Effect> {
         let (size, at) = (self.small(size), (at.0 / self.scale, at.1 / self.scale));
         let effects = self.clicked(size, at, text_offset);
+        self.ask_for_name();
         self.look_after_save();
         effects
     }
@@ -524,6 +532,7 @@ impl App {
             match toolbar.buttons[i].click.clone() {
                 Click::Do(action) => self.editor.apply(&action),
                 Click::Open(menu) => self.open_menu(menu, toolbar.buttons[i].bounds, size),
+                Click::NewWindow => return vec![Effect::NewWindow],
                 Click::Save => {
                     self.editor.save();
                 }
@@ -747,41 +756,97 @@ impl App {
             PromptKind::Move => ("Move to: ".into(), tree.relative(&row.path)),
             PromptKind::ConfirmDelete => (format!("Delete \u{201c}{name}\u{201d}?"), String::new()),
             // Only the git commands start these two, which know what to put in them.
-            PromptKind::ConfirmDiscard | PromptKind::Commit => return,
+            PromptKind::ConfirmDiscard | PromptKind::Commit | PromptKind::SaveAs => return,
         };
         self.prompt = Some(Prompt { label, text, kind });
     }
 
-    /// A key while a prompt is open: typing, Backspace, Enter to carry it out, Esc to drop it.
+    /// A key while a prompt is open: typing, Backspace, Enter to carry it out, Esc to drop it. A
+    /// question takes `y` for yes and any other key for no.
     fn prompt_key(&mut self, key: Key) {
-        let Some(prompt) = &mut self.prompt else {
+        let Some(mut prompt) = self.prompt.take() else {
             return;
         };
         if prompt.kind.confirms() {
-            let confirmed = matches!(key, Key::Char('y' | 'Y'));
-            let Prompt { kind, text, .. } = self.prompt.take().unwrap();
-            if confirmed {
-                self.finish_prompt(kind, text);
+            if matches!(key, Key::Char('y' | 'Y')) {
+                self.finish_prompt(prompt.kind, prompt.text);
             }
             return;
         }
         match key {
-            Key::Esc => self.prompt = None,
-            Key::Enter => {
-                let Prompt { kind, text, .. } = self.prompt.take().unwrap();
-                self.finish_prompt(kind, text);
+            Key::Esc => {}
+            Key::Enter => self.finish_prompt(prompt.kind, prompt.text),
+            key => {
+                match key {
+                    Key::Backspace => {
+                        prompt.text.pop();
+                    }
+                    Key::Char(c) => prompt.text.push(c),
+                    _ => {}
+                }
+                self.prompt = Some(prompt);
             }
-            Key::Backspace => {
-                prompt.text.pop();
+        }
+    }
+
+    /// Saves a document that has no file under `name`, in the open folder or else the current one,
+    /// or at `name` itself if it is a full path. `.dj` is added to a name without an extension.
+    fn save_as(&mut self, name: &str) {
+        let name = name.trim();
+        if name.is_empty() {
+            return;
+        }
+        // `..` and `.` could land the file somewhere other than where the name says.
+        if Path::new(name)
+            .components()
+            .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+        {
+            self.editor.vim.message = format!("E13: {name:?} is not a plain name or path");
+            return;
+        }
+        let base = match &self.tree {
+            Some(tree) => tree.root().to_path_buf(),
+            None => std::env::current_dir().unwrap_or_default(),
+        };
+        let mut path = base.join(name);
+        if path.extension().is_none() {
+            path.set_extension("dj");
+        }
+        if path.exists() {
+            self.editor.vim.message = format!("E13: {} already exists", path.display());
+            return;
+        }
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        self.editor.set_path(Some(path.clone()));
+        if self.editor.save() {
+            self.remember(&path);
+            if let Some(tree) = &mut self.tree {
+                tree.refresh();
             }
-            Key::Char(c) => prompt.text.push(c),
-            _ => {}
+            self.refresh_git();
+        } else {
+            self.editor.set_path(None);
+        }
+    }
+
+    /// Saving a document that has no file asks what to call it.
+    fn ask_for_name(&mut self) {
+        if std::mem::take(&mut self.editor.needs_name) && self.prompt.is_none() {
+            self.editor.vim.message.clear();
+            self.prompt = Some(Prompt {
+                label: "Save as: ".into(),
+                text: String::new(),
+                kind: PromptKind::SaveAs,
+            });
         }
     }
 
     fn finish_prompt(&mut self, kind: PromptKind, text: String) {
         match kind {
             PromptKind::Commit => return self.git_commit(&text),
+            PromptKind::SaveAs => return self.save_as(&text),
             PromptKind::ConfirmDiscard => return self.git_discard(&PathBuf::from(text)),
             _ => {}
         }
@@ -803,7 +868,7 @@ impl App {
             PromptKind::ConfirmDelete => {
                 tree.delete().map(|()| selected.clone().unwrap_or_default())
             }
-            PromptKind::ConfirmDiscard | PromptKind::Commit => return,
+            PromptKind::ConfirmDiscard | PromptKind::Commit | PromptKind::SaveAs => return,
         };
         match result {
             Ok(path) => {
@@ -851,7 +916,6 @@ impl App {
             Key::Char('y') => {
                 if let Some(path) = tree.yank() {
                     self.message = format!("Yanked {}", tree.relative(&path));
-                    self.yanked = Some(path);
                 }
             }
             Key::Char('p') => match tree.paste() {
@@ -1098,6 +1162,7 @@ impl App {
     /// A key press.
     pub fn key(&mut self, size: (f32, f32), key: Key) -> Vec<Effect> {
         let effects = self.key_pressed(self.small(size), key);
+        self.ask_for_name();
         self.look_after_save();
         effects
     }
@@ -1130,27 +1195,26 @@ impl App {
         if key == Key::Esc && self.popup.take().is_some() {
             return Vec::new();
         }
-        // Ctrl-L goes to the file tree and Ctrl-H to the outline, showing them if hidden; the
-        // same key again goes back to the text.
-        if key == Key::Ctrl('l') {
-            if self.focus != Focus::Tree {
-                self.ensure_tree();
-                self.focus = Focus::Tree;
-            } else {
-                self.focus = Focus::Editor;
-            }
-            return Vec::new();
-        }
-        if key == Key::Ctrl('h') {
-            if self.focus != Focus::Outline {
-                if !self.config.outline {
-                    self.toggle_setting(&Click::ToggleOutline);
+        // Ctrl-H and Ctrl-L move between panes by where they sit, outline | text | tree, showing a
+        // hidden panel when moving onto it; at the edge they stay put.
+        if key == Key::Ctrl('l') || key == Key::Ctrl('h') {
+            let right = key == Key::Ctrl('l');
+            match (self.focus, right) {
+                (Focus::Editor, true) => {
+                    self.ensure_tree();
+                    self.focus = Focus::Tree;
                 }
-                let cursor = self.editor.buf.cursor();
-                self.outline_sel = outline::current(self.editor.headings(), cursor).unwrap_or(0);
-                self.focus = Focus::Outline;
-            } else {
-                self.focus = Focus::Editor;
+                (Focus::Editor, false) => {
+                    if !self.config.outline {
+                        self.toggle_setting(&Click::ToggleOutline);
+                    }
+                    let cursor = self.editor.buf.cursor();
+                    self.outline_sel =
+                        outline::current(self.editor.headings(), cursor).unwrap_or(0);
+                    self.focus = Focus::Outline;
+                }
+                (Focus::Tree, false) | (Focus::Outline, true) => self.focus = Focus::Editor,
+                _ => {}
             }
             return Vec::new();
         }
@@ -1337,6 +1401,8 @@ mod tests {
     use crate::vim::Mode;
 
     const SIZE: (f32, f32) = (1000.0, 700.0);
+    /// Wide enough for every toolbar button.
+    const WIDE: (f32, f32) = (1500.0, 700.0);
 
     fn temp_file(name: &str, text: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!("bwa_app_{name}.dj"));
@@ -1577,7 +1643,8 @@ mod tests {
         )
     }
 
-    /// Types `keys`: `\n` is Enter, `\x1b` Esc, `\x08` Backspace, `\x05` Ctrl+L, and `\t` Tab.
+    /// Types `keys`: `\n` is Enter, `\x1b` Esc, `\x08` Backspace, `\x05` Ctrl+L, `\x0b` Ctrl+H,
+    /// and `\t` Tab.
     fn press(app: &mut App, keys: &str) {
         for c in keys.chars() {
             app.key(
@@ -1587,6 +1654,7 @@ mod tests {
                     '\x1b' => Key::Esc,
                     '\x08' => Key::Backspace,
                     '\x05' => Key::Ctrl('l'),
+                    '\x0b' => Key::Ctrl('h'),
                     c => Key::Char(c),
                 },
             );
@@ -1611,6 +1679,29 @@ mod tests {
     }
 
     #[test]
+    fn saving_a_nameless_buffer_in_an_empty_folder_asks_for_a_name() {
+        let root = std::env::temp_dir().join("bwa_app_save_as");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let mut app = App::new(Editor::default(), Screen::Editing, Recent::default(), None);
+        app.open_folder(&root);
+        press(&mut app, "ihello\x1b:w\n");
+        assert_eq!(app.prompt.as_ref().unwrap().label, "Save as: ");
+        press(&mut app, "ch1\n");
+        assert_eq!(std::fs::read_to_string(root.join("ch1.dj")).unwrap(), "hello");
+        assert_eq!(app.editor.file_name(), "ch1.dj");
+        assert_eq!(rows(&app), ["ch1.dj*"]);
+        // A name that is taken is refused and the buffer stays nameless.
+        let mut other = App::new(Editor::default(), Screen::Editing, Recent::default(), None);
+        other.open_folder(&root);
+        press(&mut other, "ix\x1b:w\nch1.dj\n");
+        assert!(other.editor.path().is_none());
+        assert_eq!(std::fs::read_to_string(root.join("ch1.dj")).unwrap(), "hello");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn ctrl_e_shows_the_tree_and_passes_the_keyboard_back_and_forth() {
         let (mut app, root) = tree_app("focus");
         assert!(app.tree.is_none() && !app.tree_visible);
@@ -1620,7 +1711,7 @@ mod tests {
         // The tree has the keys now, so `x` doesn't reach the text.
         press(&mut app, "x");
         assert_eq!(app.editor.buf.text(), "a.dj");
-        press(&mut app, "\x05");
+        press(&mut app, "\x0b");
         assert_eq!(app.focus, Focus::Editor);
         press(&mut app, "x");
         assert_eq!(app.editor.buf.text(), ".dj");
@@ -1859,7 +1950,7 @@ mod tests {
             None,
         );
         app.set_config(Config::default(), Some(settings.clone()));
-        let toolbar = toolbar::toolbar(app.regions(SIZE).toolbar);
+        let toolbar = toolbar::toolbar(app.regions(WIDE).toolbar);
         let button = |label: &str| {
             let b = toolbar
                 .buttons
@@ -1872,17 +1963,17 @@ mod tests {
         // Save does what :w does.
         press(&mut app, "x");
         assert!(app.editor.buf.is_modified());
-        app.click(SIZE, button("Save"), |_, _| None);
+        app.click(WIDE, button("Save"), |_, _| None);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "ne two");
         assert!(!app.editor.buf.is_modified());
         // Auto toggles, is lit while on, and is remembered in the settings file.
         assert!(!app.autosave.enabled);
-        app.click(SIZE, button("Auto"), |_, _| None);
+        app.click(WIDE, button("Auto"), |_, _| None);
         assert!(app.autosave.enabled);
         assert!(Config::load(&settings).auto_save);
         let lit = |app: &mut App| {
             let (x, y) = button("Auto");
-            app.chrome(SIZE).rects.iter().any(|r| {
+            app.chrome(WIDE).rects.iter().any(|r| {
                 r.color == [0xd2, 0xc8, 0xac, 0xff]
                     && r.x <= x
                     && x < r.x + r.w
@@ -1891,28 +1982,28 @@ mod tests {
             })
         };
         assert!(lit(&mut app));
-        app.click(SIZE, button("Auto"), |_, _| None);
+        app.click(WIDE, button("Auto"), |_, _| None);
         assert!(!app.autosave.enabled && !lit(&mut app));
         assert!(!Config::load(&settings).auto_save);
         // The theme button switches the look and the choice is remembered.
         assert!(!app.theme().dark);
-        app.click(SIZE, button("\u{263e}"), |_, _| None);
+        app.click(WIDE, button("Dark"), |_, _| None);
         assert!(app.theme().dark && Config::load(&settings).dark);
-        app.click(SIZE, button("\u{263e}"), |_, _| None);
+        app.click(WIDE, button("Dark"), |_, _| None);
         assert!(!app.theme().dark && !Config::load(&settings).dark);
         // A tip shows once the mouse has rested on a button, and goes when it moves off.
         let (x, y) = button("Save");
         let shown = |app: &mut App| {
-            app.chrome(SIZE)
+            app.chrome(WIDE)
                 .over_labels
                 .iter()
                 .any(|l| l.text.starts_with("Save ("))
         };
-        assert!(app.hover_at(SIZE, x, y) && !shown(&mut app));
+        assert!(app.hover_at(WIDE, x, y) && !shown(&mut app));
         assert!(app.next_wake().is_some());
         app.tick(Instant::now() + Duration::from_secs(1));
         assert!(shown(&mut app));
-        app.hover_at(SIZE, 500.0, 300.0);
+        app.hover_at(WIDE, 500.0, 300.0);
         assert!(!shown(&mut app));
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -2211,7 +2302,7 @@ mod tests {
             Recent::default(),
             None,
         );
-        let toolbar = toolbar::toolbar(app.regions(SIZE).toolbar);
+        let toolbar = toolbar::toolbar(app.regions(WIDE).toolbar);
         let button = |label: &str| {
             let b = toolbar
                 .buttons
@@ -2222,11 +2313,11 @@ mod tests {
             (b.x + b.w / 2.0, b.y + b.h / 2.0)
         };
         assert_eq!(
-            app.click(SIZE, button("MD"), |_, _| None),
+            app.click(WIDE, button("MD"), |_, _| None),
             [Effect::PickExport(ExportKind::Markdown)]
         );
         assert_eq!(
-            app.click(SIZE, button("PDF"), |_, _| None),
+            app.click(WIDE, button("PDF"), |_, _| None),
             [Effect::PickExport(ExportKind::Pdf)]
         );
         // The suggested name is the file's own with the new extension.
@@ -2261,14 +2352,14 @@ mod tests {
         );
         // The note shows on the status bar until the next key.
         assert!(
-            app.chrome(SIZE)
+            app.chrome(WIDE)
                 .labels
                 .iter()
                 .any(|l| l.text.starts_with("Can't write"))
         );
         press(&mut app, "l");
         assert!(
-            !app.chrome(SIZE)
+            !app.chrome(WIDE)
                 .labels
                 .iter()
                 .any(|l| l.text.starts_with("Can't write"))

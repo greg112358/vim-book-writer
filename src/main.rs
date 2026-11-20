@@ -206,6 +206,26 @@ impl Shell {
                 }
                 // The cursor may have moved, so wait for the next layout to know where it is.
                 Effect::Align(by) => self.align = Some(by),
+                Effect::NewWindow => {
+                    use std::os::unix::process::CommandExt;
+                    use std::process::Stdio;
+                    // A window of its own: no shared terminal input or output, its own process
+                    // group, and reaped when it closes.
+                    match std::env::current_exe().and_then(|exe| {
+                        std::process::Command::new(exe)
+                            .stdin(Stdio::null())
+                            .stdout(Stdio::null())
+                            .process_group(0)
+                            .spawn()
+                    }) {
+                        Ok(mut child) => {
+                            std::thread::spawn(move || child.wait());
+                        }
+                        Err(e) => {
+                            self.app.editor.vim.message = format!("Can't open a new window: {e}")
+                        }
+                    }
+                }
                 Effect::PickFolder => {
                     if let Some(folder) = rfd::FileDialog::new()
                         .set_title("Open a folder")
@@ -371,15 +391,19 @@ fn window_icon() -> Option<winit::window::Icon> {
 }
 
 /// Writes RGBA pixels to a PNG file.
-fn write_png(path: &std::path::Path, (width, height): (u32, u32), pixels: &[u8]) {
-    let file = std::fs::File::create(path).expect("failed to create the screenshot file");
+fn write_png(
+    path: &std::path::Path,
+    (width, height): (u32, u32),
+    pixels: &[u8],
+) -> Result<(), String> {
+    let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
     let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
     encoder
         .write_header()
         .and_then(|mut writer| writer.write_image_data(pixels))
-        .expect("failed to write the PNG");
+        .map_err(|e| e.to_string())
 }
 
 fn main() {
@@ -393,14 +417,21 @@ fn main() {
     };
 
     config::migrate();
+    let screenshot = args.screenshot.is_some();
+    // A file that can't be read stops an export or screenshot, but the window opens on the start
+    // screen and says why, since a double-click on the file is a common way to get here.
+    let mut failed = String::new();
     let editor = match &args.file {
         Some(path) => Editor::open(path).unwrap_or_else(|error| {
-            eprintln!("can't open {}: {error}", path.display());
-            std::process::exit(1);
+            failed = format!("Can't open {}: {error}", path.display());
+            if screenshot || args.export.is_some() {
+                eprintln!("{failed}");
+                std::process::exit(1);
+            }
+            Editor::default()
         }),
         None => Editor::default(),
     };
-    let screenshot = args.screenshot.is_some();
     // Screenshots list the files they are given; the window lists and saves the user's own.
     let (recent, recent_path) = if screenshot {
         let mut recent = Recent::default();
@@ -415,11 +446,8 @@ fn main() {
             path,
         )
     };
-    let start = args.file.is_none() || args.start;
-    let screen = if start {
-        Screen::Start {
-            message: String::new(),
-        }
+    let screen = if args.file.is_none() || args.start || !failed.is_empty() {
+        Screen::Start { message: failed }
     } else {
         Screen::Editing
     };
@@ -523,7 +551,10 @@ fn main() {
                 },
             )
         };
-        write_png(path, args.size, &pixels);
+        if let Err(error) = write_png(path, args.size, &pixels) {
+            eprintln!("can't write {}: {error}", path.display());
+            std::process::exit(1);
+        }
         return;
     }
 

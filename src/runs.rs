@@ -18,6 +18,8 @@ pub struct Format {
     /// Inline code.
     pub code: bool,
     pub link: bool,
+    /// The `- ` or `1. ` that starts a list item.
+    pub marker: bool,
 }
 
 /// A stretch of source text drawn one way.
@@ -26,7 +28,7 @@ pub struct Run {
     pub range: Range<usize>,
     /// Syntax the writer typed rather than text a reader sees: `**`, `## `, `> `, code fences,
     /// and the `](url)` or `]{.class}` after a link or span. List markers count as text.
-    /// Insert mode draws markup faint; normal mode hides it.
+    /// It is drawn faint.
     pub markup: bool,
     /// From every span whose range holds the run, delimiters included, so `**` is drawn bold.
     pub format: Format,
@@ -51,8 +53,9 @@ pub fn runs(src: &str, spans: &[Span]) -> Vec<Run> {
     let mut out: Vec<Run> = Vec::new();
     // Indices of the spans holding the current position, outermost first.
     let mut active: Vec<usize> = Vec::new();
-    // Spans whose delimiters hold the current position.
+    // Spans whose delimiters hold the current position, and list items whose marker does.
     let mut in_markup = 0i32;
+    let mut in_marker = 0i32;
     let mut at = 0;
     for (pos, i, step) in events {
         if pos > at {
@@ -73,6 +76,7 @@ pub fn runs(src: &str, spans: &[Span]) -> Vec<Run> {
                     SpanKind::ListItem | SpanKind::BlockquoteMarker | SpanKind::Span => {}
                 }
             }
+            format.marker = in_marker > 0;
             let markup = in_markup > 0;
             match out.last_mut() {
                 Some(last) if last.markup == markup && last.format == format => {
@@ -87,43 +91,27 @@ pub fn runs(src: &str, spans: &[Span]) -> Vec<Run> {
             at = pos;
         }
         let Some(span) = spans.get(i) else { continue };
-        // A list marker is text, so list items never count as markup.
-        let d = i32::from(span.kind != SpanKind::ListItem);
+        // A list marker is text the reader sees, so it is marked rather than counted as markup.
+        let list = span.kind == SpanKind::ListItem;
+        let (d, m) = (i32::from(!list), i32::from(list));
         match step {
             0 => {
                 active.insert(active.partition_point(|&j| j < i), i);
                 in_markup += d;
+                in_marker += m;
             }
-            1 => in_markup -= d,
+            1 => {
+                in_markup -= d;
+                in_marker -= m;
+            }
             2 => in_markup += d,
             _ => {
-                active.remove(active.binary_search(&i).unwrap());
+                active.retain(|&j| j != i);
                 in_markup -= d;
             }
         }
     }
     out
-}
-
-/// What normal mode shows: the runs that aren't markup, laid end to end.
-#[derive(Debug)]
-pub struct Visible<'a> {
-    pub text: String,
-    /// Each shown run as its range in `text` and the run it came from, which holds the
-    /// source range and the format.
-    pub runs: Vec<(Range<usize>, &'a Run)>,
-}
-
-/// Hides every markup run. `runs` must come from `runs()` on the same `src`.
-pub fn visible<'a>(src: &str, runs: &'a [Run]) -> Visible<'a> {
-    let mut text = String::new();
-    let mut shown = Vec::new();
-    for run in runs.iter().filter(|run| !run.markup) {
-        let start = text.len();
-        text.push_str(&src[run.range.clone()]);
-        shown.push((start..text.len(), run));
-    }
-    Visible { text, runs: shown }
 }
 
 #[cfg(test)]
@@ -190,7 +178,9 @@ mod tests {
                 (false, "\n\n"),
                 (true, "> "),
                 (false, "quote"),
-                (false, "\n\n- item\n\n"),
+                (false, "\n\n"),
+                (false, "- "),
+                (false, "item\n\n"),
                 (true, "***"),
                 (false, "\n"),
             ]
@@ -201,6 +191,8 @@ mod tests {
         assert_eq!(runs[2].format.heading, 0);
         assert!(runs[3].format.quote && runs[4].format.quote);
         assert!(!runs[5].format.quote);
+        // The list marker is the reader's text, in a look of its own.
+        assert!(runs[6].format.marker && !runs[6].markup && !runs[7].format.marker);
     }
 
     #[test]
@@ -214,31 +206,5 @@ mod tests {
         }
         assert!(all.iter().all(|r| !r.range.is_empty()));
         assert!(runs("", &[]).is_empty());
-    }
-
-    #[test]
-    fn normal_mode_hides_delimiters_markers_and_attribute_blocks() {
-        let check = |src: &str| {
-            let runs = runs(src, &parse(src));
-            visible(src, &runs).text
-        };
-        assert_eq!(check("**bold** and _it_"), "bold and it");
-        assert_eq!(
-            check(
-                "## Head\n\n> a\n> b\n\n[t]{style=\"color:#c00\"} ok\n\n***\n\n```rust\nlet x;\n```\n\n- [l](http://x.y)\n"
-            ),
-            "Head\n\na\nb\n\nt ok\n\n\n\nlet x;\n\n- l\n"
-        );
-    }
-
-    #[test]
-    fn visible_runs_tile_the_text_and_keep_source_ranges() {
-        let src = "é **b** ü";
-        let runs = runs(src, &parse(src));
-        let shown = visible(src, &runs);
-        assert_eq!(shown.text, "é b ü");
-        assert_eq!(shown.runs[1].0, 3..4);
-        assert_eq!(shown.runs[1].1.range, 5..6);
-        assert!(shown.runs[1].1.format.bold);
     }
 }

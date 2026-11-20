@@ -125,6 +125,45 @@ pub fn toggle_quote(buf: &mut Buffer, range: Range<usize>) {
     buf.end_group();
 }
 
+/// Fences the lines in `range` as a code block, or, if they sit between fence lines already (or
+/// the range runs from one fence to the other), takes the fences off. One undo step.
+pub fn toggle_code_block(buf: &mut Buffer, range: Range<usize>) {
+    let text = buf.text();
+    let lines = lines(text, range);
+    let (first, last) = (lines[0].clone(), lines[lines.len() - 1].clone());
+    // An opening fence may name a language, `\`\`\`rust`; a closing one is bare.
+    let opens = |r: &Range<usize>| text[r.clone()].starts_with("```");
+    let closes = |r: &Range<usize>| text[r.clone()].trim_end() == "```";
+    let mut fences = None;
+    if lines.len() > 1 && opens(&first) && closes(&last) {
+        fences = Some((first.clone(), last.clone()));
+    } else if first.start > 0 && last.end < text.len() {
+        let before_start = text[..first.start - 1].rfind('\n').map_or(0, |i| i + 1);
+        let after_end = text[last.end + 1..]
+            .find('\n')
+            .map_or(text.len(), |i| last.end + 1 + i);
+        let (before, after) = (before_start..first.start - 1, last.end + 1..after_end);
+        if opens(&before) && closes(&after) {
+            fences = Some((before, after));
+        }
+    }
+    buf.begin_group();
+    match fences {
+        Some((open, close)) => {
+            // Each fence goes with the newline that joins it to the code.
+            buf.replace(close.start - 1..close.end, "");
+            buf.replace(open.start..open.end + 1, "");
+        }
+        None => {
+            let (open, close) = ("```\n", "\n```");
+            buf.replace(last.end..last.end, close);
+            buf.replace(first.start..first.start, open);
+            set_apart(buf, first.start, last.end + open.len() + close.len());
+        }
+    }
+    buf.end_group();
+}
+
 /// Makes the lines in `range` items of a bullet list, or of a numbered one, or, if they all are
 /// such items already, plain lines. Other markers are replaced. Blank lines are left alone. One
 /// undo step.
@@ -267,5 +306,18 @@ mod tests {
             .map(|s| s.kind)
             .collect();
         assert!(kinds.contains(&crate::djot::SpanKind::Blockquote));
+    }
+
+    #[test]
+    fn code_blocks_fence_and_unfence_lines() {
+        let fenced = |src: &str, range| {
+            let mut buf = Buffer::new(src);
+            toggle_code_block(&mut buf, range);
+            buf.text().to_string()
+        };
+        assert_eq!(fenced("a\nb", 0..3), "```\na\nb\n```");
+        assert_eq!(fenced("x\ny\nz", 2..3), "x\n\n```\ny\n```\n\nz");
+        assert_eq!(fenced("```\na\nb\n```", 4..7), "a\nb");
+        assert_eq!(fenced("```\na\nb\n```", 0..11), "a\nb");
     }
 }

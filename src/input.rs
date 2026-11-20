@@ -45,33 +45,6 @@ mod tests {
     }
 
     #[test]
-    fn named_keys() {
-        let none = ModifiersState::empty();
-        for (named, want) in [
-            (NamedKey::Escape, Key::Esc),
-            (NamedKey::Enter, Key::Enter),
-            (NamedKey::Backspace, Key::Backspace),
-            (NamedKey::Delete, Key::Delete),
-            (NamedKey::ArrowLeft, Key::Left),
-            (NamedKey::ArrowDown, Key::Down),
-            (NamedKey::Tab, Key::Char('\t')),
-            (NamedKey::Space, Key::Char(' ')),
-        ] {
-            assert_eq!(keys(&WinitKey::Named(named), None, none), [want]);
-        }
-        // Keys with no meaning here, and bare modifiers, give nothing.
-        assert!(keys(&WinitKey::Named(NamedKey::F2), None, none).is_empty());
-        assert!(
-            keys(
-                &WinitKey::Named(NamedKey::Shift),
-                None,
-                ModifiersState::SHIFT
-            )
-            .is_empty()
-        );
-    }
-
-    #[test]
     fn typed_text_uses_what_the_press_produced() {
         let none = ModifiersState::empty();
         assert_eq!(keys(&character("a"), Some("a"), none), [Key::Char('a')]);

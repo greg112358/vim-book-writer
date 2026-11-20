@@ -250,8 +250,10 @@ impl Vim {
             }
             _ if p.wait.is_some() => self.finish_prefix(buf, &p, key, count),
             Key::Char('g') if !p.g => self.pending = Pending { g: true, ..p },
-            // Any other key after `g` isn't a command we have.
-            _ if p.g && key != Key::Char('g') => {}
+            // Any other key after `g` isn't a command we have, except `gj` and `gk`.
+            _ if p.g
+                && key != Key::Char('g')
+                && !(p.op.is_none() && matches!(key, Key::Char('j' | 'k'))) => {}
             Key::Char('"') if p.op.is_none() && p.object.is_none() && !p.awaiting_register => {
                 self.pending = Pending {
                     awaiting_register: true,
@@ -398,7 +400,11 @@ impl Vim {
                 Some(op) if op == c => self.lines_operator(buf, op, count),
                 Some(_) => {}
             },
-            _ if p.op.is_some() => self.operator(buf, p.op.unwrap(), key, p.g, count),
+            _ if p.op.is_some() => {
+                if let Some(op) = p.op {
+                    self.operator(buf, op, key, p.g, count);
+                }
+            }
             Key::Char('x') => self.operator(buf, 'd', Key::Char('l'), false, count),
             Key::Char('X') => self.operator(buf, 'd', Key::Char('h'), false, count),
             Key::Char('D') => self.operator(buf, 'd', Key::Char('$'), false, count),
@@ -478,12 +484,15 @@ impl Vim {
                     Mode::VisualLine
                 };
             }
-            // With the window's wrapping known, up and down go a row at a time.
-            Key::Char('j' | 'k') | Key::Up | Key::Down if !p.g && !buf.rows.is_empty() => {
-                let down = matches!(key, Key::Char('j') | Key::Down);
-                for _ in 0..n {
-                    if !buf.move_row(down, false) {
-                        break;
+            // `gj` and `gk` go a wrapped row at a time, once the window's wrapping is known.
+            Key::Char('j' | 'k') if p.g => {
+                if buf.rows.is_empty() {
+                    move_cursor(buf, key, false, count);
+                } else {
+                    for _ in 0..n {
+                        if !buf.move_row(key == Key::Char('j'), false) {
+                            break;
+                        }
                     }
                 }
             }

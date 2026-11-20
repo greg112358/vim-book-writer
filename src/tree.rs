@@ -93,17 +93,19 @@ fn unused_copy_name(dir: &Path, name: &OsStr) -> PathBuf {
     let ext = path
         .extension()
         .map_or(String::new(), |e| format!(".{}", e.to_string_lossy()));
-    (1..)
-        .map(|n| {
-            let copy = if n == 1 {
-                " copy".to_string()
-            } else {
-                format!(" copy {n}")
-            };
-            dir.join(format!("{stem}{copy}{ext}"))
-        })
-        .find(|candidate| !candidate.exists())
-        .unwrap()
+    let mut n = 1;
+    loop {
+        let copy = if n == 1 {
+            " copy".to_string()
+        } else {
+            format!(" copy {n}")
+        };
+        let candidate = dir.join(format!("{stem}{copy}{ext}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+        n += 1;
+    }
 }
 
 impl Tree {
@@ -151,10 +153,6 @@ impl Tree {
 
     pub fn selected(&self) -> Option<&Row> {
         self.rows.get(self.selected)
-    }
-
-    pub fn show_hidden(&self) -> bool {
-        self.show_hidden
     }
 
     /// Moves the selection by `delta` rows, stopping at the ends.

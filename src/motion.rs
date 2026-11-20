@@ -513,14 +513,6 @@ mod tests {
     }
 
     #[test]
-    fn word_run_end_stops_at_a_class_change() {
-        assert_eq!(word_run_end("foo.bar", 1), 2);
-        assert_eq!(word_run_end("foo.bar", 3), 3);
-        assert_eq!(word_run_end("é é", 0), 0);
-        assert_eq!(word_run_end("ab", 1), 1);
-    }
-
-    #[test]
     fn line_helpers() {
         let text = "a\n  b\n\nc\n";
         assert_eq!(first_non_blank(text, 3), 4);

@@ -13,5 +13,6 @@ pub enum Action {
     BulletList,
     NumberedList,
     Quote,
+    CodeBlock,
     Link,
 }

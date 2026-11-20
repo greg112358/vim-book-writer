@@ -198,10 +198,6 @@ impl Repo {
         }
     }
 
-    pub fn unstage_all(&self) -> Result<(), String> {
-        self.unstage(std::slice::from_ref(&self.root))
-    }
-
     /// Throws away every change under `path`: staged and not, and new files too.
     pub fn discard(&self, status: &Status, path: &Path) -> Result<(), String> {
         let under = |e: &(&PathBuf, &Entry)| e.0.starts_with(path);
@@ -422,7 +418,7 @@ mod tests {
         std::fs::write(&file, "x").unwrap();
         repo.stage_all().unwrap();
         assert!(repo.status().unwrap().files[&file].staged());
-        repo.unstage_all().unwrap();
+        repo.unstage(std::slice::from_ref(&repo.root)).unwrap();
         assert_eq!(repo.status().unwrap().files[&file].letter(), 'U');
         // A push with nowhere to push to comes back as a message, not a hang.
         let said = repo.spawn(&["push"]).recv().unwrap();

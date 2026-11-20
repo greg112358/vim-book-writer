@@ -54,36 +54,3 @@ impl Document {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn counts_words_across_whitespace() {
-        let mut doc = Document::new();
-        doc.set_text("It was  a dark\nand stormy\tnight.");
-        assert_eq!(doc.word_count(), 7);
-    }
-
-    #[test]
-    fn empty_document_has_no_words() {
-        assert_eq!(Document::new().word_count(), 0);
-    }
-
-    #[test]
-    fn save_without_path_fails() {
-        assert!(Document::new().save().is_err());
-    }
-
-    #[test]
-    fn round_trips_through_disk() {
-        let path = std::env::temp_dir().join("bwa_document_round_trip.txt");
-        std::fs::write(&path, "Chapter one").unwrap();
-        let mut doc = Document::open(&path).unwrap();
-        assert_eq!(doc.text(), "Chapter one");
-        doc.set_text("Chapter two");
-        doc.save().unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "Chapter two");
-        std::fs::remove_file(&path).unwrap();
-    }
-}

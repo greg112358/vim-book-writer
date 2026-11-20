@@ -66,8 +66,9 @@ pub fn parse(src: &str) -> Vec<Span> {
                 }
             }
             Event::End(container) => {
-                if let Some(kind) = span_kind(container) {
-                    let span = &mut spans[open.pop().unwrap()];
+                if let Some(kind) = span_kind(container)
+                    && let Some(span) = open.pop().and_then(|i| spans.get_mut(i))
+                {
                     if kind == SpanKind::CodeBlock {
                         // Ends with the closing fence, which is markup.
                         span.content.end = range.start;

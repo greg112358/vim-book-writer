@@ -25,7 +25,7 @@ pub fn headings(text: &str) -> Vec<Heading> {
         match (fence, ticks) {
             (None, Some(open)) => fence = Some(open),
             (Some(open), Some(close))
-                if close.starts_with(open.chars().next().unwrap()) && close.len() >= open.len() =>
+                if close.starts_with(&open[..1]) && close.len() >= open.len() =>
             {
                 fence = None
             }

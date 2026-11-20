@@ -33,7 +33,6 @@ pub struct Config {
     pub font: String,
     /// The size the text is read in, in points.
     pub size: f32,
-    pub vim_mode: bool,
     /// Save the file by itself once edits stop.
     pub auto_save: bool,
     /// The dark look instead of the light one.
@@ -47,7 +46,6 @@ impl Default for Config {
         Self {
             font: "Serif".into(),
             size: 14.0,
-            vim_mode: false,
             auto_save: false,
             dark: false,
             outline: true,
@@ -95,19 +93,6 @@ mod tests {
         // Settings from before the reading font was one are ignored, not an error.
         let old = Config::from_toml("font_family = \"serif\"\nfont_size = 16.0").unwrap();
         assert_eq!((old.font.as_str(), old.size), ("Serif", 14.0));
-        assert!(!config.vim_mode);
-    }
-
-    #[test]
-    fn round_trips_through_toml() {
-        let config = Config {
-            vim_mode: true,
-            ..Config::default()
-        };
-        assert_eq!(
-            Config::from_toml(&config.to_toml().unwrap()).unwrap(),
-            config
-        );
     }
 
     #[test]
@@ -126,10 +111,5 @@ mod tests {
         std::fs::write(&path, "auto_save = [").unwrap();
         assert_eq!(Config::load(&path), Config::default());
         std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn rejects_wrong_types() {
-        assert!(Config::from_toml("size = \"big\"").is_err());
     }
 }

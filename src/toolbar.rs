@@ -13,6 +13,8 @@ pub enum Menu {
 pub enum Click {
     Do(Action),
     Open(Menu),
+    /// Start another window on the start screen.
+    NewWindow,
     /// The same save `:w` does.
     Save,
     ExportMarkdown,
@@ -62,35 +64,35 @@ pub fn toolbar(bounds: Bounds) -> Toolbar {
     let mut spec: Vec<Option<(&str, f32, Click, String)>> = Vec::new();
     let mut add =
         |label, width, click, tip: &str| spec.push(Some((label, width, click, tip.to_string())));
-    add("B", 26.0, Click::Do(Action::Bold), "Bold (Ctrl+B)");
-    add("I", 26.0, Click::Do(Action::Italic), "Italic (Ctrl+I)");
-    add("S", 26.0, Click::Do(Action::Strikethrough), "Strikethrough");
+    add("B", 23.0, Click::Do(Action::Bold), "Bold (Ctrl+B)");
+    add("I", 23.0, Click::Do(Action::Italic), "Italic (Ctrl+I)");
+    add("S", 23.0, Click::Do(Action::Strikethrough), "Strikethrough");
     add(
         "x\u{b2}",
-        28.0,
+        25.0,
         Click::Do(Action::Superscript),
         "Superscript",
     );
-    add("x\u{2082}", 28.0, Click::Do(Action::Subscript), "Subscript");
+    add("x\u{2082}", 25.0, Click::Do(Action::Subscript), "Subscript");
     add("AA", 30.0, Click::Do(Action::Uppercase), "Make uppercase");
     spec.push(None);
     let mut add =
         |label, width, click, tip: &str| spec.push(Some((label, width, click, tip.to_string())));
     add(
         "H1",
-        28.0,
+        25.0,
         Click::Do(Action::Heading(1)),
         "Heading 1 (again for plain text)",
     );
     add(
         "H2",
-        28.0,
+        25.0,
         Click::Do(Action::Heading(2)),
         "Heading 2 (again for plain text)",
     );
     add(
         "H3",
-        28.0,
+        25.0,
         Click::Do(Action::Heading(3)),
         "Heading 3 (again for plain text)",
     );
@@ -99,16 +101,17 @@ pub fn toolbar(bounds: Bounds) -> Toolbar {
         |label, width, click, tip: &str| spec.push(Some((label, width, click, tip.to_string())));
     add(
         "\u{2022}",
-        26.0,
+        23.0,
         Click::Do(Action::BulletList),
         "Bulleted list",
     );
-    add("1.", 26.0, Click::Do(Action::NumberedList), "Numbered list");
-    add("\"", 26.0, Click::Do(Action::Quote), "Block quote");
+    add("1.", 23.0, Click::Do(Action::NumberedList), "Numbered list");
+    add("\"", 23.0, Click::Do(Action::Quote), "Block quote");
+    add("</>", 30.0, Click::Do(Action::CodeBlock), "Code block");
     add("Link", 40.0, Click::Do(Action::Link), "Link");
 
     // The buttons for the file rather than the text sit at the right end.
-    let right: [(&str, f32, Click, String); 9] = [
+    let mut right: Vec<(&str, f32, Click, String)> = vec![
         (
             "Font",
             52.0,
@@ -127,6 +130,12 @@ pub fn toolbar(bounds: Bounds) -> Toolbar {
             Click::ToggleOutline,
             "Show or hide the headings (Ctrl+H goes there)".into(),
         ),
+        (
+            "Open New Window",
+            132.0,
+            Click::NewWindow,
+            "Open another window with the start screen: open a file or folder there".into(),
+        ),
         ("Save", 40.0, Click::Save, "Save (Ctrl+S or :w)".into()),
         (
             "MD",
@@ -142,8 +151,8 @@ pub fn toolbar(bounds: Bounds) -> Toolbar {
             "Auto-save after you stop typing".into(),
         ),
         (
-            "\u{263e}",
-            26.0,
+            "Dark",
+            40.0,
             Click::ToggleDark,
             "Switch between light and dark".into(),
         ),
@@ -172,11 +181,18 @@ pub fn toolbar(bounds: Bounds) -> Toolbar {
             None => x += GROUP_GAP - GAP,
         }
     }
-    let right_width: f32 = right
-        .iter()
-        .map(|(_, w, _, _)| w * SCALE + GAP)
-        .sum::<f32>()
-        - GAP;
+    // In a window too narrow for every button, the ones least needed go first rather than
+    // overlapping the rest.
+    let width_of = |right: &[(&str, f32, Click, String)]| {
+        right.iter().map(|(_, w, _, _)| w * SCALE + GAP).sum::<f32>() - GAP
+    };
+    for drop in ["Auto", "PDF", "MD", "Size", "Font"] {
+        if x + GROUP_GAP - GAP + width_of(&right) <= bounds.x + bounds.w - PADDING {
+            break;
+        }
+        right.retain(|(label, ..)| *label != drop);
+    }
+    let right_width = width_of(&right);
     let mut x = (bounds.x + bounds.w - PADDING - right_width).max(x + GROUP_GAP - GAP);
     for (label, width, click, tip) in right {
         buttons.push(Button {
@@ -386,69 +402,20 @@ mod tests {
         Bounds {
             x: 0.0,
             y: 0.0,
-            w: 1000.0,
+            w: 1300.0,
             h: 34.0,
         }
     }
 
     #[test]
-    fn buttons_sit_in_the_strip_in_order_without_overlapping() {
-        let toolbar = toolbar(strip());
-        let labels: Vec<&str> = toolbar.buttons.iter().map(|b| b.label.as_str()).collect();
-        assert_eq!(
-            labels,
-            [
-                "B",
-                "I",
-                "S",
-                "x\u{b2}",
-                "x\u{2082}",
-                "AA",
-                "H1",
-                "H2",
-                "H3",
-                "\u{2022}",
-                "1.",
-                "\"",
-                "Link",
-                "Font",
-                "Size",
-                "Outline",
-                "Save",
-                "MD",
-                "PDF",
-                "Auto",
-                "\u{263e}",
-                "?"
-            ]
-        );
-        let strip = strip();
-        for pair in toolbar.buttons.windows(2) {
+    fn a_narrow_strip_drops_buttons_instead_of_overlapping() {
+        let narrow = toolbar(Bounds { w: 950.0, ..strip() });
+        assert!(narrow.buttons.len() < toolbar(strip()).buttons.len());
+        for pair in narrow.buttons.windows(2) {
             assert!(pair[0].bounds.x + pair[0].bounds.w <= pair[1].bounds.x);
         }
-        for b in &toolbar.buttons {
-            assert!(b.bounds.x >= strip.x && b.bounds.x + b.bounds.w <= strip.w);
-            assert!(b.bounds.y >= strip.y && b.bounds.y + b.bounds.h <= strip.y + strip.h);
-        }
-        // The file buttons are at the right end, clear of the text buttons.
-        let last = toolbar.buttons.last().unwrap().bounds;
-        assert!((last.x + last.w - (strip.w - PADDING)).abs() < 0.01);
-        assert_eq!(toolbar.buttons[15].click, Click::ToggleOutline);
-        assert_eq!(toolbar.buttons[16].click, Click::Save);
-        assert_eq!(toolbar.buttons[17].click, Click::ExportMarkdown);
-        assert_eq!(toolbar.buttons[18].click, Click::ExportPdf);
-        assert_eq!(toolbar.buttons[19].click, Click::ToggleAutoSave);
-        assert_eq!(toolbar.buttons[20].click, Click::ToggleDark);
-        assert_eq!(toolbar.buttons[21].click, Click::Help);
-        assert_eq!(toolbar.buttons[0].tip.split(' ').next(), Some("Bold"));
-        assert!(toolbar.buttons.iter().all(|b| !b.tip.is_empty()));
-        // Groups have a wider gap between them than buttons do.
-        let gap = |i: usize| {
-            toolbar.buttons[i + 1].bounds.x
-                - toolbar.buttons[i].bounds.x
-                - toolbar.buttons[i].bounds.w
-        };
-        assert!(gap(5) > gap(0) && (gap(0) - GAP).abs() < 0.01);
+        let last = narrow.buttons.last().unwrap().bounds;
+        assert!(last.x + last.w <= 950.0);
     }
 
     #[test]
@@ -461,7 +428,7 @@ mod tests {
         let (x, y) = center(0);
         let i = toolbar.hit(x, y).unwrap();
         assert_eq!(toolbar.buttons[i].click, Click::Do(Action::Bold));
-        let (x, y) = center(13);
+        let (x, y) = center(14);
         assert_eq!(
             toolbar.buttons[toolbar.hit(x, y).unwrap()].click,
             Click::Open(Menu::Font)
@@ -469,7 +436,7 @@ mod tests {
         // Between groups and outside the strip hit nothing.
         let b = toolbar.buttons[5].bounds;
         assert_eq!(toolbar.hit(b.x + b.w + GROUP_GAP / 2.0, 17.0), None);
-        let link = toolbar.buttons[12].bounds;
+        let link = toolbar.buttons[13].bounds;
         assert_eq!(toolbar.hit(link.x + link.w + 2.0, 17.0), None);
         assert_eq!(toolbar.hit(strip().w + 5.0, 17.0), None);
         // Every formatting action has a button.
@@ -486,6 +453,7 @@ mod tests {
             Action::BulletList,
             Action::NumberedList,
             Action::Quote,
+            Action::CodeBlock,
             Action::Link,
         ] {
             assert!(

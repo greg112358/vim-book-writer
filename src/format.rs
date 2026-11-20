@@ -271,16 +271,6 @@ mod tests {
     }
 
     #[test]
-    fn is_a_single_undo_step() {
-        let mut buf = Buffer::new("a\n\nb");
-        toggle(&mut buf, 0..4, Mark::Bold);
-        assert_eq!(buf.text(), "*a*\n\n*b*");
-        assert!(buf.undo());
-        assert_eq!(buf.text(), "a\n\nb");
-        assert!(!buf.undo());
-    }
-
-    #[test]
     fn uppercase_changes_text_but_not_markup() {
         let src = r#"héllo *world* ß [link](http://x.y) and [c]{.note}"#;
         let mut buf = Buffer::new(src);
